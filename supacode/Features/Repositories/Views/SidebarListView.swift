@@ -210,21 +210,19 @@ private struct SidebarSectionDispatcher: View {
         shortcutHintByID: shortcutHintByID
       )
       .moveDisabled(true)
-    case .failedRepository(let repositoryID, let rootURL, let customTitle, let color, let isRemote):
+    case .failedRepository(let repositoryID, let rootURL, let customTitle, _, let isRemote):
       SidebarFailedRepositorySection(
         repositoryID: repositoryID,
         rootURL: rootURL,
         customTitle: customTitle,
-        color: color,
         isRemote: isRemote,
         store: store
       )
-    case .environmentBlockedRepository(let repositoryID, let rootURL, let customTitle, let color):
+    case .environmentBlockedRepository(let repositoryID, let rootURL, let customTitle, _):
       SidebarBlockedRepositorySection(
         repositoryID: repositoryID,
         rootURL: rootURL,
         customTitle: customTitle,
-        color: color,
         store: store
       )
     case .folder(let repositoryID, let rowID):
@@ -245,6 +243,9 @@ private struct SidebarSectionDispatcher: View {
       }
     case .repository(let repositoryID, let groups):
       if let repository = store.state.repositories[id: repositoryID] {
+        if structure.sections.first?.id != section.id {
+          SidebarSectionSeparator()
+        }
         SidebarGitRepositorySection(
           repository: repository,
           groups: groups,
@@ -271,48 +272,131 @@ private struct SidebarGitRepositorySection: View {
     let isRemovingRepository = store.state.isRemovingRepository(repository)
     let isResolvingRemote = store.state.resolvingRemoteRepositoryIDs.contains(repository.id)
     let section = store.state.sidebar.sections[repository.id]
-    Section(isExpanded: repositoryExpansionBinding) {
-      SidebarItemsView(
-        repository: repository,
-        groups: groups,
-        shortcutHintByID: shortcutHintByID,
-        store: store,
-        terminalManager: terminalManager
-      )
-      if let hoistSummary {
-        SidebarHoistSummaryRow(
-          repositoryName: Repository.sidebarDisplayName(custom: section?.title, fallback: repository.name),
-          summary: hoistSummary,
-          store: store
+    let isExpanded = store.state.isRepositoryExpanded(repository.id)
+    // The header is a plain row above a `Section` with an empty header (the
+    // folder-repo pattern), so the expand/collapse chevron can live on the
+    // trailing edge instead of the native leading disclosure.
+    SidebarRepositoryHeaderRow(
+      name: repository.name,
+      customTitle: section?.title,
+      tint: section?.color,
+      hostInfo: repository.host?.displayAuthority,
+      worktreeCount: groups.reduce(0) { $0 + $1.rowIDs.count },
+      isExpanded: isExpanded,
+      isRemoving: isRemovingRepository,
+      isResolvingRemote: isResolvingRemote,
+      isRemote: repository.host != nil,
+      repositoryID: repository.id,
+      store: store
+    )
+    Section {
+      if isExpanded {
+        SidebarItemsView(
+          repository: repository,
+          groups: groups,
+          shortcutHintByID: shortcutHintByID,
+          store: store,
+          terminalManager: terminalManager
         )
+        if let hoistSummary {
+          SidebarHoistSummaryRow(
+            repositoryName: Repository.sidebarDisplayName(custom: section?.title, fallback: repository.name),
+            summary: hoistSummary,
+            store: store
+          )
+        }
       }
     } header: {
-      RepoSectionHeaderView(
-        name: repository.name,
-        customTitle: section?.title,
-        color: section?.color,
-        isRemoving: isRemovingRepository,
-        hostInfo: repository.host?.displayAuthority,
-        isResolving: isResolvingRemote
-      )
+      EmptyView()
     }
-    .sectionActions {
-      SidebarSectionActionsView(
-        repositoryID: repository.id,
-        isRemovingRepository: isRemovingRepository,
-        isRemote: repository.host != nil,
-        store: store
-      )
+    .environment(\.sidebarRepoTint, section?.color)
+  }
+}
+
+/// Repo section header: title + muted count on the leading
+/// side; trailing `⋯` / `+` (revealed on hover when collapsed, always visible
+/// when expanded) and the expand/collapse chevron. Tapping the row toggles
+/// expansion through the same `repositoryExpansionChanged` action the native
+/// `Section(isExpanded:)` disclosure used to drive. A row-scale `Button`
+/// can't wrap the nested `⋯` / `+` controls, so the toggle rides
+/// `onTapGesture` while the chevron stays a real `Button` for keyboard and
+/// VoiceOver.
+private struct SidebarRepositoryHeaderRow: View {
+  let name: String
+  let customTitle: String?
+  let tint: RepositoryColor?
+  var hostInfo: String? = nil
+  let worktreeCount: Int
+  let isExpanded: Bool
+  let isRemoving: Bool
+  let isResolvingRemote: Bool
+  let isRemote: Bool
+  let repositoryID: Repository.ID
+  @Bindable var store: StoreOf<RepositoriesFeature>
+  @State private var isHovering = false
+
+  private var showsActions: Bool { isExpanded || isHovering }
+
+  private func toggleExpansion() {
+    withAnimation(.easeInOut(duration: 0.2)) {
+      store.send(.repositoryExpansionChanged(repositoryID, isExpanded: !isExpanded))
     }
   }
 
-  private var repositoryExpansionBinding: Binding<Bool> {
-    Binding(
-      get: { store.state.isRepositoryExpanded(repository.id) },
-      set: { isExpanded in
-        store.send(.repositoryExpansionChanged(repository.id, isExpanded: isExpanded))
+  var body: some View {
+    HStack(spacing: 4) {
+      RepoSectionHeaderView(
+        name: name,
+        customTitle: customTitle,
+        worktreeCount: worktreeCount,
+        isRemoving: isRemoving,
+        hostInfo: hostInfo,
+        isResolving: isResolvingRemote
+      )
+      Spacer(minLength: 0)
+      // Opacity (not insert/remove) keeps the row width stable on hover.
+      SidebarSectionActionsView(
+        repositoryID: repositoryID,
+        isRemovingRepository: isRemoving,
+        isRemote: isRemote,
+        store: store
+      )
+      .opacity(showsActions ? 1 : 0)
+      .allowsHitTesting(showsActions)
+      Button(action: toggleExpansion) {
+        Image(systemName: "chevron.right")
+          .imageScale(.small)
+          .fontWeight(.semibold)
+          .foregroundStyle(.secondary)
+          .rotationEffect(.degrees(isExpanded ? 90 : 0))
+          .frame(width: 16, height: 16)
+          .contentShape(Rectangle())
       }
-    )
+      .buttonStyle(.plain)
+      .help(isExpanded ? "Collapse" : "Expand")
+      .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")
+    }
+    .animation(.easeInOut(duration: 0.15), value: isExpanded)
+    .contentShape(Rectangle())
+    .onTapGesture(perform: toggleExpansion)
+    .onHover { isHovering = $0 }
+    .listRowBackground(SidebarRowChrome(tint: tint, isHovering: isHovering))
+    .listRowInsets(.vertical, 5)
+  }
+}
+
+/// 1px rule between repo sections — sections are separated, not rows.
+private struct SidebarSectionSeparator: View {
+  @Environment(\.pixelLength) private var pixelLength
+
+  var body: some View {
+    Rectangle()
+      .fill(Color(nsColor: .separatorColor))
+      .frame(height: pixelLength)
+      .padding(.vertical, 3)
+      .listRowInsets(EdgeInsets())
+      .moveDisabled(true)
+      .accessibilityHidden(true)
   }
 }
 
@@ -434,7 +518,6 @@ private struct SidebarFailedRepositorySection: View {
   let repositoryID: Repository.ID
   let rootURL: URL
   let customTitle: String?
-  let color: RepositoryColor?
   /// A disconnected SSH repo: route Remove to the remote config store and offer
   /// "Edit Connection…" to fix a bad host/path, rather than the local-roots flow.
   let isRemote: Bool
@@ -461,7 +544,6 @@ private struct SidebarFailedRepositorySection: View {
       RepoSectionHeaderView(
         name: fallbackName,
         customTitle: customTitle,
-        color: color,
         isRemoving: false,
         hostInfo: store.state.repositories[id: repositoryID]?.host?.displayAuthority
       )
@@ -505,7 +587,6 @@ private struct SidebarBlockedRepositorySection: View {
   let repositoryID: Repository.ID
   let rootURL: URL
   let customTitle: String?
-  let color: RepositoryColor?
   let store: StoreOf<RepositoriesFeature>
 
   var body: some View {
@@ -526,7 +607,6 @@ private struct SidebarBlockedRepositorySection: View {
       RepoSectionHeaderView(
         name: fallbackName,
         customTitle: customTitle,
-        color: color,
         isRemoving: false,
         hostInfo: nil
       )

@@ -41,6 +41,8 @@ struct SidebarItemView: View {
   var nestDepth: Int = 0
   /// Non-nil only inside the global Pinned / Active sections.
   var highlightSubtitle: SidebarHighlightRepoTag?
+  @State private var isHovering = false
+  @Environment(\.sidebarRepoTint) private var sidebarRepoTint
 
   var body: some View {
     let resolved = ResolvedRowDisplay(
@@ -89,6 +91,33 @@ struct SidebarItemView: View {
     .listRowInsets(.leading, CGFloat(nestDepth) * SidebarNestLayout.indentStep)
     .listRowInsets(.trailing, 4)
     .listRowInsets(.vertical, 6)
+    .listRowBackground(
+      SidebarRowChrome(tint: store.customTint ?? sidebarRepoTint, isHovering: isHovering)
+    )
+    .onHover { isHovering = $0 }
+  }
+}
+
+/// Row chrome shared by worktree rows and repo section
+/// headers: a 3px repo-accent stripe on the leading edge plus a 7%-primary
+/// hover fill (the `color-mix(foreground 7%)` formula, system-color
+/// compliant). Rows whose repo has no custom tint get a quiet neutral stripe
+/// so every row carries one. Sits in `.listRowBackground`, beneath the native
+/// selection highlight.
+struct SidebarRowChrome: View {
+  let tint: RepositoryColor?
+  let isHovering: Bool
+
+  var body: some View {
+    ZStack(alignment: .leading) {
+      if isHovering {
+        Color.primary.opacity(0.07)
+      }
+      UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 1.5, topTrailing: 1.5))
+        .fill(tint?.color ?? Color.secondary.opacity(0.3))
+        .frame(width: 3)
+        .padding(.vertical, 4)
+    }
   }
 }
 
@@ -97,6 +126,9 @@ struct ResolvedRowDisplay: Equatable {
     case none
     /// Standard per-repo subtitle. Rendered in the row's accent color.
     case plain(String)
+    /// Main worktree: a neutral outline pill reading "Default"
+    /// instead of accent-colored text — the repo accent lives on the stripe.
+    case mainMarker
     /// Highlight-section subtitle: `repo · host · trail`. `repo` paints with
     /// `repoColor`, `trail` with the row's accent; `hostInfo` (when set) inserts
     /// `· host` plus a `wifi` glyph. `trail == nil` collapses to just the repo.
@@ -166,6 +198,8 @@ struct ResolvedRowDisplay: Equatable {
 
     if hideSubtitle || shouldHideOnMatch {
       self.subtitle = .none
+    } else if isMainWorktree {
+      self.subtitle = .mainMarker
     } else {
       self.subtitle = .plain(effectiveWorktreeName)
     }
@@ -276,6 +310,7 @@ private struct TitleView: View, Equatable {
   let isTaskRunning: Bool
   // `==` ignores @Environment; SwiftUI tracks env changes separately.
   @Environment(\.backgroundProminence) private var backgroundProminence
+  @Environment(\.pixelLength) private var pixelLength
 
   static func == (lhs: Self, rhs: Self) -> Bool {
     lhs.name == rhs.name
@@ -307,6 +342,16 @@ private struct TitleView: View, Equatable {
           .appFont(.footnote)
           .foregroundStyle(accentStyle)
           .lineLimit(1)
+      case .mainMarker:
+        Text("Default")
+          .appFont(.caption2)
+          .foregroundStyle(.secondary)
+          .padding(.horizontal, 5)
+          .padding(.vertical, 1)
+          .overlay {
+            Capsule()
+              .strokeBorder(Color(nsColor: .separatorColor), lineWidth: pixelLength)
+          }
       case .highlight(let repo, let repoColor, let trail, let hostInfo):
         let repoStyle: AnyShapeStyle =
           isEmphasized
@@ -679,4 +724,8 @@ extension EnvironmentValues {
   @Entry var focusNotificationAction: (WorktreeTerminalNotification) -> Void = { _ in
     notificationEnvironmentLogger.warning("focusNotificationAction called but was never set in the environment.")
   }
+
+  /// Repo-level accent for the leading row stripe, set by the repo section so
+  /// per-worktree `customTint` can still win when both are present.
+  @Entry var sidebarRepoTint: RepositoryColor?
 }
