@@ -13,6 +13,17 @@ enum SidebarNestLayout {
   /// Width of a group header's disclosure chevron, narrower than the slot it
   /// sits in; the remainder is padded out after it.
   static let groupChevronWidth: CGFloat = 12
+  /// Gap between the leading accent stripe and a row's content. The stripe
+  /// lives in the row background, which `listRowInsets` doesn't touch, so this
+  /// only moves the content.
+  static let rowLeadingInset: CGFloat = 12
+  /// Matching gap on the trailing edge, before badges and section controls.
+  static let rowTrailingInset: CGFloat = 12
+  /// Vertical breathing room on a worktree row.
+  static let rowVerticalInset: CGFloat = 10
+  /// Repo header rows run a little taller than the worktrees under them, which
+  /// is what separates the two tiers now that neither draws a native header.
+  static let headerVerticalInset: CGFloat = 12
 }
 
 /// Repo identity carried alongside a sidebar row so the highlight sections
@@ -89,9 +100,12 @@ struct SidebarItemView: View {
       )
     }
     .labelStyle(.verticallyCentered)
-    .listRowInsets(.leading, CGFloat(nestDepth) * SidebarNestLayout.indentStep)
-    .listRowInsets(.trailing, 4)
-    .listRowInsets(.vertical, 6)
+    .listRowInsets(
+      .leading,
+      SidebarNestLayout.rowLeadingInset + CGFloat(nestDepth) * SidebarNestLayout.indentStep
+    )
+    .listRowInsets(.trailing, SidebarNestLayout.rowTrailingInset)
+    .listRowInsets(.vertical, SidebarNestLayout.rowVerticalInset)
     .listRowBackground(
       SidebarRowChrome(
         tint: store.customTint ?? sidebarRepoTint,

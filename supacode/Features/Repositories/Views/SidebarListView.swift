@@ -403,7 +403,9 @@ private struct SidebarRepositoryHeaderRow: View {
     .listRowBackground(
       SidebarRowChrome(tint: tint, isHovering: isHovering, showsTopSeparator: showsTopSeparator)
     )
-    .listRowInsets(.vertical, 5)
+    .listRowInsets(.leading, SidebarNestLayout.rowLeadingInset)
+    .listRowInsets(.trailing, SidebarNestLayout.rowTrailingInset)
+    .listRowInsets(.vertical, SidebarNestLayout.headerVerticalInset)
   }
 }
 
