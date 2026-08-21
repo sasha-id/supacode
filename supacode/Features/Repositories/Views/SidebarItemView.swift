@@ -43,6 +43,7 @@ struct SidebarItemView: View {
   var highlightSubtitle: SidebarHighlightRepoTag?
   @State private var isHovering = false
   @Environment(\.sidebarRepoTint) private var sidebarRepoTint
+  @Environment(\.sidebarRowTopSeparator) private var sidebarRowTopSeparator
 
   var body: some View {
     let resolved = ResolvedRowDisplay(
@@ -92,7 +93,11 @@ struct SidebarItemView: View {
     .listRowInsets(.trailing, 4)
     .listRowInsets(.vertical, 6)
     .listRowBackground(
-      SidebarRowChrome(tint: store.customTint ?? sidebarRepoTint, isHovering: isHovering)
+      SidebarRowChrome(
+        tint: store.customTint ?? sidebarRepoTint,
+        isHovering: isHovering,
+        showsTopSeparator: sidebarRowTopSeparator
+      )
     )
     .pointerStyle(.link)
     .onHover { isHovering = $0 }
@@ -119,10 +124,9 @@ struct SidebarRowChrome: View {
     // and center itself in the row instead of hugging the leading edge.
     ZStack(alignment: .leading) {
       if isHovering {
-        // Matches the radius of the native sidebar selection pill so hover and
-        // selection read as the same shape.
-        RoundedRectangle(cornerRadius: 6)
-          .fill(Color.primary.opacity(0.07))
+        // Square and full-bleed so hover covers the whole row and reads as the
+        // same shape as the selection fill beneath it.
+        Color.primary.opacity(0.07)
       }
       UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 1.5, topTrailing: 1.5))
         .fill(tint?.color ?? Color.secondary.opacity(0.3))
@@ -747,4 +751,10 @@ extension EnvironmentValues {
   /// Repo-level accent for the leading row stripe, set by the repo section so
   /// per-worktree `customTint` can still win when both are present.
   @Entry var sidebarRepoTint: RepositoryColor?
+
+  /// Set on a section whose single row opens a new repository, so the row draws
+  /// the inter-repo rule that a git repo's header row draws for itself. Only
+  /// ever set on one-row sections — on a multi-row section every row would
+  /// draw it.
+  @Entry var sidebarRowTopSeparator: Bool = false
 }

@@ -63,7 +63,17 @@ struct SidebarListView: View {
           )
         }
       }
-      .listStyle(.sidebar)
+      // `.sidebar` draws selection as a rounded pill inset from both edges and
+      // pads every section apart, which left a dead strip under each row that
+      // the hover fill couldn't reach. `.plain` gives full-bleed square rows;
+      // the repo separators are ours (`SidebarRowChrome`), and the sidebar's
+      // translucency comes from the split-view column, not the list, so the
+      // hidden scroll background keeps it showing through.
+      .listStyle(.plain)
+      .scrollContentBackground(.hidden)
+      // Drives the row-selection fill. Kept a muted grey rather than the accent
+      // so a selected row reads as a surface, not a highlight.
+      .tint(Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.6))
       .focused($isSidebarFocused)
       .frame(minWidth: 220)
       .onChange(of: groupPinnedRows, initial: false) { _, _ in
@@ -227,8 +237,8 @@ private struct SidebarSectionDispatcher: View {
       )
     case .folder(let repositoryID, let rowID):
       if let repository = store.state.repositories[id: repositoryID] {
-        // Empty header keeps `.listStyle(.sidebar)` from merging two
-        // consecutive folder repos visually.
+        // A folder repo is a single row and has no header of its own, so it
+        // carries the inter-repo rule itself.
         Section {
           SidebarFolderRow(
             repository: repository,
@@ -240,6 +250,7 @@ private struct SidebarSectionDispatcher: View {
         } header: {
           EmptyView()
         }
+        .environment(\.sidebarRowTopSeparator, structure.sections.first?.id != section.id)
       }
     case .repository(let repositoryID, let groups):
       if let repository = store.state.repositories[id: repositoryID] {
