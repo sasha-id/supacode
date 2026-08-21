@@ -384,6 +384,7 @@ private struct SidebarRepositoryHeaderRow: View {
     .animation(.easeInOut(duration: 0.15), value: isExpanded)
     .contentShape(Rectangle())
     .onTapGesture(perform: toggleExpansion)
+    .pointerStyle(.link)
     .help(isExpanded ? "Collapse \(name)" : "Expand \(name)")
     .accessibilityAddTraits(.isButton)
     .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")

@@ -94,6 +94,7 @@ struct SidebarItemView: View {
     .listRowBackground(
       SidebarRowChrome(tint: store.customTint ?? sidebarRepoTint, isHovering: isHovering)
     )
+    .pointerStyle(.link)
     .onHover { isHovering = $0 }
   }
 }
