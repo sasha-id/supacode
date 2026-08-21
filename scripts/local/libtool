@@ -1,0 +1,98 @@
+#!/bin/bash
+# LOCAL BUILD HATCH — not for upstream.
+#
+# Xcode 26.6's libtool silently DROPS zig-emitted objects when merging static
+# archives ("64-bit mach-o member 'libghostty_zcu.o' not 8-byte aligned"), so the
+# GhosttyKit macOS slice loses every ghostty_surface_* symbol and the app fails to
+# link. `ar` has no alignment rule, so this shim performs the merge with `ar`
+# instead: extract every member of every input archive (keeping same-named members
+# from different inputs distinct — e.g. dcimgui's ext.o vs ghostty's ext.o) and
+# append them all in input order. Anything it cannot handle (fat inputs, an
+# unexpected argv) falls through to the real libtool.
+#
+# It sits on PATH ahead of the real libtool for the ghostty build only; see
+# scripts/build-ghostty.sh.
+set -euo pipefail
+
+real_libtool="$(/usr/bin/xcrun -f libtool)"
+ar_bin="$(/usr/bin/xcrun -f ar)"
+ranlib_bin="$(/usr/bin/xcrun -f ranlib)"
+
+out=""
+inputs=()
+passthrough=0
+args=("$@")
+i=0
+while [ "${i}" -lt "${#args[@]}" ]; do
+  case "${args[$i]}" in
+    -static) ;;
+    -o) i=$((i + 1)); out="${args[$i]:-}" ;;
+    *.a) inputs+=("${args[$i]}") ;;
+    *) passthrough=1 ;;
+  esac
+  i=$((i + 1))
+done
+
+fall_back() {
+  exec "${real_libtool}" "$@"
+}
+
+[ "${passthrough}" -eq 0 ] && [ -n "${out}" ] && [ "${#inputs[@]}" -gt 0 ] || fall_back "$@"
+
+# `ar` cannot read universal archives; libtool merges per-arch here, so a fat input
+# means we are in a case this shim was not written for.
+for archive in "${inputs[@]}"; do
+  [ -f "${archive}" ] || fall_back "$@"
+  # Note: a thin archive reports "Non-fat file: ...", which contains "fat file" —
+  # anchor on the universal form instead.
+  if /usr/bin/lipo -info "${archive}" 2>/dev/null | grep -q "^Architectures in the fat file"; then
+    fall_back "$@"
+  fi
+done
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+
+objects=()
+index=0
+for archive in "${inputs[@]}"; do
+  case "${archive}" in
+    /*) ;;
+    *) archive="${PWD}/${archive}" ;;
+  esac
+  index=$((index + 1))
+  dir="${tmp}/in${index}"
+  mkdir -p "${dir}"
+  ( cd "${dir}" && "${ar_bin}" x "${archive}" )
+  # Members are stored with the archived mode, which zig writes as 0; `ar q` then
+  # fails with "Permission denied" when reading them back.
+  chmod -R u+rw "${dir}"
+  while IFS= read -r member; do
+    case "${member}" in
+      __.SYMDEF*|"") continue ;;
+    esac
+    [ -f "${dir}/${member}" ] || continue
+    objects+=("${dir}/${member}")
+  done < <("${ar_bin}" -t "${archive}")
+done
+
+[ "${#objects[@]}" -gt 0 ] || fall_back "$@"
+
+rm -f "${out}"
+# Append in batches so a large member list cannot overflow the argument limit.
+batch=()
+flush_batch() {
+  [ "${#batch[@]}" -gt 0 ] || return 0
+  "${ar_bin}" q "${out}" "${batch[@]}"
+  batch=()
+}
+for object in "${objects[@]}"; do
+  batch+=("${object}")
+  if [ "${#batch[@]}" -ge 200 ]; then
+    flush_batch
+  fi
+done
+flush_batch
+"${ranlib_bin}" "${out}"
+
+echo "libtool-shim: merged ${#objects[@]} member(s) from ${#inputs[@]} archive(s) into ${out}" >&2
