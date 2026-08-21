@@ -73,7 +73,7 @@ struct SidebarListView: View {
       .scrollContentBackground(.hidden)
       // Drives the row-selection fill. Kept a muted grey rather than the accent
       // so a selected row reads as a surface, not a highlight.
-      .tint(Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.6))
+      .tint(Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.5))
       .focused($isSidebarFocused)
       .frame(minWidth: 220)
       .onChange(of: groupPinnedRows, initial: false) { _, _ in
