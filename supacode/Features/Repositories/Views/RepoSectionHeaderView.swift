@@ -6,7 +6,7 @@ struct RepoSectionHeaderView: View {
   let customTitle: String?
   /// Muted `(N)` worktree count next to the title; `nil` hides it (failed /
   /// blocked repos render no rows to count).
-  var worktreeCount: Int? = nil
+  var worktreeCount: Int?
   let isRemoving: Bool
   /// `[user@]host[:port]` when the repository lives on an SSH host, else nil;
   /// surfaces a `wifi` glyph beside the title, full value shown on hover.

@@ -107,16 +107,34 @@ struct SidebarItemView: View {
 struct SidebarRowChrome: View {
   let tint: RepositoryColor?
   let isHovering: Bool
+  /// Hairline along the top edge, marking where a repo section begins. Drawn
+  /// here rather than as its own list row so the rule costs no extra height.
+  var showsTopSeparator: Bool = false
+  @Environment(\.pixelLength) private var pixelLength
 
   var body: some View {
+    // The outer `.frame` is load-bearing: a `ZStack` sizes to its children, so
+    // without it the non-hovering case (stripe only) would shrink to 3pt wide
+    // and center itself in the row instead of hugging the leading edge.
     ZStack(alignment: .leading) {
       if isHovering {
-        Color.primary.opacity(0.07)
+        // Matches the radius of the native sidebar selection pill so hover and
+        // selection read as the same shape.
+        RoundedRectangle(cornerRadius: 6)
+          .fill(Color.primary.opacity(0.07))
       }
       UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 1.5, topTrailing: 1.5))
         .fill(tint?.color ?? Color.secondary.opacity(0.3))
         .frame(width: 3)
         .padding(.vertical, 4)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    .overlay(alignment: .top) {
+      if showsTopSeparator {
+        Rectangle()
+          .fill(Color(nsColor: .separatorColor))
+          .frame(height: pixelLength)
+      }
     }
   }
 }

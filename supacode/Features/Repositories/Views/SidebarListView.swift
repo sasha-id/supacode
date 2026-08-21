@@ -243,13 +243,11 @@ private struct SidebarSectionDispatcher: View {
       }
     case .repository(let repositoryID, let groups):
       if let repository = store.state.repositories[id: repositoryID] {
-        if structure.sections.first?.id != section.id {
-          SidebarSectionSeparator()
-        }
         SidebarGitRepositorySection(
           repository: repository,
           groups: groups,
           hoistSummary: structure.hoistSummaryByRepositoryID[repositoryID],
+          showsTopSeparator: structure.sections.first?.id != section.id,
           shortcutHintByID: shortcutHintByID,
           store: store,
           terminalManager: terminalManager
@@ -265,6 +263,9 @@ private struct SidebarGitRepositorySection: View {
   /// Non-nil when one or more of this repo's rows were hoisted into the
   /// highlight sections; rendered as a muted summary line under the rows.
   let hoistSummary: SidebarHoistSummary?
+  /// False only for the very first section in the list, where a rule would
+  /// hang off the top edge with nothing above it.
+  let showsTopSeparator: Bool
   let shortcutHintByID: [Worktree.ID: String]
   @Bindable var store: StoreOf<RepositoriesFeature>
   let terminalManager: WorktreeTerminalManager
@@ -273,23 +274,28 @@ private struct SidebarGitRepositorySection: View {
     let isResolvingRemote = store.state.resolvingRemoteRepositoryIDs.contains(repository.id)
     let section = store.state.sidebar.sections[repository.id]
     let isExpanded = store.state.isRepositoryExpanded(repository.id)
-    // The header is a plain row above a `Section` with an empty header (the
-    // folder-repo pattern), so the expand/collapse chevron can live on the
-    // trailing edge instead of the native leading disclosure.
-    SidebarRepositoryHeaderRow(
-      name: repository.name,
-      customTitle: section?.title,
-      tint: section?.color,
-      hostInfo: repository.host?.displayAuthority,
-      worktreeCount: groups.reduce(0) { $0 + $1.rowIDs.count },
-      isExpanded: isExpanded,
-      isRemoving: isRemovingRepository,
-      isResolvingRemote: isResolvingRemote,
-      isRemote: repository.host != nil,
-      repositoryID: repository.id,
-      store: store
-    )
+    // The header is the section's own first row, not its `header:` slot, so the
+    // expand/collapse chevron can live on the trailing edge and the row can
+    // carry the same full-bleed chrome as the worktrees beneath it. The empty
+    // `header:` is the folder-repo pattern: it keeps `.listStyle(.sidebar)`
+    // from merging two adjacent repos. Everything stays inside one `Section`
+    // so a collapsed repo costs exactly one row, and so the outer `.onMove`
+    // still sees one draggable element per repository.
     Section {
+      SidebarRepositoryHeaderRow(
+        name: repository.name,
+        customTitle: section?.title,
+        tint: section?.color,
+        hostInfo: repository.host?.displayAuthority,
+        worktreeCount: groups.reduce(0) { $0 + $1.rowIDs.count },
+        isExpanded: isExpanded,
+        isRemoving: isRemovingRepository,
+        isResolvingRemote: isResolvingRemote,
+        isRemote: repository.host != nil,
+        showsTopSeparator: showsTopSeparator,
+        repositoryID: repository.id,
+        store: store
+      )
       if isExpanded {
         SidebarItemsView(
           repository: repository,
@@ -325,12 +331,13 @@ private struct SidebarRepositoryHeaderRow: View {
   let name: String
   let customTitle: String?
   let tint: RepositoryColor?
-  var hostInfo: String? = nil
+  var hostInfo: String?
   let worktreeCount: Int
   let isExpanded: Bool
   let isRemoving: Bool
   let isResolvingRemote: Bool
   let isRemote: Bool
+  let showsTopSeparator: Bool
   let repositoryID: Repository.ID
   @Bindable var store: StoreOf<RepositoriesFeature>
   @State private var isHovering = false
@@ -338,7 +345,7 @@ private struct SidebarRepositoryHeaderRow: View {
   private var showsActions: Bool { isExpanded || isHovering }
 
   private func toggleExpansion() {
-    withAnimation(.easeInOut(duration: 0.2)) {
+    _ = withAnimation(.easeInOut(duration: 0.2)) {
       store.send(.repositoryExpansionChanged(repositoryID, isExpanded: !isExpanded))
     }
   }
@@ -363,40 +370,28 @@ private struct SidebarRepositoryHeaderRow: View {
       )
       .opacity(showsActions ? 1 : 0)
       .allowsHitTesting(showsActions)
-      Button(action: toggleExpansion) {
-        Image(systemName: "chevron.right")
-          .imageScale(.small)
-          .fontWeight(.semibold)
-          .foregroundStyle(.secondary)
-          .rotationEffect(.degrees(isExpanded ? 90 : 0))
-          .frame(width: 16, height: 16)
-          .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .help(isExpanded ? "Collapse" : "Expand")
-      .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")
+      // A visual affordance only: the whole row is the tap target and carries
+      // the button trait, so exposing the chevron separately would announce the
+      // same action twice.
+      Image(systemName: "chevron.right")
+        .imageScale(.small)
+        .fontWeight(.semibold)
+        .foregroundStyle(.secondary)
+        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+        .frame(width: 16, height: 16)
+        .accessibilityHidden(true)
     }
     .animation(.easeInOut(duration: 0.15), value: isExpanded)
     .contentShape(Rectangle())
     .onTapGesture(perform: toggleExpansion)
+    .help(isExpanded ? "Collapse \(name)" : "Expand \(name)")
+    .accessibilityAddTraits(.isButton)
+    .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")
     .onHover { isHovering = $0 }
-    .listRowBackground(SidebarRowChrome(tint: tint, isHovering: isHovering))
+    .listRowBackground(
+      SidebarRowChrome(tint: tint, isHovering: isHovering, showsTopSeparator: showsTopSeparator)
+    )
     .listRowInsets(.vertical, 5)
-  }
-}
-
-/// 1px rule between repo sections — sections are separated, not rows.
-private struct SidebarSectionSeparator: View {
-  @Environment(\.pixelLength) private var pixelLength
-
-  var body: some View {
-    Rectangle()
-      .fill(Color(nsColor: .separatorColor))
-      .frame(height: pixelLength)
-      .padding(.vertical, 3)
-      .listRowInsets(EdgeInsets())
-      .moveDisabled(true)
-      .accessibilityHidden(true)
   }
 }
 
