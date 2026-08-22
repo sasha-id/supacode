@@ -346,11 +346,9 @@ final class WorktreeTerminalManager {
       openFileWithScript(in: worktree, input: input)
     case .ensureInitialTab(let worktree, let runSetupScriptIfNew, let focusing):
       ensureInitialTab(in: worktree, runSetupScriptIfNew: runSetupScriptIfNew, focusing: focusing)
-      // Arm terminal focus on the just-created host; it claims first responder
-      // immediately when the surface is live and keyed, else once it becomes so.
-      if focusing {
-        host(for: worktree).focusSelectedTab()
-      }
+      activateHost(for: worktree, focusing: focusing)
+    case .activateWorktree(let worktree, let focusing):
+      activateHost(for: worktree, focusing: focusing)
     case .stopRunScript(let worktree, let focusing):
       stopBlockingScripts(in: worktree) { host in
         self.closeBlockingTabs(in: worktree, host: host, focusing: focusing) { $0.isRunKind }
@@ -441,6 +439,20 @@ final class WorktreeTerminalManager {
     return true
   }
 
+  /// Wires up a worktree's host and arms terminal focus on it.
+  ///
+  /// `host(for:)` attaches the layout and stamps the title prefix, which a
+  /// hydrated worktree still needs on first selection. It deliberately creates
+  /// nothing: a worktree with an empty layout waits for ⌘T. Focus claims first
+  /// responder immediately when the surface is live and keyed, else once it
+  /// becomes so.
+  private func activateHost(for worktree: Worktree, focusing: Bool) {
+    let host = host(for: worktree)
+    if focusing {
+      host.focusSelectedTab()
+    }
+  }
+
   /// Selects the tab at a 1-based index, clamped to the strip, matching Ghostty
   /// goto_tab semantics.
   private func selectTab(atIndex index: Int, in worktree: Worktree) {
@@ -485,7 +497,8 @@ final class WorktreeTerminalManager {
       host(for: worktree).navigateSearchOnFocusedSurface(.previous)
     case .endSearch(let worktree):
       host(for: worktree).performBindingActionOnFocusedSurface("end_search")
-    case .createTab, .createTabWithInput, .openFileWithScript, .ensureInitialTab, .stopRunScript, .stopScript,
+    case .createTab, .createTabWithInput, .openFileWithScript, .ensureInitialTab, .activateWorktree,
+      .stopRunScript, .stopScript,
       .runBlockingScript, .closeFocusedTab, .closeFocusedSurface, .performBindingAction,
       .performBindingActionOnSurface, .selectTab, .selectTabAtIndex, .selectRelativeTab, .focusSurface, .splitSurface,
       .destroyTab, .destroySurface, .renameTab, .setImagePasteAgents, .prune, .removeWorktreeLayout,
@@ -530,7 +543,8 @@ final class WorktreeTerminalManager {
       host(for: worktree).performBindingAction(action, onSurfaceID: surfaceID)
     case .setImagePasteAgents(let surfaceID, let agents):
       setImagePasteAgents(agents, onSurfaceID: surfaceID)
-    case .createTab, .createTabWithInput, .openFileWithScript, .ensureInitialTab, .stopRunScript, .stopScript,
+    case .createTab, .createTabWithInput, .openFileWithScript, .ensureInitialTab, .activateWorktree,
+      .stopRunScript, .stopScript,
       .runBlockingScript, .closeFocusedTab, .closeFocusedSurface, .startSearch, .searchSelection,
       .navigateSearchNext, .navigateSearchPrevious, .endSearch, .selectTab, .selectTabAtIndex, .selectRelativeTab,
       .focusSurface, .splitSurface, .destroyTab, .destroySurface, .renameTab, .prune, .removeWorktreeLayout,
@@ -580,7 +594,8 @@ final class WorktreeTerminalManager {
       // event fires; refresh here or the window keeps the previous tint.
       refreshFocusedSurfaceBackground()
       terminalLogger.info("Selected worktree \(id?.rawValue ?? "nil")")
-    case .createTab, .createTabWithInput, .openFileWithScript, .ensureInitialTab, .stopRunScript, .stopScript,
+    case .createTab, .createTabWithInput, .openFileWithScript, .ensureInitialTab, .activateWorktree,
+      .stopRunScript, .stopScript,
       .runBlockingScript, .closeFocusedTab, .closeFocusedSurface, .performBindingAction,
       .performBindingActionOnSurface, .setImagePasteAgents, .startSearch, .searchSelection, .navigateSearchNext,
       .navigateSearchPrevious, .endSearch, .selectTab, .selectTabAtIndex, .selectRelativeTab, .focusSurface,
