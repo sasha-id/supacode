@@ -93,7 +93,8 @@ struct AgentPresenceFeature {
 
     enum Delegate: Equatable, Sendable {
       /// Surfaces whose presence record was added, removed, or had its activity flip.
-      /// Parent fans out per-row `agentSnapshotChanged` via the `surfaceToItemID` reverse index.
+      /// Parent fans out per-row `agentSnapshotChanged` to the rows whose
+      /// `surfaceIDs` intersect the set.
       case surfacesChanged(Set<UUID>)
     }
   }

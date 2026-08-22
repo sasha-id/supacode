@@ -265,6 +265,10 @@ struct RepositoriesFeature {
     /// in the recompute helper keeps a no-op rebuild from invalidating
     /// SwiftUI when the user-visible layout didn't actually change.
     var sidebarStructure: SidebarStructure = .placeholder
+    /// Input snapshot behind `recomputeSidebarStructureIfChanged()`, so an
+    /// invalidating action whose inputs didn't actually move skips the walk
+    /// instead of rebuilding the whole plan only to diff it away.
+    var sidebarStructureInputs = SidebarStructureInputsCache()
     /// Cached projection of the focused row's display fields. The detail body
     /// reads this directly instead of `sidebarItems[id: id]` so per-leaf agent
     /// / notification mutations on the focused row don't invalidate the

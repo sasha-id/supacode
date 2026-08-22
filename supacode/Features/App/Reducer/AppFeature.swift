@@ -2140,13 +2140,13 @@ struct AppFeature {
   ) -> Effect<Action> {
     @Shared(.settingsFile) var settingsFile: SettingsFile
     let badgesEnabled = settingsFile.global.agentPresenceBadgesEnabled
-    // Hoisted: `surfaceToItemID` is a computed property that rebuilds the dict
-    // per access; reading it once keeps this loop O(surfaces) not O(rows × surfaces).
-    let surfaceToItemID = state.repositories.surfaceToItemID
+    // Resolved by scanning the rows rather than through `surfaceToItemID`: that
+    // computed property materializes a dictionary of every row's surfaces on
+    // each access, and an agent storm only ever needs the rows behind `surfaces`.
     var affectedRowIDs: Set<SidebarItemID> = []
-    for surfaceID in surfaces {
-      guard let rowID = surfaceToItemID[surfaceID] else { continue }
-      affectedRowIDs.insert(rowID)
+    for row in state.repositories.sidebarItems
+    where row.surfaceIDs.contains(where: surfaces.contains) {
+      affectedRowIDs.insert(row.id)
     }
     return agentSnapshotEffects(
       for: affectedRowIDs,

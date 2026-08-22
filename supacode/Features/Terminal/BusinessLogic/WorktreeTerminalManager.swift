@@ -718,9 +718,12 @@ final class WorktreeTerminalManager {
     for worktree: Worktree,
     runSetupScriptIfNew: () -> Bool = { false }
   ) -> WorktreeContentHost {
-    // Unconditional: attach is idempotent and a hydrated layout still needs
-    // its minted-title prefix stamped.
-    sendTerminals(.attachLayout(worktreeID: worktree.id, titlePrefix: worktree.name))
+    // Attach only mints the layout and stamps the minted-title prefix, so a
+    // hydrated layout already carrying this prefix needs no send. The nil
+    // comparison covers the not-yet-attached case.
+    if layoutState(for: worktree.id)?.titlePrefix != worktree.name {
+      sendTerminals(.attachLayout(worktreeID: worktree.id, titlePrefix: worktree.name))
+    }
     if let existing = hosts[worktree.id] {
       if runSetupScriptIfNew() {
         existing.enableSetupScriptIfNeeded()
@@ -811,9 +814,13 @@ final class WorktreeTerminalManager {
 
   /// Fires the layout-changed side effects the reducer cannot: persistence,
   /// content lifecycle, surface activity, the pane windows, and the sidebar
-  /// projection. Called for every layout action, not only topology changes.
-  func handleLayoutChanged(for worktreeID: Worktree.ID) {
+  /// projection. Called for every layout action, so everything past the
+  /// persistence debounce is gated on `.structural`: a ratio drag or a
+  /// reported title moves no surface and adds none, and those arrive at frame
+  /// rate.
+  func handleLayoutChanged(for worktreeID: Worktree.ID, scope: LayoutChangeScope) {
     markLayoutDirty(worktreeID: worktreeID)
+    guard scope == .structural else { return }
     hosts[worktreeID]?.reconcileContentLifecycle()
     // Zoom and selection changes flip which surfaces render; re-derive
     // occlusion and focus so hidden panes stop drawing.

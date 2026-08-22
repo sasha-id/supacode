@@ -2,14 +2,23 @@ import ComposableArchitecture
 import Foundation
 import SupacodeSettingsShared
 
+/// How much of the app-shell layout-changed work a layout action can invalidate.
+nonisolated enum LayoutChangeScope: Equatable, Sendable {
+  /// Topology, tab visibility, pane focus, or the live surface set may have moved.
+  case structural
+  /// Only per-layout bookkeeping changed (split ratios, reported titles, the
+  /// inline rename field), so nothing but the persisted snapshot is stale.
+  case bookkeeping
+}
+
 /// App-shell side effects of a layout change (persistence debounce, sidebar
 /// projection, dormant watchers); the integration layer injects the live hook.
 nonisolated struct LayoutChangeObserver: Sendable {
-  var layoutChanged: @MainActor @Sendable (Worktree.ID) -> Void
+  var layoutChanged: @MainActor @Sendable (Worktree.ID, LayoutChangeScope) -> Void
 }
 
 extension LayoutChangeObserver: DependencyKey {
-  static let liveValue = LayoutChangeObserver(layoutChanged: { _ in })
+  static let liveValue = LayoutChangeObserver(layoutChanged: { _, _ in })
   static let testValue = liveValue
 }
 
@@ -70,19 +79,21 @@ struct TerminalsFeature {
 
   private static let logger = SupaLogger("TerminalsFeature")
 
-  // Ratio drags and title reports arrive at high frequency and cannot flip
-  // tab visibility; skip the layout-wide re-diff for them.
-  private static func canAffectVisibility(_ action: LayoutFeature.Action) -> Bool {
+  // Ratio drags and title reports arrive at high frequency and can flip
+  // neither tab visibility nor anything the app-shell hooks re-derive; skip
+  // the layout-wide re-diff and the heavy hooks for them. Exhaustive so a new
+  // action has to declare itself; classify as `.structural` when unsure.
+  static func changeScope(_ action: LayoutFeature.Action) -> LayoutChangeScope {
     switch action {
     case .resizePane, .runtime(.titleChanged), .beginTabRename, .endTabRename:
-      return false
+      return .bookkeeping
     case .newTab, .splitPane, .closeTab, .closePane, .selectTab, .renameTab, .focusPane,
       .moveTab, .moveTabToSplit, .moveTabToSpanningSplit, .enterWindowMode, .exitWindowMode,
       .equalizePanes, .toggleZoom, .hibernateTab, .wakeTab, .runtime(.killConfirmed),
       .contentRequestedClose, .contentRequestedNewTab, .contentRequestedSplit,
       .contentRequestedFocus, .contentRequestedFocusSplit, .contentRequestedToggleZoom,
       .contentRequestedResize, .contentRequestedGotoTab, .contentRequestedMoveTab, .alert:
-      return true
+      return .structural
     }
   }
 
@@ -97,10 +108,11 @@ struct TerminalsFeature {
         // The element reducer already ran; any topology change may flip tab
         // visibility, so re-diff the grace timers and fire the app-shell
         // hooks (persistence debounce, sidebar projection).
-        let hibernation = Self.canAffectVisibility(action) ? reconcileHibernation(&state) : .none
+        let scope = Self.changeScope(action)
+        let hibernation = scope == .structural ? reconcileHibernation(&state) : .none
         return .merge(
           hibernation,
-          .run { _ in await layoutChangeObserver.layoutChanged(worktreeID) }
+          .run { _ in await layoutChangeObserver.layoutChanged(worktreeID, scope) }
         )
 
       case .layouts:
