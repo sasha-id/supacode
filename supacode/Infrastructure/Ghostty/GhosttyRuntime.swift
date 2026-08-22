@@ -562,6 +562,7 @@ final class GhosttyRuntime {
   private static func loadConfig() -> (config: ghostty_config_t, userBackgroundOpacity: Double)? {
     @Shared(.settingsFile) var settingsFile
     let themeSyncEnabled = settingsFile.global.terminalThemeSyncEnabled
+    let translucencyEnabled = settingsFile.global.terminalTranslucencyEnabled
     let supacodeUserConfigURL = SupacodePaths.ghosttyUserConfigURL
     let plan = ConfigResolution.plan(
       mode: settingsFile.global.ghosttyUserConfigMode,
@@ -583,7 +584,9 @@ final class GhosttyRuntime {
     // mirroring the user tiers so the tint matches the active mode.
     let userOpacity: Double
     if let userView = ghostty_config_clone(config) {
-      loadBundledTheme(into: userView, enabled: themeSyncEnabled)
+      loadBundledTheme(
+        into: userView, themeSyncEnabled: themeSyncEnabled, translucencyEnabled: translucencyEnabled
+      )
       if plan.loadSupacodeUserConfig {
         loadUserFile(at: supacodeUserConfigURL, into: userView)
       }
@@ -595,7 +598,8 @@ final class GhosttyRuntime {
     }
     // Tier 2: the always-applied Supacode overlay (theme, then cosmetic
     // overrides). The user's config may override these.
-    loadBundledTheme(into: config, enabled: themeSyncEnabled)
+    loadBundledTheme(
+      into: config, themeSyncEnabled: themeSyncEnabled, translucencyEnabled: translucencyEnabled)
     loadBundledOverrides(into: config)
     // Tier 3: the user-authored Supacode config, layered on top so it overrides.
     // Its `config-file` includes are not followed: re-running the recursive pass
@@ -635,8 +639,9 @@ final class GhosttyRuntime {
   /// Cosmetic Supacode defaults loaded in the middle tier; the user's own
   /// Supacode config may override these.
   ///
-  /// No `background-opacity` override: surfaces render translucent at the
-  /// theme's opacity and keep their own OSC 11 color. The window tint behind
+  /// No `background-opacity` override: that lives in `loadBundledTheme`, gated
+  /// on the translucency setting. When translucency is on, surfaces render at
+  /// the theme's opacity and keep their own OSC 11 color; the window tint behind
   /// them is masked out by `WindowTintBackdrop` so a surface composites over
   /// blur, not the tint (no double background).
   ///
@@ -739,23 +744,58 @@ final class GhosttyRuntime {
     }
   }
 
-  /// Loads the bundled Supacode light/dark theme plus its opacity and blur. No-op when sync is disabled.
-  private static func loadBundledTheme(into config: ghostty_config_t, enabled: Bool) {
-    guard enabled else { return }
-    guard
-      let lightPath = Bundle.main.path(forResource: "Supacode Light", ofType: nil),
-      let darkPath = Bundle.main.path(forResource: "Supacode Dark", ofType: nil)
-    else {
-      assertionFailure("Bundled Supacode themes missing from app bundle.")
-      logger.warning("Bundled Supacode themes missing from app bundle.")
-      return
+  /// Pure decision for which config lines `loadBundledTheme` emits, given the
+  /// theme-sync and translucency settings. Kept free of GhosttyKit so the
+  /// (themeSync x translucency) matrix is unit-testable.
+  static func bundledThemeLines(
+    themeSyncEnabled: Bool,
+    translucencyEnabled: Bool,
+    lightThemePath: String,
+    darkThemePath: String
+  ) -> [String] {
+    var lines: [String] = []
+    if themeSyncEnabled {
+      lines.append("theme = light:\(lightThemePath),dark:\(darkThemePath)")
     }
-    let contents = """
-      theme = light:\(lightPath),dark:\(darkPath)
-      background-opacity = 0.9
-      background-blur = true
-      """
-    let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("supacode-theme.conf")
+    if translucencyEnabled {
+      lines.append("background-opacity = 0.9")
+      lines.append("background-blur = true")
+    }
+    return lines
+  }
+
+  /// Loads the bundled Supacode light/dark theme (when theme sync is on) and the
+  /// 0.9 opacity + blur look (when translucency is on). No-op when both are off,
+  /// which leaves the terminal at Ghostty's own opaque default.
+  private static func loadBundledTheme(
+    into config: ghostty_config_t,
+    themeSyncEnabled: Bool,
+    translucencyEnabled: Bool
+  ) {
+    var lightPath = ""
+    var darkPath = ""
+    if themeSyncEnabled {
+      guard
+        let resolvedLightPath = Bundle.main.path(forResource: "Supacode Light", ofType: nil),
+        let resolvedDarkPath = Bundle.main.path(forResource: "Supacode Dark", ofType: nil)
+      else {
+        assertionFailure("Bundled Supacode themes missing from app bundle.")
+        logger.warning("Bundled Supacode themes missing from app bundle.")
+        return
+      }
+      lightPath = resolvedLightPath
+      darkPath = resolvedDarkPath
+    }
+    let lines = Self.bundledThemeLines(
+      themeSyncEnabled: themeSyncEnabled,
+      translucencyEnabled: translucencyEnabled,
+      lightThemePath: lightPath,
+      darkThemePath: darkPath
+    )
+    guard !lines.isEmpty else { return }
+    let contents = lines.joined(separator: "\n")
+    let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "supacode-theme.conf")
     do {
       try contents.write(to: tempURL, atomically: true, encoding: .utf8)
     } catch {
@@ -955,8 +995,9 @@ extension Notification.Name {
     "ghosttyFocusedSurfaceBackgroundDidChange")
   // Posted when a tint mask region (a mounted surface wrapper) lays out or
   // attaches/detaches from its window, so `WindowTintBackdrop` re-cuts the hole
-  // it masks out of the window tint. Handled synchronously so the mask never lags
-  // a frame behind the region: a stale hole flashes the transparent backing.
+  // it masks out of the window tint. Only a translucent background cuts holes at
+  // all; the backdrop ignores these otherwise, and coalesces the rest into one
+  // rebuild per runloop turn.
   static let ghosttyTintMaskRegionDidChange = Notification.Name("ghosttyTintMaskRegionDidChange")
 }
 

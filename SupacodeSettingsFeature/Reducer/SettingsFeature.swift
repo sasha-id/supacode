@@ -70,6 +70,7 @@ public struct SettingsFeature {
     public var copyUntrackedOnWorktreeCreate: Bool
     public var pullRequestMergeStrategy: PullRequestMergeStrategy
     public var terminalThemeSyncEnabled: Bool
+    public var terminalTranslucencyEnabled: Bool
     public var ghosttyUserConfigMode: GhosttyUserConfigMode
     public var automatedActionPolicy: AutomatedActionPolicy
     public var defaultWorktreeBaseDirectoryPath: String
@@ -162,6 +163,7 @@ public struct SettingsFeature {
       copyUntrackedOnWorktreeCreate = settings.copyUntrackedOnWorktreeCreate
       pullRequestMergeStrategy = settings.pullRequestMergeStrategy
       terminalThemeSyncEnabled = settings.terminalThemeSyncEnabled
+      terminalTranslucencyEnabled = settings.terminalTranslucencyEnabled
       ghosttyUserConfigMode = settings.ghosttyUserConfigMode
       automatedActionPolicy = settings.automatedActionPolicy
       autoDeleteArchivedWorktreesAfterDays = settings.autoDeleteArchivedWorktreesAfterDays
@@ -210,6 +212,7 @@ public struct SettingsFeature {
         copyUntrackedOnWorktreeCreate: copyUntrackedOnWorktreeCreate,
         pullRequestMergeStrategy: pullRequestMergeStrategy,
         terminalThemeSyncEnabled: terminalThemeSyncEnabled,
+        terminalTranslucencyEnabled: terminalTranslucencyEnabled,
         ghosttyUserConfigMode: ghosttyUserConfigMode,
         automatedActionPolicy: automatedActionPolicy,
         defaultWorktreeBaseDirectoryPath: SupacodePaths.normalizedWorktreeBaseDirectoryPath(
@@ -376,6 +379,7 @@ public struct SettingsFeature {
         state.copyUntrackedOnWorktreeCreate = normalizedSettings.copyUntrackedOnWorktreeCreate
         state.pullRequestMergeStrategy = normalizedSettings.pullRequestMergeStrategy
         state.terminalThemeSyncEnabled = normalizedSettings.terminalThemeSyncEnabled
+        state.terminalTranslucencyEnabled = normalizedSettings.terminalTranslucencyEnabled
         state.ghosttyUserConfigMode = normalizedSettings.ghosttyUserConfigMode
         state.automatedActionPolicy = normalizedSettings.automatedActionPolicy
         state.autoDeleteArchivedWorktreesAfterDays = normalizedSettings.autoDeleteArchivedWorktreesAfterDays

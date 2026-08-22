@@ -70,6 +70,14 @@ enum WindowChromeApplier {
     window.backgroundColor = tintColor
   }
 
+  // The surface holes only earn their keep while the background is translucent:
+  // at full opacity a hole reveals `window.backgroundColor`, which `apply()` has
+  // already set to this same tint, so the mask is invisible while still costing
+  // the region walk, a path rebuild, and an alpha-blended full-window layer.
+  nonisolated static func tintMaskIsNeeded(backgroundOpacity: Double) -> Bool {
+    backgroundOpacity < 1
+  }
+
   // Even-odd mask inputs: the full `bounds` fill plus a hole per region, clipped
   // to `bounds`. A rect spanning the whole backdrop is dropped so it can't
   // even-odd-cancel the entire tint into a fully transparent window (the terminal
@@ -243,11 +251,12 @@ final class WindowChromeObserverNSView: NSView {
 }
 
 // Mounted from ContentView. Installs a single tint layer in the window's frame
-// view, behind the content view, carrying the focused-surface tint with each
-// terminal surface's rect masked OUT of it. The tint shows behind the chrome
-// (sidebar / toolbar / tab bar / empty detail); the surface holes reveal the
-// window blur so a translucent surface composites over blur, never over the
-// tint.
+// view, behind the content view, carrying the focused-surface tint so it shows
+// behind the chrome (sidebar / toolbar / tab bar / empty detail). While the
+// background is translucent each terminal surface's rect is masked OUT of it,
+// so the holes reveal the window blur and a surface composites over blur, never
+// over the tint. At full opacity — the default — the fill is opaque and no mask
+// is cut.
 struct WindowTintBackdrop: NSViewRepresentable {
   let runtime: GhosttyRuntime
 
@@ -383,14 +392,14 @@ final class TintBackdropView: NSView {
         }
       }
     )
+    // A config reload can flip translucency in either direction, so this rebuilds
+    // straight away instead of marking dirty: `setNeedsMaskRebuild` is gated on
+    // translucency and would not schedule the pass that drops a stale mask.
     observers.append(
       center.addObserver(
         forName: .ghosttyRuntimeConfigDidChange, object: nil, queue: .main
       ) { [weak self] _ in
-        Task { @MainActor [weak self] in
-          self?.refreshColor()
-          self?.setNeedsMaskRebuild()
-        }
+        Task { @MainActor [weak self] in self?.refresh() }
       }
     )
   }
@@ -409,7 +418,12 @@ final class TintBackdropView: NSView {
       .withAlphaComponent(runtime.backgroundOpacity()).cgColor
   }
 
+  private var needsTintMask: Bool {
+    WindowChromeApplier.tintMaskIsNeeded(backgroundOpacity: runtime.backgroundOpacity())
+  }
+
   private func setNeedsMaskRebuild() {
+    guard needsTintMask else { return }
     guard !maskRebuildScheduled else { return }
     maskRebuildScheduled = true
     Task { @MainActor [weak self] in
@@ -419,14 +433,22 @@ final class TintBackdropView: NSView {
     }
   }
 
-  // Each mounted surface wrapper is punched as a hole so behind it there is
-  // only blur, and the surface paints its own OSC 11 color over that blur at
-  // the same opacity (no double background, seamless with the chrome).
+  // While the background is translucent, each mounted surface wrapper is punched
+  // as a hole so behind it there is only blur, and the surface paints its own
+  // OSC 11 color over that blur at the same opacity (no double background,
+  // seamless with the chrome). An opaque background needs no holes, so the whole
+  // walk is skipped and any mask left from a translucent config is dropped.
   private var lastAppliedHoleRects: [CGRect]?
   private var lastAppliedMaskBounds = CGRect.null
 
   private func rebuildMask() {
-    guard layer != nil else { return }
+    guard let layer else { return }
+    guard needsTintMask else {
+      lastAppliedHoleRects = nil
+      lastAppliedMaskBounds = .null
+      layer.mask = nil
+      return
+    }
     var holeRects: [CGRect] = []
     if let window {
       for region in WindowTintMaskRegistry.regions(in: window)
@@ -460,7 +482,7 @@ final class TintBackdropView: NSView {
     mask.frame = bounds
     mask.path = path
     mask.fillRule = .evenOdd
-    layer?.mask = mask
+    layer.mask = mask
   }
 }
 

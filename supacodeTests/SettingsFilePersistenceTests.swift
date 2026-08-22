@@ -449,6 +449,34 @@ struct SettingsFilePersistenceTests {
     #expect(GlobalSettings.default.terminalThemeSyncEnabled == true)
   }
 
+  // Opaque is the performance default for everyone: a fresh install and an
+  // existing settings file predating this key must both land on `false`.
+  @Test func freshInstallDefaultsTerminalTranslucencyEnabledToFalse() {
+    #expect(GlobalSettings.default.terminalTranslucencyEnabled == false)
+  }
+
+  @Test(.dependencies) func decodesMissingTerminalTranslucencyEnabledAsFalse() throws {
+    let legacy = LegacySettingsFile(
+      global: LegacyGlobalSettings(
+        appearanceMode: .dark,
+        updatesAutomaticallyCheckForUpdates: false,
+        updatesAutomaticallyDownloadUpdates: true
+      ),
+      repositories: [:]
+    )
+    let data = try JSONEncoder().encode(legacy.global)
+    let storage = MutableTestStorage(initialData: data)
+
+    let settings: SettingsFile = withDependencies {
+      $0.settingsFileStorage = storage.storage
+    } operation: {
+      @Shared(.settingsFile) var settings: SettingsFile
+      return settings
+    }
+
+    #expect(settings.global.terminalTranslucencyEnabled == false)
+  }
+
   @Test(.dependencies) func decodesLegacyConfirmBeforeQuitTrueAsAlways() throws {
     // Opt-out users (`confirmBeforeQuit = true` in the old single-toggle model)
     // must land on `.always`, NOT `.auto`. `.auto` would silently re-enable the

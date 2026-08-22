@@ -46,6 +46,19 @@ struct WindowTintMaskNormalizationTests {
   }
 }
 
+struct WindowTintMaskGateTests {
+  // Opaque is the default now, and there the holes would reveal the same tint
+  // the window backing already carries: no mask, so no region walk and no
+  // alpha-blended full-window layer.
+  @Test func opaqueBackgroundNeedsNoMask() {
+    #expect(WindowChromeApplier.tintMaskIsNeeded(backgroundOpacity: 1) == false)
+  }
+
+  @Test func translucentBackgroundNeedsTheMask() {
+    #expect(WindowChromeApplier.tintMaskIsNeeded(backgroundOpacity: 0.9))
+  }
+}
+
 @MainActor
 struct WindowTintMaskRegistryTests {
   private final class TestMaskRegion: NSView, WindowTintMaskRegion {}

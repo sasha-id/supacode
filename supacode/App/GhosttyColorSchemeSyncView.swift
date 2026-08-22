@@ -5,7 +5,7 @@ import SwiftUI
 
 /// Synchronizes the user's appearance mode preference with both NSApp appearance
 /// and Ghostty's color scheme, and reloads Ghostty config when terminal theme
-/// sync or the user-config mode changes.
+/// sync, translucency, or the user-config mode changes.
 struct GhosttyColorSchemeSyncView<Content: View>: View {
   @Shared(.settingsFile) private var settingsFile
   let ghostty: GhosttyRuntime
@@ -45,6 +45,9 @@ struct GhosttyColorSchemeSyncView<Content: View>: View {
         ghostty.setColorScheme(newValue)
       }
       .onChange(of: settingsFile.global.terminalThemeSyncEnabled) {
+        ghostty.reloadAppConfig()
+      }
+      .onChange(of: settingsFile.global.terminalTranslucencyEnabled) {
         ghostty.reloadAppConfig()
       }
       .onChange(of: settingsFile.global.ghosttyUserConfigMode) {

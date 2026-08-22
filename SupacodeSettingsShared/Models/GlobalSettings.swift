@@ -126,6 +126,11 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
   public var copyUntrackedOnWorktreeCreate: Bool
   public var pullRequestMergeStrategy: PullRequestMergeStrategy
   public var terminalThemeSyncEnabled: Bool
+  /// Restores the pre-performance-refactor look: `background-opacity = 0.9` and
+  /// `background-blur = true`, layered under the user's own Ghostty config so an
+  /// explicit `background-opacity`/`background-blur` there still wins. Off by
+  /// default: the terminal background is opaque, matching Ghostty's own default.
+  public var terminalTranslucencyEnabled: Bool
   /// Whether the optional `~/.supacode/ghostty.config` merges after the standard
   /// Ghostty config or replaces it. Inert until that file exists.
   public var ghosttyUserConfigMode: GhosttyUserConfigMode
@@ -194,6 +199,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     copyUntrackedOnWorktreeCreate: false,
     pullRequestMergeStrategy: .merge,
     terminalThemeSyncEnabled: true,
+    terminalTranslucencyEnabled: false,
     ghosttyUserConfigMode: .mergeAfterDefault,
     automatedActionPolicy: .cliOnly,
     defaultWorktreeBaseDirectoryPath: nil,
@@ -236,6 +242,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     copyUntrackedOnWorktreeCreate: Bool = false,
     pullRequestMergeStrategy: PullRequestMergeStrategy = .merge,
     terminalThemeSyncEnabled: Bool = true,
+    terminalTranslucencyEnabled: Bool = false,
     ghosttyUserConfigMode: GhosttyUserConfigMode = .mergeAfterDefault,
     automatedActionPolicy: AutomatedActionPolicy = .cliOnly,
     defaultWorktreeBaseDirectoryPath: String? = nil,
@@ -280,6 +287,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     self.copyUntrackedOnWorktreeCreate = copyUntrackedOnWorktreeCreate
     self.pullRequestMergeStrategy = pullRequestMergeStrategy
     self.terminalThemeSyncEnabled = terminalThemeSyncEnabled
+    self.terminalTranslucencyEnabled = terminalTranslucencyEnabled
     self.ghosttyUserConfigMode = ghosttyUserConfigMode
     self.automatedActionPolicy = automatedActionPolicy
     self.defaultWorktreeBaseDirectoryPath = defaultWorktreeBaseDirectoryPath
@@ -408,6 +416,11 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     terminalThemeSyncEnabled =
       try container.decodeIfPresent(Bool.self, forKey: .terminalThemeSyncEnabled)
       ?? false
+    // Off for both fresh installs and existing files missing the key: opaque is
+    // the new performance default for everyone, not just new users.
+    terminalTranslucencyEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .terminalTranslucencyEnabled)
+      ?? Self.default.terminalTranslucencyEnabled
     // Reject unrecognized values (and a mistyped key) rather than throwing, which
     // would reset the whole file to defaults. Pre-feature files omit this key.
     ghosttyUserConfigMode =
