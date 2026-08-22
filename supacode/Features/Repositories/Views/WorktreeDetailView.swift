@@ -11,6 +11,10 @@ struct WorktreeDetailView: View {
   let terminalManager: WorktreeTerminalManager
   @Shared(.appStorage("worktreeRowHideSubtitleOnMatch")) private var hideSubtitleOnMatch = true
   @Shared(.settingsFile) private var settingsFile: SettingsFile
+  // Captured here and re-injected past the terminal stack's hosting boundary,
+  // which environment objects do not cross.
+  @Environment(GhosttyShortcutManager.self) private var ghosttyShortcuts
+  @Environment(CommandKeyObserver.self) private var commandKeyObserver
   private var agentBadgesEnabled: Bool { settingsFile.global.agentPresenceBadgesEnabled }
 
   var body: some View {
@@ -296,20 +300,40 @@ struct WorktreeDetailView: View {
         }
       } else if let selectedWorktree {
         let shouldFocusTerminal = repositories.shouldFocusTerminal(for: selectedWorktree.id)
-        WorktreeLayoutView(
-          worktree: selectedWorktree,
-          manager: terminalManager,
-          terminalsStore: store.scope(state: \.terminals, action: \.terminals),
-          runtime: ContentRuntime.liveValue,
-          forceAutoFocus: shouldFocusTerminal,
-          isLifecycleBusy: selectedSlice?.lifecycle.isBusy ?? false
+        let pendingTerminalFocus: Worktree.ID? = shouldFocusTerminal ? selectedWorktree.id : nil
+        let terminalsStore = store.scope(state: \.terminals, action: \.terminals)
+        // No `.id` here on purpose: the stack keeps every recently visited
+        // worktree's tree mounted and switches by visibility, so a selection
+        // change never reparents a live surface.
+        WorktreeTerminalStack(
+          inputs: WorktreeTerminalInputs(
+            worktree: selectedWorktree,
+            manager: terminalManager,
+            terminalsStore: terminalsStore,
+            runtime: ContentRuntime.liveValue,
+            forceAutoFocus: shouldFocusTerminal,
+            isLifecycleBusy: selectedSlice?.lifecycle.isBusy ?? false,
+            ghosttyShortcuts: ghosttyShortcuts,
+            commandKeyObserver: commandKeyObserver
+          )
         )
-        .id(selectedWorktree.id)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea(.container, edges: .bottom)
-        .onAppear {
-          if shouldFocusTerminal {
-            store.send(.repositories(.consumeTerminalFocus(selectedWorktree.id)))
+        // Outside the stack: each worktree's tree lives in its own hosting
+        // view, and only the selected worktree may raise a window alert.
+        .background {
+          if let layoutStore = terminalsStore.scope(
+            state: \.layouts[id: selectedWorktree.id],
+            action: \.layouts[id: selectedWorktree.id]
+          ) {
+            WorktreeLayoutAlertPresenter(store: layoutStore)
+          }
+        }
+        // The subtree survives a switch now, so `onAppear` no longer fires per
+        // selection; the consume has to follow the request itself.
+        .onChange(of: pendingTerminalFocus, initial: true) { _, target in
+          if let target {
+            store.send(.repositories(.consumeTerminalFocus(target)))
           }
         }
       } else if !repositories.isInitialLoadComplete {

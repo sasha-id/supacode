@@ -201,13 +201,18 @@ final class WorktreeContentHost {
     focusedContentID == surfaceID
   }
 
+  /// Whether the content is the selected tab of a pane open in its own window.
+  private func isInWindowedPane(_ surfaceID: UUID) -> Bool {
+    guard let pane = layout()?.panes.first(where: { $0.selectedTab?.content.id.rawValue == surfaceID })
+    else { return false }
+    return windowedPaneIDs().contains(pane.id)
+  }
+
   /// All five must hold for an arriving notification to be born read. A
   /// windowed pane's surface keys off its own window, not the main one.
   private func isViewedSurface(_ surfaceID: UUID) -> Bool {
     guard isFocusedSurface(surfaceID) else { return false }
-    if let pane = layout()?.panes.first(where: { $0.selectedTab?.content.id.rawValue == surfaceID }),
-      windowedPaneIDs().contains(pane.id)
-    {
+    if isInWindowedPane(surfaceID) {
       guard let window = liveSurface(surfaceID)?.window else { return false }
       return window.isKeyWindow && window.occlusionState.contains(.visible)
     }
@@ -757,9 +762,15 @@ final class WorktreeContentHost {
     surface.sendText(text)
   }
 
-  /// Whether a content may claim AppKit first responder.
+  /// Whether a content may claim AppKit first responder when its view is
+  /// re-attached. A deselected worktree keeps its tree mounted, so a remount
+  /// inside one (hibernation wake, split rebuild) would otherwise pull first
+  /// responder off the worktree on screen — the reclaim in
+  /// `GhosttySurfaceView.viewDidMoveToWindow` takes it from a sibling terminal.
+  /// A windowed pane is exempt: it reclaims inside its own window.
   func shouldClaimFocus(_ surfaceID: UUID) -> Bool {
-    focusedContentID == surfaceID
+    guard focusedContentID == surfaceID else { return false }
+    return isSelected() || isInWindowedPane(surfaceID)
   }
 
   /// Cross-tab focus by content id (deeplinks, unread jumps): wake and select

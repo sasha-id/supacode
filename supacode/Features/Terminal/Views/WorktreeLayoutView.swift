@@ -2,14 +2,19 @@ import AppKit
 import ComposableArchitecture
 import SwiftUI
 
-/// One worktree's terminal area on the layout engine: the pane tree with its
-/// close-confirmation alert, window-activity sync, and terminal auto-focus.
+/// One worktree's terminal area on the layout engine: the pane tree, its
+/// window-activity sync, and terminal auto-focus. The close-confirmation alert
+/// presents outside this tree, from `WorktreeLayoutAlertPresenter`.
 struct WorktreeLayoutView: View {
   let worktree: Worktree
   let manager: WorktreeTerminalManager
   let terminalsStore: StoreOf<TerminalsFeature>
   let runtime: ContentRuntime
   let forceAutoFocus: Bool
+  /// Whether this worktree is the one on screen. Deselected trees stay mounted
+  /// so a switch never reparents a surface, so everything that reaches out of
+  /// the tree — focus claims — has to gate on this.
+  var isSelected = true
   var isLifecycleBusy = false
   @State private var windowActivity = WindowActivityState.inactive
   @State private var windowActivityReader = WindowActivityReader()
@@ -28,7 +33,7 @@ struct WorktreeLayoutView: View {
         state: \.layouts[id: worktree.id],
         action: \.layouts[id: worktree.id]
       ), !layoutStore.layout.panes.isEmpty {
-        LayoutAlertHost(
+        LayoutContentView(
           store: layoutStore,
           runtime: runtime,
           dividerColor: manager.splitDividerColor(),
@@ -52,17 +57,17 @@ struct WorktreeLayoutView: View {
       }
     )
     .onAppear {
-      if shouldAutoFocusTerminal {
+      if isSelected, shouldAutoFocusTerminal {
         host?.focusSelectedTab()
       }
       syncResolvedWindowActivity()
     }
     // Catch a focus intent that lands after the first appearance.
     .onChange(of: forceAutoFocus) { _, focus in
-      if focus { host?.focusSelectedTab() }
+      if focus, isSelected { host?.focusSelectedTab() }
     }
     .onChange(of: selectedContentID) {
-      if shouldAutoFocusTerminal {
+      if isSelected, shouldAutoFocusTerminal {
         host?.focusSelectedTab()
       }
       syncResolvedWindowActivity()
@@ -98,34 +103,22 @@ struct WorktreeLayoutView: View {
   }
 }
 
-/// Hosts the pane tree and binds the layout's close-confirmation alert.
-private struct LayoutAlertHost: View {
+/// Binds one worktree's close-confirmation alert. Mounted alongside the
+/// terminal stack rather than inside it: the stack hosts each worktree's tree
+/// in its own `NSHostingView`, and only the selected worktree's alert may
+/// present over the window.
+struct WorktreeLayoutAlertPresenter: View {
   @Bindable var store: StoreOf<LayoutFeature>
-  let runtime: ContentRuntime
-  let dividerColor: Color
-  let unfocusedOverlay: UnfocusedSplitOverlay
-  let services: PaneRenderServices
-  let isLifecycleBusy: Bool
 
   /// Alerts raised from a windowed pane present in that pane's window; this
-  /// host owns the rest.
+  /// presenter owns the rest.
   private var presentsAlert: Bool {
     store.alertPaneID.map { !store.windowedPaneIDs.contains($0) } ?? true
   }
 
   var body: some View {
-    LayoutContentView(
-      store: store,
-      runtime: runtime,
-      dividerColor: dividerColor,
-      unfocusedOverlay: unfocusedOverlay,
-      services: services,
-      isLifecycleBusy: isLifecycleBusy
-    )
-    .background {
-      if presentsAlert {
-        Color.clear.alert($store.scope(state: \.alert, action: \.alert))
-      }
+    if presentsAlert {
+      Color.clear.alert($store.scope(state: \.alert, action: \.alert))
     }
   }
 }

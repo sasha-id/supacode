@@ -100,14 +100,14 @@ struct LayoutPaneTreeView: View {
     let store = inputs.store
     Group {
       if let node = store.layout.tree.visibleNode {
-        // Panes and the windowed set flow down by value from this `.id`
-        // boundary, so a dismantling copy cannot retarget a content host to
-        // post-swap state.
+        // Panes and the windowed set flow down by value, so a dismantling copy
+        // cannot retarget a content host to post-swap state. Identity lives on
+        // the leaves instead of the whole tree, so a split or close
+        // re-identifies only the branch it changed.
         PaneNodeView(
           node: node, panes: store.layout.panes, windowedPaneIDs: store.windowedPaneIDs,
           store: store, renderContext: inputs.renderContext
         )
-        .id(store.layout.tree.structuralIdentity)
       } else {
         EmptyLayoutView()
       }
@@ -242,32 +242,39 @@ private struct PaneNodeView: View {
   var body: some View {
     switch node {
     case .leaf(let paneID):
-      if let pane = panes[id: paneID] {
-        if windowedPaneIDs.contains(paneID) {
-          WindowedPanePlaceholderView(paneID: paneID, store: store, services: renderContext.services)
-        } else {
-          PaneStripView(
-            pane: pane, windowedPaneIDs: windowedPaneIDs, store: store,
-            runtime: renderContext.runtime,
-            unfocusedOverlay: renderContext.unfocusedOverlay,
-            services: renderContext.services,
-            isLifecycleBusy: renderContext.isLifecycleBusy,
-            dragModel: renderContext.dragModel)
-        }
-      } else {
-        // Tree and panes disagree; render an explicit fallback, never a hole.
-        EmptyTerminalPaneView(
-          message: "This pane is unavailable.",
-          hint: Text("Reopen the worktree to rebuild its layout.")
-        )
-        .onAppear {
-          Self.logger.error("Tree leaf \(paneID.rawValue) has no pane; layout state is inconsistent.")
-        }
-      }
+      // The pane's own id, not the tree's shape: a split or close elsewhere
+      // leaves this leaf's identity — and so its mounted surface — untouched.
+      leafBody(paneID: paneID).id(paneID)
     case .split(let split):
       PaneSplitView(
         node: node, split: split, panes: panes, windowedPaneIDs: windowedPaneIDs,
         store: store, renderContext: renderContext)
+    }
+  }
+
+  @ViewBuilder
+  private func leafBody(paneID: PaneID) -> some View {
+    if let pane = panes[id: paneID] {
+      if windowedPaneIDs.contains(paneID) {
+        WindowedPanePlaceholderView(paneID: paneID, store: store, services: renderContext.services)
+      } else {
+        PaneStripView(
+          pane: pane, windowedPaneIDs: windowedPaneIDs, store: store,
+          runtime: renderContext.runtime,
+          unfocusedOverlay: renderContext.unfocusedOverlay,
+          services: renderContext.services,
+          isLifecycleBusy: renderContext.isLifecycleBusy,
+          dragModel: renderContext.dragModel)
+      }
+    } else {
+      // Tree and panes disagree; render an explicit fallback, never a hole.
+      EmptyTerminalPaneView(
+        message: "This pane is unavailable.",
+        hint: Text("Reopen the worktree to rebuild its layout.")
+      )
+      .onAppear {
+        Self.logger.error("Tree leaf \(paneID.rawValue) has no pane; layout state is inconsistent.")
+      }
     }
   }
 }

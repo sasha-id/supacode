@@ -100,6 +100,8 @@ final class GhosttySurfaceView: NSView, Identifiable {
   // Only ever holds sizes actually pushed to ghostty_surface_set_size; a rejected
   // degenerate size must be re-evaluated on the next layout pass.
   private var lastAppliedBackingSize: CGSize = .zero
+  // A size that arrived while this view was hidden, deferred to the reveal.
+  private var needsSizeSyncOnReveal = false
   private var lastPerformKeyEvent: TimeInterval?
   private var currentCursor: NSCursor = .iBeam
   private var focused = false
@@ -521,6 +523,13 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   override func layout() {
     super.layout()
+    notifySizeChanged()
+  }
+
+  override func viewDidUnhide() {
+    super.viewDidUnhide()
+    guard needsSizeSyncOnReveal else { return }
+    needsSizeSyncOnReveal = false
     notifySizeChanged()
   }
 
@@ -1008,6 +1017,14 @@ final class GhosttySurfaceView: NSView, Identifiable {
     // Off-window backing conversion is 1x; re-measuring a detached view would
     // halve the applied size and poison the hibernation freeze.
     guard window != nil || !hasBeenInWindow else { return }
+    // A deselected worktree keeps its tree mounted and AppKit lays hidden
+    // subtrees out anyway, so a window resize would otherwise reflow every
+    // off-screen grid per drag frame. The very first size still applies: the
+    // PTY must never run at the placeholder grid.
+    if isHiddenOrHasHiddenAncestor, lastAppliedBackingSize != .zero {
+      needsSizeSyncOnReveal = true
+      return
+    }
     let backingSize = convertToBacking(contentSize ?? bounds.size)
     let currentSize = ghostty_surface_size(surface)
     let decision = ResizePolicy.decision(

@@ -131,6 +131,32 @@ struct WorktreeContentHostTests {
     host.trackBlockingScript(kind: .archive, tabID: tabID, launchDirectory: nil)
     #expect(content.terminalChrome.isReadOnly == false)
   }
+
+  @Test func theFocusedContentReclaimsFirstResponderOnlyWhileSelected() {
+    let surfaceID = UUID()
+    let host = makeHost(layout: singleTabLayout(contentID: surfaceID))
+
+    host.isSelected = { true }
+    #expect(host.shouldClaimFocus(surfaceID))
+
+    // A deselected worktree keeps its tree mounted, so a remount inside it must
+    // not pull first responder off the worktree on screen.
+    host.isSelected = { false }
+    #expect(!host.shouldClaimFocus(surfaceID))
+  }
+
+  @Test func aWindowedPaneReclaimsFirstResponderWhileTheWorktreeIsDeselected() {
+    let surfaceID = UUID()
+    let layout = singleTabLayout(contentID: surfaceID)
+    let host = makeHost(layout: layout)
+    let paneID = layout.panes[0].id
+
+    host.isSelected = { false }
+    host.windowedPaneIDs = { [paneID] }
+
+    // The pane owns its own window's focus, whichever worktree is selected.
+    #expect(host.shouldClaimFocus(surfaceID))
+  }
 }
 
 /// Pins the render-host claim invariants the steal-proof mount depends on.

@@ -518,6 +518,12 @@ enum WindowTintMaskRegistry {
     Self.postRegionDidChange(view)
   }
 
+  // A container hid or revealed whole branches without moving any region, so
+  // the mask has to be re-cut even though no region's geometry changed.
+  static func regionVisibilityDidChange(in container: NSView) {
+    Self.postRegionDidChange(container)
+  }
+
   static func regions(in window: NSWindow) -> [NSView] {
     liveRegions.allObjects.filter { $0.window === window }
   }

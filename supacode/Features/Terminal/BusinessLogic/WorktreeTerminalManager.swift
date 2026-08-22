@@ -596,6 +596,9 @@ final class WorktreeTerminalManager {
         markLayoutDirty(worktreeID: previousID)
       }
       selectedWorktreeID = id
+      // Both trees stay mounted across a switch, so AppKit hands the keyboard
+      // to nobody; `WorktreeTerminalStackView` moves first responder over once
+      // the incoming tree is on screen.
       hosts[id ?? WorktreeID("")]?.setWorktreeSelected(true)
       // Deselecting arms grace timers, selecting wakes the visible tabs; the
       // reducer owns both through the selection action.
@@ -2293,5 +2296,12 @@ final class WorktreeTerminalManager {
     // hasAny can only flip when this worktree's surface set actually changed,
     // which `projectionChanged` already implies.
     emitHasAnyTerminalSurfaceIfNeeded()
+  }
+}
+
+/// Identity equality, so the views carrying this reference stay diffable.
+extension WorktreeTerminalManager: Equatable {
+  nonisolated static func == (lhs: WorktreeTerminalManager, rhs: WorktreeTerminalManager) -> Bool {
+    lhs === rhs
   }
 }
