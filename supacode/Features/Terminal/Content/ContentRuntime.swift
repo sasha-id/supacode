@@ -90,6 +90,13 @@ final class ContentRuntime {
   }
 }
 
+/// Identity equality, so the views carrying this reference stay diffable.
+extension ContentRuntime: Equatable {
+  nonisolated static func == (lhs: ContentRuntime, rhs: ContentRuntime) -> Bool {
+    lhs === rhs
+  }
+}
+
 extension ContentRuntime: DependencyKey {
   // Stored nonisolated `let` so reducers resolve the shared registry
   // synchronously; the nonisolated init makes the off-actor creation safe.

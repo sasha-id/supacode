@@ -146,6 +146,11 @@ final class GhosttySurfaceView: NSView, Identifiable {
       }
     }
   }
+  /// Strong hold on the wrapper `scrollWrapper` tracks weakly, so the wrapper
+  /// outlives the host container it happens to be mounted in. Cleared in
+  /// `detachSurface`, which is what breaks the cycle the wrapper's own strong
+  /// reference back to this view forms.
+  private var ownedScrollWrapper: GhosttySurfaceScrollView?
   var onFocusChange: ((Bool) -> Void)?
   /// Asks the owning state to re-derive activity because user input reached an
   /// occluded surface, passing the window's fresh key/visibility readings so
@@ -309,6 +314,17 @@ final class GhosttySurfaceView: NSView, Identifiable {
     return ghostty_surface_needs_confirm_quit(surface)
   }
 
+  /// The view a host container mounts for this surface, built once and reused
+  /// across containers. A rebuilt wrapper would re-parent the surface and start
+  /// it back at zero size, and the renderer drops completed frames whose size
+  /// does not match the layer's for as long as that mismatch lasts.
+  func hostedView() -> NSView {
+    if let ownedScrollWrapper { return ownedScrollWrapper }
+    let wrapper = GhosttySurfaceScrollView(surfaceView: self)
+    ownedScrollWrapper = wrapper
+    return wrapper
+  }
+
   func closeSurface() {
     guard let surface = detachSurface() else { return }
     ghostty_surface_free(surface)
@@ -337,6 +353,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
   /// still owing a free; nil when there is nothing left to free.
   private func detachSurface() -> ghostty_surface_t? {
     clearNotificationObservers()
+    ownedScrollWrapper = nil
     guard let surface else { return nil }
     if let surfaceRef {
       runtime.unregisterSurface(surfaceRef)

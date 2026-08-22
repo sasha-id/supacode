@@ -12,13 +12,12 @@ struct LayoutContentView: View {
   let runtime: ContentRuntime
   var dividerColor: Color = Color(nsColor: .separatorColor)
   /// The `unfocused-split-fill` dim painted over visible unfocused panes.
-  var unfocusedOverlay: (fill: Color?, opacity: Double) = (nil, 0)
-  /// Resolves a content id to its observable unseen-notification counter.
-  var surfaceState: (UUID) -> WorktreeSurfaceState? = { _ in nil }
+  var unfocusedOverlay = UnfocusedSplitOverlay()
+  /// Worktree-scoped lookups the pane tree needs; nil renders a tree with no
+  /// notification badges and no way back to a windowed pane.
+  var services: PaneRenderServices?
   /// Workspace lifecycle work, represented on the focused pane's selected tab.
   var isLifecycleBusy = false
-  /// Brings a windowed pane's window to the front.
-  var showWindowedPane: (PaneID) -> Void = { _ in }
   // Captured here, in the outer SwiftUI world, and re-injected past the
   // NSHostingView boundary, which environment objects do not cross.
   @Environment(GhosttyShortcutManager.self) private var ghosttyShortcuts
@@ -37,9 +36,8 @@ struct LayoutContentView: View {
         runtime: runtime,
         dividerColor: dividerColor,
         unfocusedOverlay: unfocusedOverlay,
-        surfaceState: surfaceState,
+        services: services,
         isLifecycleBusy: isLifecycleBusy,
-        showWindowedPane: showWindowedPane,
         dragModel: dragModel
       ),
       ghosttyShortcuts: ghosttyShortcuts,
@@ -54,30 +52,52 @@ struct LayoutContentView: View {
   }
 }
 
+/// The `unfocused-split-fill` dim painted over visible unfocused panes.
+struct UnfocusedSplitOverlay: Equatable {
+  var fill: Color?
+  var opacity: Double = 0
+}
+
 /// The values every pane renders with, constant across the tree; bundled so
-/// the recursive node views forward one value instead of seven.
-struct PaneRenderContext {
+/// the recursive node views forward one value instead of six.
+///
+/// The conformance is synthesized so a new member cannot silently escape the
+/// hosting gate below; that also means every member has to stay a value or a
+/// long-lived reference, since a stored closure would make each pane look
+/// changed on every pass.
+struct PaneRenderContext: Equatable {
   let runtime: ContentRuntime
   var dividerColor: Color = Color(nsColor: .separatorColor)
-  var unfocusedOverlay: (fill: Color?, opacity: Double) = (nil, 0)
-  var surfaceState: (UUID) -> WorktreeSurfaceState? = { _ in nil }
+  var unfocusedOverlay = UnfocusedSplitOverlay()
+  var services: PaneRenderServices?
   var isLifecycleBusy = false
-  var showWindowedPane: (PaneID) -> Void = { _ in }
   /// Shared tab-drag source, so a pane's split zones can gray out invalid drops.
   var dragModel = PaneTabDragModel()
+}
+
+/// Everything the hosted pane tree renders from that is not self-observing.
+/// The store, the shortcut manager, and the command-key observer publish their
+/// own changes into the nested hosting view, so only a change in one of these
+/// identities or values means the hosted root has to be rewritten.
+///
+/// This is the pane tree's whole input surface, not a copy of it, so the
+/// hosting gate below cannot fall out of step with what the tree renders.
+struct PaneTreeInputs: Equatable {
+  let store: StoreOf<LayoutFeature>
+  let renderContext: PaneRenderContext
+  var ghosttyShortcuts: GhosttyShortcutManager?
+  var commandKeyObserver: CommandKeyObserver?
 }
 
 /// Renders the pane tree itself: the split structure over panes, each pane a
 /// tab strip above its selected content.
 struct LayoutPaneTreeView: View {
-  let store: StoreOf<LayoutFeature>
-  let renderContext: PaneRenderContext
-  var ghosttyShortcuts: GhosttyShortcutManager?
-  var commandKeyObserver: CommandKeyObserver?
+  let inputs: PaneTreeInputs
 
   @Shared(.settingsFile) private var settingsFile
 
   var body: some View {
+    let store = inputs.store
     Group {
       if let node = store.layout.tree.visibleNode {
         // Panes and the windowed set flow down by value from this `.id`
@@ -85,15 +105,15 @@ struct LayoutPaneTreeView: View {
         // post-swap state.
         PaneNodeView(
           node: node, panes: store.layout.panes, windowedPaneIDs: store.windowedPaneIDs,
-          store: store, renderContext: renderContext
+          store: store, renderContext: inputs.renderContext
         )
         .id(store.layout.tree.structuralIdentity)
       } else {
         EmptyLayoutView()
       }
     }
-    .environment(ghosttyShortcuts)
-    .environment(commandKeyObserver)
+    .environment(inputs.ghosttyShortcuts)
+    .environment(inputs.commandKeyObserver)
     // The pane tree is hosted in a fresh `NSHostingView`, so the scene's chrome
     // text size has to be republished here to reach the tab strip.
     .appChromeTextSize(settingsFile.global.chromeTextSize)
@@ -115,7 +135,7 @@ private struct LayoutAXContainer: NSViewRepresentable {
 
   func updateNSView(_ nsView: LayoutAXContainerView, context: Context) {
     nsView.update(
-      rootView: LayoutPaneTreeView(
+      inputs: PaneTreeInputs(
         store: store, renderContext: renderContext,
         ghosttyShortcuts: ghosttyShortcuts, commandKeyObserver: commandKeyObserver),
       panes: panes
@@ -128,15 +148,25 @@ final class LayoutAXContainerView: NSView {
   // Typed hosting view (no `AnyView`) so re-assigning `rootView` lets SwiftUI
   // diff against a stable concrete view type.
   private var hostingView: NSHostingView<LayoutPaneTreeView>?
+  /// Hosted-root writes since creation; the gate that suppresses them is
+  /// otherwise unobservable from a test.
+  private(set) var hostedRootWrites = 0
   private var panes: [NSView] = []
   private var panesLabel = "Terminal split: 0 panes"
   private var lastPaneIDs: [ObjectIdentifier] = []
 
-  func update(rootView: LayoutPaneTreeView, panes: [NSView]) {
+  func update(inputs: PaneTreeInputs, panes: [NSView]) {
     if let hostingView {
-      hostingView.rootView = rootView
+      // Every assignment re-renders the whole tree behind the AppKit boundary,
+      // so an unchanged root is left alone; the hosted body still re-runs on
+      // its own observation of the store and the shared settings file.
+      if hostingView.rootView.inputs != inputs {
+        hostingView.rootView = LayoutPaneTreeView(inputs: inputs)
+        hostedRootWrites += 1
+      }
     } else {
-      let hostingView = NSHostingView(rootView: rootView)
+      let hostingView = NSHostingView(rootView: LayoutPaneTreeView(inputs: inputs))
+      hostedRootWrites += 1
       // The window uses a full-size content view; without this the hosted
       // tree insets below the titlebar wherever the container overlaps it.
       hostingView.safeAreaRegions = []
@@ -214,13 +244,13 @@ private struct PaneNodeView: View {
     case .leaf(let paneID):
       if let pane = panes[id: paneID] {
         if windowedPaneIDs.contains(paneID) {
-          WindowedPanePlaceholderView(paneID: paneID, store: store, showWindow: renderContext.showWindowedPane)
+          WindowedPanePlaceholderView(paneID: paneID, store: store, services: renderContext.services)
         } else {
           PaneStripView(
             pane: pane, windowedPaneIDs: windowedPaneIDs, store: store,
             runtime: renderContext.runtime,
             unfocusedOverlay: renderContext.unfocusedOverlay,
-            surfaceState: renderContext.surfaceState,
+            services: renderContext.services,
             isLifecycleBusy: renderContext.isLifecycleBusy,
             dragModel: renderContext.dragModel)
         }
@@ -307,8 +337,8 @@ struct PaneStripView: View {
   let windowedPaneIDs: Set<PaneID>
   let store: StoreOf<LayoutFeature>
   let runtime: ContentRuntime
-  var unfocusedOverlay: (fill: Color?, opacity: Double) = (nil, 0)
-  var surfaceState: (UUID) -> WorktreeSurfaceState? = { _ in nil }
+  var unfocusedOverlay = UnfocusedSplitOverlay()
+  var services: PaneRenderServices?
   var isLifecycleBusy = false
   var context: Context = .embedded
   /// Shared tab-drag source; nil in a pane window, where there are no drop zones.
@@ -351,7 +381,7 @@ struct PaneStripView: View {
         isLifecycleBusy: isLifecycleBusy,
         store: store,
         runtime: runtime,
-        surfaceState: surfaceState,
+        services: services,
         dragModel: dragModel
       )
       if let contentID = pane.selectedTab?.content.id {
@@ -495,7 +525,7 @@ private final class HoverFocusSensorView: NSView {
 private struct WindowedPanePlaceholderView: View {
   let paneID: PaneID
   let store: StoreOf<LayoutFeature>
-  let showWindow: (PaneID) -> Void
+  let services: PaneRenderServices?
 
   var body: some View {
     ContentUnavailableView {
@@ -504,7 +534,7 @@ private struct WindowedPanePlaceholderView: View {
       Text("This pane is open in its own window.")
     } actions: {
       Button("Show Window") {
-        showWindow(paneID)
+        services?.showWindowedPane(paneID)
       }
       .help("Bring the pane's window to the front")
       Button("Exit Window Mode") {
@@ -768,6 +798,13 @@ private struct ContentHostView: NSViewRepresentable {
     Coordinator()
   }
 
+  /// A fresh container per host, deliberately: a container cached per content
+  /// would have to be handed to two hosts at once during a structural rebuild,
+  /// and SwiftUI owns whatever `makeNSView` returns — the dying host's teardown
+  /// would then be free to pull the live container out of the surviving one.
+  /// So the surface keeps its wrapper, its scroll state, and its non-zero frame
+  /// across a rebuild, but not its window membership; only hosting the pane
+  /// tree in a view that outlives the rebuild would keep that.
   func makeNSView(context: Context) -> NSView {
     let container = NSView()
     claim(context.coordinator)
@@ -795,29 +832,21 @@ private struct ContentHostView: NSViewRepresentable {
       container.subviews.forEach { $0.removeFromSuperview() }
       return
     }
-    let hostedView: NSView
-    if let surface = renderer as? GhosttySurfaceView {
-      // Terminals mount through the scroll wrapper: it owns the surface's
-      // frame, the overlay scroller, and zeroes the window safe-area insets.
-      if let wrapper = container.subviews.first as? GhosttySurfaceScrollView,
-        surface.scrollWrapper === wrapper
-      {
-        return
-      }
-      hostedView = GhosttySurfaceScrollView(surfaceView: surface)
-    } else {
-      // Already showing the right renderer: nothing to do.
-      if container.subviews.first === renderer { return }
-      hostedView = renderer
-    }
+    // Terminals mount through their scroll wrapper: it owns the surface's
+    // frame, the overlay scroller, and zeroes the window safe-area insets. The
+    // surface owns that wrapper, so a structural rebuild re-parents the wrapper
+    // instead of building a new one around the surface.
+    let hosted = (renderer as? GhosttySurfaceView)?.hostedView() ?? renderer
+    // Already showing the right view: nothing to do.
+    guard container.subviews.first !== hosted else { return }
     container.subviews.forEach { $0.removeFromSuperview() }
-    hostedView.translatesAutoresizingMaskIntoConstraints = false
-    container.addSubview(hostedView)
+    hosted.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(hosted)
     NSLayoutConstraint.activate([
-      hostedView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-      hostedView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-      hostedView.topAnchor.constraint(equalTo: container.topAnchor),
-      hostedView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      hosted.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      hosted.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      hosted.topAnchor.constraint(equalTo: container.topAnchor),
+      hosted.bottomAnchor.constraint(equalTo: container.bottomAnchor),
     ])
   }
 }

@@ -33,13 +33,8 @@ struct WorktreeLayoutView: View {
           runtime: runtime,
           dividerColor: manager.splitDividerColor(),
           unfocusedOverlay: manager.unfocusedSplitOverlay(),
-          surfaceState: { [weak manager] surfaceID in
-            manager?.hostIfExists(for: worktree.id)?.surfaceStates[surfaceID]
-          },
-          isLifecycleBusy: isLifecycleBusy,
-          showWindowedPane: { [weak manager] paneID in
-            manager?.paneWindows.orderFront(worktreeID: worktree.id, paneID: paneID)
-          }
+          services: manager.renderServices(for: worktree.id),
+          isLifecycleBusy: isLifecycleBusy
         )
       } else {
         // No strip is mounted here, so the default "+" hint would point at a
@@ -108,10 +103,9 @@ private struct LayoutAlertHost: View {
   @Bindable var store: StoreOf<LayoutFeature>
   let runtime: ContentRuntime
   let dividerColor: Color
-  let unfocusedOverlay: (fill: Color?, opacity: Double)
-  let surfaceState: (UUID) -> WorktreeSurfaceState?
+  let unfocusedOverlay: UnfocusedSplitOverlay
+  let services: PaneRenderServices
   let isLifecycleBusy: Bool
-  let showWindowedPane: (PaneID) -> Void
 
   /// Alerts raised from a windowed pane present in that pane's window; this
   /// host owns the rest.
@@ -125,9 +119,8 @@ private struct LayoutAlertHost: View {
       runtime: runtime,
       dividerColor: dividerColor,
       unfocusedOverlay: unfocusedOverlay,
-      surfaceState: surfaceState,
-      isLifecycleBusy: isLifecycleBusy,
-      showWindowedPane: showWindowedPane
+      services: services,
+      isLifecycleBusy: isLifecycleBusy
     )
     .background {
       if presentsAlert {

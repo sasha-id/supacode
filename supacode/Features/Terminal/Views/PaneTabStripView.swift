@@ -46,6 +46,13 @@ nonisolated struct PaneTabDragPayload: Codable, Sendable, Transferable {
   }
 }
 
+/// Identity equality, so the views carrying this reference stay diffable.
+extension PaneTabDragModel: Equatable {
+  nonisolated static func == (lhs: PaneTabDragModel, rhs: PaneTabDragModel) -> Bool {
+    lhs === rhs
+  }
+}
+
 /// One pane's tab strip: fixed-width tabs, dividers, overflow fades, and the
 /// trailing accessories, with no background so the window tint shows through.
 struct PaneTabStrip: View {
@@ -56,7 +63,7 @@ struct PaneTabStrip: View {
   let isLifecycleBusy: Bool
   let store: StoreOf<LayoutFeature>
   let runtime: ContentRuntime
-  let surfaceState: (UUID) -> WorktreeSurfaceState?
+  let services: PaneRenderServices?
   /// Shared drag source, nil in a pane window; drives the split-zone graying.
   var dragModel: PaneTabDragModel?
 
@@ -157,7 +164,7 @@ struct PaneTabStrip: View {
           fixedWidth: effectiveTabWidth,
           store: store,
           runtime: runtime,
-          surfaceState: surfaceState,
+          services: services,
           dragModel: dragModel
         )
         .id(tab.id)
@@ -353,7 +360,7 @@ private struct PaneTabView: View {
   let fixedWidth: CGFloat?
   let store: StoreOf<LayoutFeature>
   let runtime: ContentRuntime
-  let surfaceState: (UUID) -> WorktreeSurfaceState?
+  let services: PaneRenderServices?
   var dragModel: PaneTabDragModel?
 
   @State private var isHovering = false
@@ -601,7 +608,7 @@ private struct PaneTabView: View {
   }
 
   private var hasUnseenNotifications: Bool {
-    surfaceState(tab.content.id.rawValue)?.hasUnseenNotification == true
+    services?.surfaceState(tab.content.id.rawValue)?.hasUnseenNotification == true
   }
 
   private var slotAnimation: Animation? {

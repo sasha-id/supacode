@@ -520,4 +520,29 @@ struct GhosttySurfaceViewTests {
     #expect(wrapper.safeAreaInsets.bottom == 0)
     #expect(wrapper.safeAreaInsets.right == 0)
   }
+
+  @Test func hostedViewIsBuiltOnceAndReleasedOnTeardown() {
+    let surfaceView = GhosttySurfaceView(
+      id: UUID(),
+      runtime: GhosttyRuntime(),
+      workingDirectory: nil,
+      initialGeometry: .fallback,
+      context: GHOSTTY_SURFACE_CONTEXT_TAB
+    )
+
+    let hosted = surfaceView.hostedView()
+    let wrappingSuperview = surfaceView.superview
+
+    // A second host container asks for the same view, so the surface itself
+    // stays where it is instead of being re-parented into a new wrapper.
+    #expect(surfaceView.hostedView() === hosted)
+    #expect(surfaceView.scrollWrapper === hosted)
+    #expect(surfaceView.superview === wrappingSuperview)
+
+    // Teardown drops the surface's hold on the wrapper; without it the two
+    // would retain each other and the surface would never deinit.
+    surfaceView.closeSurfaceDeferringFree()
+    #expect(surfaceView.hostedView() !== hosted)
+    surfaceView.closeSurfaceDeferringFree()
+  }
 }

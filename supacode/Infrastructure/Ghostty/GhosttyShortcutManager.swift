@@ -63,3 +63,10 @@ final class GhosttyShortcutManager {
   }
 
 }
+
+/// Identity equality, so the views carrying this reference stay diffable.
+extension GhosttyShortcutManager: Equatable {
+  nonisolated static func == (lhs: GhosttyShortcutManager, rhs: GhosttyShortcutManager) -> Bool {
+    lhs === rhs
+  }
+}

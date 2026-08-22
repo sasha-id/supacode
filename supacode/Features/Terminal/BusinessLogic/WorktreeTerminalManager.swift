@@ -16,6 +16,18 @@ final class WorktreeTerminalManager {
   @ObservationIgnored private let surfaceBindingActionPerformer: ((GhosttySurfaceView, String) -> Void)?
   private(set) var socketServer: AgentHookSocketServer?
   private var hosts: [Worktree.ID: WorktreeContentHost] = [:]
+  /// One render-services instance per worktree, so the pane tree's render
+  /// context keeps a stable identity across view updates.
+  @ObservationIgnored private var renderServicesByWorktree: [Worktree.ID: PaneRenderServices] = [:]
+  private struct SplitChrome {
+    let generation: Int
+    let divider: Color
+    let overlay: UnfocusedSplitOverlay
+  }
+  /// Config-derived split chrome, resolved once per Ghostty config reload.
+  /// Each resolve is three FFI config lookups, and a freshly built `Color` per
+  /// view pass would make the pane render context compare unequal every time.
+  @ObservationIgnored private var splitChromeCache: SplitChrome?
   /// The windowed-pane windows, reconciled after every layout change.
   @ObservationIgnored let paneWindows = PaneWindowManager()
   /// The app store; topology commands route into `TerminalsFeature` through it.
@@ -2077,15 +2089,39 @@ final class WorktreeTerminalManager {
 
   var ghosttyRuntime: GhosttyRuntime { runtime }
 
-  func unfocusedSplitOverlay() -> (fill: Color?, opacity: Double) {
-    (runtime.unfocusedSplitFill(), runtime.unfocusedSplitOverlayOpacity())
+  func unfocusedSplitOverlay() -> UnfocusedSplitOverlay {
+    splitChrome().overlay
   }
 
   // The user's `split-divider-color`, or the opaque asset fallback when unset.
   // Opaque, not a system separator: the terminal body is cut out of the window
   // tint, so a translucent divider would let the window blur show through the gap.
   func splitDividerColor() -> Color {
-    runtime.splitDividerColor() ?? Color(.splitDivider)
+    splitChrome().divider
+  }
+
+  private func splitChrome() -> SplitChrome {
+    let generation = configGeneration
+    if let splitChromeCache, splitChromeCache.generation == generation {
+      return splitChromeCache
+    }
+    let chrome = SplitChrome(
+      generation: generation,
+      divider: runtime.splitDividerColor() ?? Color(.splitDivider),
+      overlay: UnfocusedSplitOverlay(
+        fill: runtime.unfocusedSplitFill(), opacity: runtime.unfocusedSplitOverlayOpacity())
+    )
+    splitChromeCache = chrome
+    return chrome
+  }
+
+  /// The worktree's pane render services, created once and reused so the pane
+  /// tree's render context stays diffable across view updates.
+  func renderServices(for worktreeID: Worktree.ID) -> PaneRenderServices {
+    if let existing = renderServicesByWorktree[worktreeID] { return existing }
+    let services = PaneRenderServices(worktreeID: worktreeID, manager: self)
+    renderServicesByWorktree[worktreeID] = services
+    return services
   }
 
   private func emit(_ event: TerminalClient.Event) {
@@ -2192,6 +2228,7 @@ final class WorktreeTerminalManager {
   /// Clears the worktree-keyed lastEmittedProjections during prune; emit's purge has
   /// already cleared the coalesce keys, which this re-clears as a guard against drift.
   private func invalidateCaches(forPrunedWorktree id: Worktree.ID) {
+    renderServicesByWorktree.removeValue(forKey: id)
     lastEmittedProjections.removeValue(forKey: id)
     pendingShedProjectionReplays.remove(id)
     for key in Self.invalidatedCoalesceKeys(by: .worktreeStateTornDown(worktreeID: id)) {

@@ -566,9 +566,7 @@ private struct WindowedPaneRootView: View {
             windowedPaneIDs: [],
             store: store,
             runtime: runtime,
-            surfaceState: { [weak manager] surfaceID in
-              manager?.hostIfExists(for: worktreeID)?.surfaceStates[surfaceID]
-            },
+            services: manager.renderServices(for: worktreeID),
             context: .windowed
           )
         }
