@@ -269,43 +269,32 @@ struct WorktreeDetailView: View {
     selectedWorktreeSummaries: [MultiSelectedWorktreeSummary]
   ) -> some View {
     let repositories = repositoriesStore.state
-    Group {
-      if repositories.isShowingArchivedWorktrees {
-        ArchivedWorktreesDetailView(store: repositoriesStore)
-      } else if shouldShowMultiSelectionSummary(
-        repositories: repositories,
-        selectedWorktreeSummaries: selectedWorktreeSummaries
-      ) {
-        MultiSelectedWorktreesDetailView(rows: selectedWorktreeSummaries)
-      } else if let loadingInfo {
-        WorktreeLoadingView(info: loadingInfo)
-      } else if let failedRepositoryID = repositories.selectedFailedRepositoryID {
-        FailedRepositoryDetailView(
-          repositoryID: failedRepositoryID,
-          failureMessage: repositories.loadFailuresByID[failedRepositoryID]
-        ) {
-          store.send(.repositories(.requestRemoveFailedRepository(failedRepositoryID)))
-        }
-      } else if let selectedWorktree, selectedWorktree.isMissing {
-        MissingWorktreeDetailView(worktree: selectedWorktree) {
-          guard let repositoryID = repositories.sidebarItems[id: selectedWorktree.id]?.repositoryID
-          else { return }
-          let target = RepositoriesFeature.DeleteWorktreeTarget(
-            worktreeID: selectedWorktree.id,
-            repositoryID: repositoryID
-          )
-          store.send(.repositories(.requestDeleteSidebarItems([target])))
-        }
-      } else if let selectedWorktree {
-        let shouldFocusTerminal = repositories.shouldFocusTerminal(for: selectedWorktree.id)
-        let pendingTerminalFocus: Worktree.ID? = shouldFocusTerminal ? selectedWorktree.id : nil
-        let terminalsStore = store.scope(state: \.terminals, action: \.terminals)
-        // No `.id` here on purpose: the stack keeps every recently visited
-        // worktree's tree mounted and switches by visibility, so a selection
-        // change never reparents a live surface.
-        WorktreeTerminalStack(
-          inputs: WorktreeTerminalInputs(
-            worktree: selectedWorktree,
+    let showsMultiSelection = shouldShowMultiSelectionSummary(
+      repositories: repositories,
+      selectedWorktreeSummaries: selectedWorktreeSummaries
+    )
+    // The worktree whose terminal tree should be visible; nil parks the stack
+    // under whichever transient view shows instead.
+    let terminalWorktree: Worktree? = {
+      guard !repositories.isShowingArchivedWorktrees, !showsMultiSelection, loadingInfo == nil,
+        repositories.selectedFailedRepositoryID == nil,
+        let selectedWorktree, !selectedWorktree.isMissing
+      else { return nil }
+      return selectedWorktree
+    }()
+    let shouldFocusTerminal = terminalWorktree.map { repositories.shouldFocusTerminal(for: $0.id) } ?? false
+    let pendingTerminalFocus: Worktree.ID? = shouldFocusTerminal ? terminalWorktree?.id : nil
+    let terminalsStore = store.scope(state: \.terminals, action: \.terminals)
+    ZStack {
+      // Unconditionally in the hierarchy, and no `.id`, on purpose: the stack
+      // keeps every recently visited worktree's tree mounted and switches by
+      // visibility, so neither a selection change nor a transient detail state
+      // (loading, multi-selection, archived list) ever reparents a live
+      // surface or tears the hosting chain down.
+      WorktreeTerminalStack(
+        inputs: terminalWorktree.map { worktree in
+          WorktreeTerminalInputs(
+            worktree: worktree,
             manager: terminalManager,
             terminalsStore: terminalsStore,
             runtime: ContentRuntime.liveValue,
@@ -314,25 +303,57 @@ struct WorktreeDetailView: View {
             ghosttyShortcuts: ghosttyShortcuts,
             commandKeyObserver: commandKeyObserver
           )
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .ignoresSafeArea(.container, edges: .bottom)
-        // Outside the stack: each worktree's tree lives in its own hosting
-        // view, and only the selected worktree may raise a window alert.
-        .background {
-          WorktreeLayoutAlertHost(terminalsStore: terminalsStore, worktreeID: selectedWorktree.id)
         }
-        // The subtree survives a switch now, so `onAppear` no longer fires per
-        // selection; the consume has to follow the request itself.
-        .onChange(of: pendingTerminalFocus, initial: true) { _, target in
-          if let target {
-            store.send(.repositories(.consumeTerminalFocus(target)))
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .ignoresSafeArea(.container, edges: .bottom)
+      .opacity(terminalWorktree == nil ? 0 : 1)
+      .allowsHitTesting(terminalWorktree != nil)
+      .accessibilityHidden(terminalWorktree == nil)
+      // Outside the stack: each worktree's tree lives in its own hosting
+      // view, and only the selected worktree may raise a window alert.
+      .background {
+        if let worktree = terminalWorktree {
+          WorktreeLayoutAlertHost(terminalsStore: terminalsStore, worktreeID: worktree.id)
+        }
+      }
+      // The subtree survives a switch now, so `onAppear` no longer fires per
+      // selection; the consume has to follow the request itself.
+      .onChange(of: pendingTerminalFocus, initial: true) { _, target in
+        if let target {
+          store.send(.repositories(.consumeTerminalFocus(target)))
+        }
+      }
+
+      if terminalWorktree == nil {
+        if repositories.isShowingArchivedWorktrees {
+          ArchivedWorktreesDetailView(store: repositoriesStore)
+        } else if showsMultiSelection {
+          MultiSelectedWorktreesDetailView(rows: selectedWorktreeSummaries)
+        } else if let loadingInfo {
+          WorktreeLoadingView(info: loadingInfo)
+        } else if let failedRepositoryID = repositories.selectedFailedRepositoryID {
+          FailedRepositoryDetailView(
+            repositoryID: failedRepositoryID,
+            failureMessage: repositories.loadFailuresByID[failedRepositoryID]
+          ) {
+            store.send(.repositories(.requestRemoveFailedRepository(failedRepositoryID)))
           }
+        } else if let selectedWorktree, selectedWorktree.isMissing {
+          MissingWorktreeDetailView(worktree: selectedWorktree) {
+            guard let repositoryID = repositories.sidebarItems[id: selectedWorktree.id]?.repositoryID
+            else { return }
+            let target = RepositoriesFeature.DeleteWorktreeTarget(
+              worktreeID: selectedWorktree.id,
+              repositoryID: repositoryID
+            )
+            store.send(.repositories(.requestDeleteSidebarItems([target])))
+          }
+        } else if !repositories.isInitialLoadComplete {
+          DetailPlaceholderView()
+        } else {
+          EmptyStateView(store: repositoriesStore)
         }
-      } else if !repositories.isInitialLoadComplete {
-        DetailPlaceholderView()
-      } else {
-        EmptyStateView(store: repositoriesStore)
       }
     }
   }

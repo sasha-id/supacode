@@ -115,6 +115,34 @@ struct WorktreeTerminalStackViewTests {
     #expect(!WorktreeTerminalStackView.containsFirstResponder(tree))
   }
 
+  /// A transient detail state (loading, multi-selection, archived list) parks
+  /// the stack instead of unmounting it, so returning costs nothing.
+  @Test func parkingKeepsEveryTreeMountedAndHidden() {
+    let fixture = Fixture()
+    let first = fixture.inputs("/tmp/repo/wt-a")
+    let second = fixture.inputs("/tmp/repo/wt-b")
+
+    fixture.stack.select(first)
+    fixture.stack.select(second)
+    let firstHost = fixture.stack.hostedView(for: first.worktree.id)
+    let secondHost = fixture.stack.hostedView(for: second.worktree.id)
+
+    fixture.stack.select(nil)
+
+    #expect(fixture.stack.selectedWorktreeID == nil)
+    #expect(fixture.stack.hostedView(for: first.worktree.id) === firstHost)
+    #expect(fixture.stack.hostedView(for: second.worktree.id) === secondHost)
+    #expect(firstHost?.superview === fixture.stack)
+    #expect(secondHost?.superview === fixture.stack)
+    #expect(firstHost?.isHidden == true)
+    #expect(secondHost?.isHidden == true)
+
+    fixture.stack.select(second)
+    #expect(fixture.stack.hostedView(for: second.worktree.id) === secondHost)
+    #expect(secondHost?.isHidden == false)
+    #expect(fixture.stack.mountedWorktreeIDs == [first.worktree.id, second.worktree.id])
+  }
+
   @Test func mountingPastTheLimitEvictsTheLeastRecentlySelected() {
     let fixture = Fixture()
     let visited = (0...WorktreeTerminalStackView.mountLimit).map { fixture.inputs("/tmp/repo/wt-\($0)") }

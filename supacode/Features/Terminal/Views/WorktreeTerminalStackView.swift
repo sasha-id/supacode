@@ -50,7 +50,10 @@ struct WorktreeTerminalRoot: View {
 /// ones mounted but hidden, so selecting another worktree flips visibility
 /// instead of tearing the hosting chain down and reparenting live surfaces.
 struct WorktreeTerminalStack: NSViewRepresentable {
-  let inputs: WorktreeTerminalInputs
+  /// nil parks the stack: every tree stays mounted but hidden, so a transient
+  /// detail state (loading, multi-selection, archived list) never tears the
+  /// hosting chain down.
+  let inputs: WorktreeTerminalInputs?
 
   func makeNSView(context: Context) -> WorktreeTerminalStackView {
     WorktreeTerminalStackView()
@@ -75,6 +78,10 @@ final class WorktreeTerminalStackView: NSView {
   /// otherwise unobservable from a test.
   private(set) var hostedRootWrites = 0
   private(set) var selectedWorktreeID: Worktree.ID?
+  /// Whether the keyboard was inside the stack when it was parked, so
+  /// re-selecting can hand it back instead of leaving focus wherever the
+  /// transient overlay dropped it.
+  private var parkedHeldKeyboard = false
 
   var mountedWorktreeIDs: [Worktree.ID] { mountOrder }
 
@@ -84,9 +91,15 @@ final class WorktreeTerminalStackView: NSView {
     hosted[worktreeID]
   }
 
-  func select(_ inputs: WorktreeTerminalInputs) {
+  func select(_ inputs: WorktreeTerminalInputs?) {
+    guard let inputs else {
+      park()
+      return
+    }
     let worktreeID = inputs.worktree.id
     let selectionMoved = selectedWorktreeID != worktreeID
+    let resumesFromPark = selectionMoved && selectedWorktreeID == nil && parkedHeldKeyboard
+    parkedHeldKeyboard = false
     // Read before anything hides: AppKit leaves first responder inside a hidden
     // subtree, so whatever the outgoing tree holds — a surface, the find bar's
     // field, a rename field — has to be handed over by hand.
@@ -113,8 +126,28 @@ final class WorktreeTerminalStackView: NSView {
     }
     if let outgoing, outgoingHoldsKeyboard {
       handOverFirstResponder(from: outgoing, to: worktreeID, manager: inputs.manager)
+    } else if resumesFromPark {
+      // Parking took the keyboard away by hand; selecting again gives it back.
+      inputs.manager.hostIfExists(for: worktreeID)?.focusSelectedTab()
     }
     evictBeyondMountLimit()
+  }
+
+  /// Deselects and hides the current tree without unmounting anything; the
+  /// stack sits invisible under a transient overlay until the next selection.
+  private func park() {
+    guard let previousID = selectedWorktreeID else { return }
+    let outgoing = hosted[previousID]
+    parkedHeldKeyboard = outgoing.map { Self.containsFirstResponder($0) } ?? false
+    deselect(previousID)
+    selectedWorktreeID = nil
+    if let outgoing, !outgoing.isHidden {
+      outgoing.isHidden = true
+      WindowTintMaskRegistry.regionVisibilityDidChange(in: self)
+    }
+    if parkedHeldKeyboard {
+      window?.makeFirstResponder(nil)
+    }
   }
 
   /// Hands the keyboard to the incoming worktree's focused terminal, then parks
