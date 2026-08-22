@@ -232,13 +232,22 @@ if [ -f "${ghostty_fingerprint_path}" ] &&
   exit 0
 fi
 
+# LOCAL BUILD HATCHES (not for upstream) — see scripts/local/libtool.
+#   SUPACODE_GHOSTTY_SKIP_APP=1  skip ghostty's own .app bundle; its xcodebuild link
+#                                fails on this toolchain and supacode only consumes
+#                                the xcframework.
+#   The libtool shim on PATH repairs Xcode 26.6's dropped-member archive merge.
+ghostty_emit_macos_app=true
+if [ -n "${SUPACODE_GHOSTTY_SKIP_APP:-}" ]; then
+  ghostty_emit_macos_app=false
+fi
+if [ -x "${srcroot}/scripts/local/libtool" ]; then
+  PATH="${srcroot}/scripts/local:${PATH}"
+  export PATH
+fi
+
 cd "${ghostty_dir}"
-# Local escape hatch (uncommitted): Supacode consumes only GhosttyKit.xcframework,
-# so the macOS app bundle step can be skipped when the local Xcode can't link it:
-#   SUPACODE_GHOSTTY_SKIP_APP=1 make build-ghostty-xcframework
-ghostty_emit_app=true
-[ -z "${SUPACODE_GHOSTTY_SKIP_APP:-}" ] || ghostty_emit_app=false
-mise exec -- zig build -Doptimize=ReleaseFast -Demit-xcframework=true -Demit-macos-app="${ghostty_emit_app}" -Dsentry=false --prefix "${ghostty_build_root}" --cache-dir "${ghostty_local_cache_dir}" --global-cache-dir "${ghostty_global_cache_dir}"
+mise exec -- zig build -Doptimize=ReleaseFast -Demit-xcframework=true -Demit-macos-app="${ghostty_emit_macos_app}" -Dsentry=false --prefix "${ghostty_build_root}" --cache-dir "${ghostty_local_cache_dir}" --global-cache-dir "${ghostty_global_cache_dir}"
 rsync -a --delete "${ghostty_dir}/macos/GhosttyKit.xcframework/" "${xcframework_path}/"
 repair_xcframework_macos_slice
 prepare_xcframework

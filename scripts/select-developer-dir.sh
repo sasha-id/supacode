@@ -15,6 +15,9 @@ is_zig_linkable() {
   [ -x "${dir}/usr/bin/xcodebuild" ] || return 1
   ver="$(DEVELOPER_DIR="$dir" xcrun --sdk macosx --show-sdk-version 2>/dev/null)" || return 1
   [ -n "$ver" ] || return 1
+  # LOCAL HATCH: the installed zig 0.15.2 carries the #31673 .tbd backport, so any
+  # SDK links. Set SUPACODE_ZIG_HAS_TBD_FIX=1 to skip the 26.3 pin.
+  [ -n "${SUPACODE_ZIG_HAS_TBD_FIX:-}" ] && return 0
   # Reject SDKs newer than 26.3 (the 26.4+ break); sort -V keeps 26.10 above 26.3.
   [ "$(printf '%s\n26.3\n' "$ver" | sort -V | tail -1)" = "26.3" ]
 }
