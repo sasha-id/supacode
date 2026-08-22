@@ -8,8 +8,9 @@ struct WorktreeStatusInspectorContainer: View {
   let pane: WorktreeInspectorPane
   let isFolder: Bool
   let isCheckingPullRequest: Bool
-  let pullRequest: GithubPullRequest?
+  let pullRequest: ForgePullRequest?
   let repositoriesStore: StoreOf<RepositoriesFeature>
+  let capabilities: ForgeCapabilities
   let terminalManager: WorktreeTerminalManager
   let fileOpenActions: [OpenWorktreeAction]
   let resolvedOpenAction: OpenWorktreeAction?
@@ -29,6 +30,7 @@ struct WorktreeStatusInspectorContainer: View {
           pullRequest: pullRequest,
           isFolder: isFolder,
           isCheckingPullRequest: isCheckingPullRequest,
+          capabilities: capabilities,
           onPullRequestAction: onPullRequestAction
         )
       case .files:
@@ -81,15 +83,20 @@ extension View {
 /// Inspector pane mirroring the pull-request popover, re-laid out as a grouped
 /// `Form` so it reads cleanly in a narrow inspector column.
 struct WorktreeGitInspectorView: View {
-  let pullRequest: GithubPullRequest?
+  let pullRequest: ForgePullRequest?
   let isFolder: Bool
   let isCheckingPullRequest: Bool
+  let capabilities: ForgeCapabilities
   let onPullRequestAction: (RepositoriesFeature.PullRequestAction) -> Void
 
   var body: some View {
     Group {
       if !isFolder, let pullRequest {
-        GitInspectorContent(pullRequest: pullRequest, onPullRequestAction: onPullRequestAction)
+        GitInspectorContent(
+          pullRequest: pullRequest,
+          capabilities: capabilities,
+          onPullRequestAction: onPullRequestAction
+        )
       } else {
         Color.clear
       }
@@ -98,7 +105,7 @@ struct WorktreeGitInspectorView: View {
     // under it for the native top blur; the empty/checking states reserve no bar.
     .safeAreaBar(edge: .top) {
       if !isFolder, let pullRequest {
-        GitInspectorHeader(pullRequest: pullRequest)
+        GitInspectorHeader(pullRequest: pullRequest, vocabulary: capabilities.vocabulary)
       }
     }
     // Empty states as a background so they fill the whole pane (past the safe
@@ -107,7 +114,8 @@ struct WorktreeGitInspectorView: View {
       GitInspectorEmptyState(
         isFolder: isFolder,
         hasPullRequest: pullRequest != nil,
-        isCheckingPullRequest: isCheckingPullRequest
+        isCheckingPullRequest: isCheckingPullRequest,
+        vocabulary: capabilities.vocabulary
       )
     }
   }
@@ -119,6 +127,7 @@ private struct GitInspectorEmptyState: View {
   let isFolder: Bool
   let hasPullRequest: Bool
   let isCheckingPullRequest: Bool
+  let vocabulary: ForgeVocabulary
 
   var body: some View {
     if isFolder {
@@ -136,9 +145,9 @@ private struct GitInspectorEmptyState: View {
         }
       } else {
         ContentUnavailableView(
-          "No Pull Request",
+          "No \(vocabulary.noun)",
           systemImage: "arrow.trianglehead.branch",
-          description: Text("This worktree has no open pull request.")
+          description: Text("This worktree has no open \(vocabulary.noun.lowercased()).")
         )
       }
     }
@@ -148,13 +157,14 @@ private struct GitInspectorEmptyState: View {
 /// Pull-request pane header, shown only over the pull-request content. The Open
 /// in Browser affordance appears when the pull request has a URL.
 private struct GitInspectorHeader: View {
-  let pullRequest: GithubPullRequest
+  let pullRequest: ForgePullRequest
+  let vocabulary: ForgeVocabulary
   @Environment(\.openURL) private var openURL
   @Environment(\.analyticsClient) private var analyticsClient
 
   var body: some View {
     HStack {
-      Text("Pull Request")
+      Text(vocabulary.noun)
         .appFont(.headline)
       Spacer()
       if let url = URL(string: pullRequest.url) {
@@ -174,7 +184,8 @@ private struct GitInspectorHeader: View {
 }
 
 private struct GitInspectorContent: View {
-  let pullRequest: GithubPullRequest
+  let pullRequest: ForgePullRequest
+  let capabilities: ForgeCapabilities
   let onPullRequestAction: (RepositoriesFeature.PullRequestAction) -> Void
 
   var body: some View {
@@ -186,17 +197,20 @@ private struct GitInspectorContent: View {
     let badge = PullRequestBadgeStyle.style(
       state: pullRequest.state,
       number: pullRequest.number,
-      isQueued: mergeQueueStatus != nil
+      isQueued: mergeQueueStatus != nil,
+      numberSigil: pullRequest.numberSigil
     )
 
     Form {
       Section {
         LabeledContent("Author", value: pullRequest.authorLogin ?? "Someone")
         LabeledContent("Commits", value: (pullRequest.commitsCount ?? 0).formatted())
-        LabeledContent("Changes") {
-          HStack(spacing: 6) {
-            Text("+\(pullRequest.additions.formatted())").foregroundStyle(.green)
-            Text("-\(pullRequest.deletions.formatted())").foregroundStyle(.red)
+        if let additions = pullRequest.additions, let deletions = pullRequest.deletions {
+          LabeledContent("Changes") {
+            HStack(spacing: 6) {
+              Text("+\(additions.formatted())").foregroundStyle(.green)
+              Text("-\(deletions.formatted())").foregroundStyle(.red)
+            }
           }
         }
         if readiness.isConflicting {
@@ -209,15 +223,10 @@ private struct GitInspectorContent: View {
         }
       } header: {
         VStack(alignment: .leading, spacing: 6) {
-          HStack {
-            if let badge {
-              PullRequestBadgeView(
-                text: pullRequest.isDraft ? "DRAFT" : badge.text,
-                color: badge.color)
-            }
-            Spacer()
-            Text(verbatim: "#\(pullRequest.number)")
-              .foregroundStyle(.secondary)
+          if let badge {
+            PullRequestBadgeView(
+              text: pullRequest.isDraft ? "DRAFT" : badge.text,
+              color: badge.color)
           }
           Text(pullRequest.title)
             .appFont(.headline)
@@ -243,6 +252,7 @@ private struct GitInspectorContent: View {
       PullRequestActionsSection(
         pullRequest: pullRequest,
         breakdown: breakdown,
+        capabilities: capabilities,
         onPullRequestAction: onPullRequestAction
       )
 
@@ -266,8 +276,8 @@ private struct GitInspectorContent: View {
     .scrollEdgeEffectStyle(.soft, for: .all)
   }
 
-  private static func sortedChecks(_ checks: [GithubPullRequestStatusCheck])
-    -> [GithubPullRequestStatusCheck]
+  private static func sortedChecks(_ checks: [ForgePullRequestStatusCheck])
+    -> [ForgePullRequestStatusCheck]
   {
     checks.sorted {
       let left = sortRank(for: $0.checkState)
@@ -279,7 +289,7 @@ private struct GitInspectorContent: View {
     }
   }
 
-  private static func sortRank(for state: GithubPullRequestCheckState) -> Int {
+  private static func sortRank(for state: ForgePullRequestCheckState) -> Int {
     switch state {
     case .failure: 0
     case .inProgress: 1
@@ -293,14 +303,18 @@ private struct GitInspectorContent: View {
 /// Pull-request actions gated the same way as the command palette (mark ready
 /// for drafts, merge when ready, CI helpers when failing, close while open).
 private struct PullRequestActionsSection: View {
-  let pullRequest: GithubPullRequest
+  let pullRequest: ForgePullRequest
   let breakdown: PullRequestCheckBreakdown
+  let capabilities: ForgeCapabilities
   let onPullRequestAction: (RepositoriesFeature.PullRequestAction) -> Void
 
   var body: some View {
-    let isOpen = pullRequest.state.uppercased() == "OPEN"
+    let vocabulary = capabilities.vocabulary
+    let isOpen = pullRequest.state == .open
     let isDraft = pullRequest.isDraft
-    let canMerge = isOpen && !isDraft && !PullRequestMergeReadiness(pullRequest: pullRequest).isBlocking
+    // Permissive on purpose: merge stays offered while mergeability is still
+    // computing; only a confirmed block hides it.
+    let canMerge = isOpen && !isDraft && PullRequestMergeReadiness(pullRequest: pullRequest).blockingReason == nil
     let hasFailingChecks = breakdown.failed > 0
     let checks = pullRequest.statusCheckRollup?.checks ?? []
     let hasFailingCheckWithDetails = checks.contains { $0.checkState == .failure && $0.detailsUrl != nil }
@@ -308,11 +322,13 @@ private struct PullRequestActionsSection: View {
     if isOpen {
       Section("Actions") {
         if canMerge {
-          PullRequestActionRow(title: "Merge Pull Request", icon: .asset(SidebarPullRequestIcon.merged.assetName)) {
+          PullRequestActionRow(
+            title: "Merge \(vocabulary.noun)", icon: .asset(SidebarPullRequestIcon.merged.assetName)
+          ) {
             onPullRequestAction(.merge)
           }
         }
-        if isDraft {
+        if isDraft, capabilities.canMarkReady {
           PullRequestActionRow(title: "Mark Ready for Review", icon: .asset(SidebarPullRequestIcon.open.assetName)) {
             onPullRequestAction(.markReadyForReview)
           }
@@ -323,11 +339,15 @@ private struct PullRequestActionsSection: View {
               onPullRequestAction(.copyFailingJobURL)
             }
           }
-          PullRequestActionRow(title: "Copy CI Failure Logs", icon: .symbol("doc.on.clipboard")) {
-            onPullRequestAction(.copyCiFailureLogs)
+          if capabilities.canCopyCIFailureLogs {
+            PullRequestActionRow(title: "Copy CI Failure Logs", icon: .symbol("doc.on.clipboard")) {
+              onPullRequestAction(.copyCiFailureLogs)
+            }
           }
-          PullRequestActionRow(title: "Re-run Failed Jobs", icon: .symbol("arrow.clockwise")) {
-            onPullRequestAction(.rerunFailedJobs)
+          if capabilities.canRerunChecks {
+            PullRequestActionRow(title: "Re-run Failed Jobs", icon: .symbol("arrow.clockwise")) {
+              onPullRequestAction(.rerunFailedJobs)
+            }
           }
           if hasFailingCheckWithDetails {
             PullRequestActionRow(title: "Open Failing Check Details", icon: .symbol("arrow.up.right.square")) {
@@ -336,7 +356,7 @@ private struct PullRequestActionsSection: View {
           }
         }
         PullRequestActionRow(
-          title: "Close Pull Request",
+          title: "Close \(vocabulary.noun)",
           icon: .asset(SidebarPullRequestIcon.closed.assetName),
           isDestructive: true
         ) {
@@ -386,7 +406,7 @@ private struct PullRequestActionRow: View {
 }
 
 private struct CheckRow: View {
-  let check: GithubPullRequestStatusCheck
+  let check: ForgePullRequestStatusCheck
   @Environment(\.openURL) private var openURL
   @Environment(\.analyticsClient) private var analyticsClient
 
@@ -411,7 +431,7 @@ private struct CheckRow: View {
 }
 
 private struct CheckRowLabel: View {
-  let check: GithubPullRequestStatusCheck
+  let check: ForgePullRequestStatusCheck
   let style: PullRequestCheckStatusStyle
 
   var body: some View {

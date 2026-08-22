@@ -184,10 +184,9 @@ enum GithubAuthStatusParsing {
 }
 
 struct GithubCLIClient: Sendable {
-  var defaultBranch: @Sendable (URL) async throws -> String
-  var latestRun: @Sendable (URL, String) async throws -> GithubWorkflowRun?
+  var latestRun: @Sendable (URL, String) async throws -> ForgeWorkflowRun?
   var resolveRemoteInfo: @Sendable (URL) async -> GithubRemoteInfo?
-  var batchPullRequests: @Sendable (String, String, String, [String]) async throws -> [String: GithubPullRequest]
+  var batchPullRequests: @Sendable (String, String, String, [String]) async throws -> [String: ForgePullRequest]
   var mergePullRequest: @Sendable (URL, GithubRemoteInfo?, Int, PullRequestMergeStrategy) async throws -> Void
   var closePullRequest: @Sendable (URL, GithubRemoteInfo?, Int) async throws -> Void
   var markPullRequestReady: @Sendable (URL, GithubRemoteInfo?, Int) async throws -> Void
@@ -196,6 +195,7 @@ struct GithubCLIClient: Sendable {
   var runLogs: @Sendable (URL, Int) async throws -> String
   var isAvailable: @Sendable () async -> Bool
   var authStatus: @Sendable () async throws -> GithubAuthStatus?
+  var authenticatedHosts: @Sendable () async throws -> Set<String>
 }
 
 extension GithubCLIClient: DependencyKey {
@@ -203,11 +203,13 @@ extension GithubCLIClient: DependencyKey {
 
   static func live(
     shell: ShellClient = .liveValue,
-    fallbackExecutableURLs: [URL] = GithubCLIExecutableResolver.defaultFallbackExecutableURLs()
+    fallbackExecutableURLs: [URL] = ForgeCLIExecutableResolver.defaultFallbackExecutableURLs(executableName: "gh")
   ) -> GithubCLIClient {
-    let resolver = GithubCLIExecutableResolver(fallbackExecutableURLs: fallbackExecutableURLs)
+    let resolver = ForgeCLIExecutableResolver(
+      executableName: "gh",
+      fallbackExecutableURLs: fallbackExecutableURLs
+    )
     return GithubCLIClient(
-      defaultBranch: defaultBranchFetcher(shell: shell, resolver: resolver),
       latestRun: latestRunFetcher(shell: shell, resolver: resolver),
       resolveRemoteInfo: resolveRemoteInfoFetcher(shell: shell, resolver: resolver),
       batchPullRequests: batchPullRequestsFetcher(shell: shell, resolver: resolver),
@@ -218,12 +220,12 @@ extension GithubCLIClient: DependencyKey {
       failedRunLogs: failedRunLogsFetcher(shell: shell, resolver: resolver),
       runLogs: runLogsFetcher(shell: shell, resolver: resolver),
       isAvailable: isAvailableFetcher(shell: shell, resolver: resolver),
-      authStatus: authStatusFetcher(shell: shell, resolver: resolver)
+      authStatus: authStatusFetcher(shell: shell, resolver: resolver),
+      authenticatedHosts: authenticatedHostsFetcher(shell: shell, resolver: resolver)
     )
   }
 
   static let testValue = GithubCLIClient(
-    defaultBranch: { _ in "main" },
     latestRun: { _, _ in nil },
     resolveRemoteInfo: { _ in nil },
     batchPullRequests: { _, _, _, _ in [:] },
@@ -234,7 +236,8 @@ extension GithubCLIClient: DependencyKey {
     failedRunLogs: { _, _ in "" },
     runLogs: { _, _ in "" },
     isAvailable: { true },
-    authStatus: { GithubAuthStatus(username: "testuser", host: "github.com") }
+    authStatus: { GithubAuthStatus(username: "testuser", host: "github.com") },
+    authenticatedHosts: { ["github.com"] }
   )
 }
 
@@ -251,130 +254,10 @@ private struct GithubPullRequestsRequest: Sendable {
   let repo: String
 }
 
-actor GithubCLIExecutableResolver {
-  nonisolated private static let logger = SupaLogger("GithubCLI")
-
-  private let fallbackExecutableURLs: [URL]
-  private var cachedExecutableURL: URL?
-  private var inFlightResolution: Task<URL, Error>?
-
-  init(fallbackExecutableURLs: [URL]) {
-    self.fallbackExecutableURLs = fallbackExecutableURLs
-  }
-
-  func executableURL(shell: ShellClient) async throws -> URL {
-    if let cachedExecutableURL {
-      return cachedExecutableURL
-    }
-    if let inFlightResolution {
-      return try await inFlightResolution.value
-    }
-    let resolutionTask = Task {
-      try await resolveExecutableURL(shell: shell)
-    }
-    inFlightResolution = resolutionTask
-    do {
-      let executableURL = try await resolutionTask.value
-      cachedExecutableURL = executableURL
-      inFlightResolution = nil
-      return executableURL
-    } catch {
-      inFlightResolution = nil
-      throw error
-    }
-  }
-
-  func invalidate() {
-    cachedExecutableURL = nil
-    inFlightResolution?.cancel()
-    inFlightResolution = nil
-  }
-
-  private func resolveExecutableURL(shell: ShellClient) async throws -> URL {
-    if let executableURL = await locateExecutableURL(
-      shell: shell,
-      useLoginShell: false
-    ) {
-      return executableURL
-    }
-    if let executableURL = await locateExecutableURL(
-      shell: shell,
-      useLoginShell: true
-    ) {
-      return executableURL
-    }
-    if let executableURL = fallbackExecutableURLs.first(where: {
-      FileManager.default.isExecutableFile(atPath: $0.path)
-    }) {
-      // Shell PATH missed gh; note the fixed-path fallback so a mismatch with the user's terminal is traceable.
-      Self.logger.info("Resolved gh via fallback path \(executableURL.path); shell PATH resolution failed.")
-      return executableURL
-    }
-    throw GithubCLIError.unavailable
-  }
-
-  nonisolated static func defaultFallbackExecutableURLs(
-    environment: [String: String] = ProcessInfo.processInfo.environment
-  ) -> [URL] {
-    [
-      "/opt/homebrew/bin/gh",
-      "/usr/local/bin/gh",
-      environment["HOME"].map { "\($0)/.local/bin/gh" },
-    ]
-    .compactMap { $0 }
-    .map { URL(fileURLWithPath: $0) }
-  }
-
-  private func locateExecutableURL(
-    shell: ShellClient,
-    useLoginShell: Bool
-  ) async -> URL? {
-    let whichURL = URL(fileURLWithPath: "/usr/bin/which")
-    do {
-      let output: String
-      if useLoginShell {
-        output = try await shell.runLogin(
-          whichURL,
-          ["gh"],
-          nil,
-          log: false
-        ).stdout
-      } else {
-        output = try await shell.run(whichURL, ["gh"], nil).stdout
-      }
-      let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty else {
-        return nil
-      }
-      return URL(fileURLWithPath: trimmed)
-    } catch {
-      return nil
-    }
-  }
-}
-
-nonisolated private func defaultBranchFetcher(
-  shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
-) -> @Sendable (URL) async throws -> String {
-  { repoRoot in
-    let output = try await runGh(
-      shell: shell,
-      resolver: resolver,
-      arguments: ["repo", "view", "--json", "defaultBranchRef"],
-      repoRoot: repoRoot
-    )
-    let decoder = JSONDecoder()
-    decoder.dateDecodingStrategy = .iso8601
-    let response = try GithubCLIOutput.decode(GithubRepoViewResponse.self, from: output, decoder: decoder)
-    return response.defaultBranchRef.name
-  }
-}
-
 nonisolated private func latestRunFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
-) -> @Sendable (URL, String) async throws -> GithubWorkflowRun? {
+  resolver: ForgeCLIExecutableResolver
+) -> @Sendable (URL, String) async throws -> ForgeWorkflowRun? {
   { repoRoot, branch in
     let output = try await runGh(
       shell: shell,
@@ -394,7 +277,7 @@ nonisolated private func latestRunFetcher(
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601
     // nil payload means no runs; a present-but-undecodable payload still throws.
-    let runs = try GithubCLIOutput.decodeIfPresent([GithubWorkflowRun].self, from: output, decoder: decoder)
+    let runs = try GithubCLIOutput.decodeIfPresent([ForgeWorkflowRun].self, from: output, decoder: decoder)
     return runs?.first
   }
 }
@@ -411,7 +294,7 @@ nonisolated private struct GithubRepoViewRemoteInfoResponse: Decodable, Sendable
 
 nonisolated private func resolveRemoteInfoFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL) async -> GithubRemoteInfo? {
   { repoRoot in
     let output: String
@@ -464,8 +347,8 @@ nonisolated private func repoSlug(for remote: GithubRemoteInfo) -> String {
 
 nonisolated private func batchPullRequestsFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
-) -> @Sendable (String, String, String, [String]) async throws -> [String: GithubPullRequest] {
+  resolver: ForgeCLIExecutableResolver
+) -> @Sendable (String, String, String, [String]) async throws -> [String: ForgePullRequest] {
   { host, owner, repo, branches in
     let dedupedBranches = deduplicatedBranches(branches)
     guard !dedupedBranches.isEmpty else {
@@ -491,7 +374,7 @@ nonisolated private func batchPullRequestsFetcher(
 
 nonisolated private func mergePullRequestFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL, GithubRemoteInfo?, Int, PullRequestMergeStrategy) async throws -> Void {
   { repoRoot, remote, pullRequestNumber, strategy in
     var arguments: [String] = ["pr", "merge", "\(pullRequestNumber)", "--\(strategy.ghArgument)"]
@@ -509,7 +392,7 @@ nonisolated private func mergePullRequestFetcher(
 
 nonisolated private func closePullRequestFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL, GithubRemoteInfo?, Int) async throws -> Void {
   { repoRoot, remote, pullRequestNumber in
     var arguments: [String] = ["pr", "close", "\(pullRequestNumber)"]
@@ -527,7 +410,7 @@ nonisolated private func closePullRequestFetcher(
 
 nonisolated private func markPullRequestReadyFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL, GithubRemoteInfo?, Int) async throws -> Void {
   { repoRoot, remote, pullRequestNumber in
     var arguments: [String] = ["pr", "ready", "\(pullRequestNumber)"]
@@ -545,7 +428,7 @@ nonisolated private func markPullRequestReadyFetcher(
 
 nonisolated private func rerunFailedJobsFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL, Int) async throws -> Void {
   { repoRoot, runID in
     _ = try await runGh(
@@ -564,7 +447,7 @@ nonisolated private func rerunFailedJobsFetcher(
 
 nonisolated private func failedRunLogsFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL, Int) async throws -> String {
   { repoRoot, runID in
     try await runGh(
@@ -583,7 +466,7 @@ nonisolated private func failedRunLogsFetcher(
 
 nonisolated private func runLogsFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable (URL, Int) async throws -> String {
   { repoRoot, runID in
     try await runGh(
@@ -602,7 +485,7 @@ nonisolated private func runLogsFetcher(
 
 nonisolated private func isAvailableFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable () async -> Bool {
   {
     do {
@@ -621,7 +504,7 @@ nonisolated private func isAvailableFetcher(
 
 nonisolated private func authStatusFetcher(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver
+  resolver: ForgeCLIExecutableResolver
 ) -> @Sendable () async throws -> GithubAuthStatus? {
   {
     let output = try await runGh(
@@ -635,6 +518,26 @@ nonisolated private func authStatusFetcher(
       return nil
     }
     return GithubAuthStatus(username: active.login, host: active.host)
+  }
+}
+
+nonisolated private func authenticatedHostsFetcher(
+  shell: ShellClient,
+  resolver: ForgeCLIExecutableResolver
+) -> @Sendable () async throws -> Set<String> {
+  {
+    let output = try await runGh(
+      shell: shell,
+      resolver: resolver,
+      arguments: ["auth", "status", "--json", "hosts"],
+      repoRoot: nil
+    )
+    let response = try GithubCLIOutput.decode(GithubAuthStatusResponse.self, from: output)
+    var hosts = Set<String>()
+    for (host, accounts) in response.hosts where !accounts.isEmpty {
+      hosts.insert(host.lowercased())
+    }
+    return hosts
   }
 }
 
@@ -674,12 +577,12 @@ nonisolated private func makeBranchChunks(
 
 nonisolated private func loadPullRequestChunks(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver,
+  resolver: ForgeCLIExecutableResolver,
   request: GithubPullRequestsRequest,
   chunks: [[String]]
-) async throws -> [Int: [String: GithubPullRequest]] {
+) async throws -> [Int: [String: ForgePullRequest]] {
   try await withThrowingTaskGroup(
-    of: (Int, [String: GithubPullRequest]).self
+    of: (Int, [String: ForgePullRequest]).self
   ) { group in
     var nextChunkIndex = 0
     let initialCount = min(batchPullRequestsMaxConcurrentRequests, chunks.count)
@@ -698,7 +601,7 @@ nonisolated private func loadPullRequestChunks(
       nextChunkIndex += 1
     }
 
-    var resultsByChunkIndex: [Int: [String: GithubPullRequest]] = [:]
+    var resultsByChunkIndex: [Int: [String: ForgePullRequest]] = [:]
     while let (chunkIndex, prsByBranch) = try await group.next() {
       resultsByChunkIndex[chunkIndex] = prsByBranch
       if nextChunkIndex < chunks.count {
@@ -722,10 +625,10 @@ nonisolated private func loadPullRequestChunks(
 }
 
 nonisolated private func mergePullRequestChunkResults(
-  _ chunkResults: [Int: [String: GithubPullRequest]],
+  _ chunkResults: [Int: [String: ForgePullRequest]],
   chunkCount: Int
-) -> [String: GithubPullRequest] {
-  var results: [String: GithubPullRequest] = [:]
+) -> [String: ForgePullRequest] {
+  var results: [String: ForgePullRequest] = [:]
   for chunkIndex in 0..<chunkCount {
     guard let prsByBranch = chunkResults[chunkIndex] else {
       continue
@@ -737,11 +640,11 @@ nonisolated private func mergePullRequestChunkResults(
 
 nonisolated private func fetchPullRequestsChunk(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver,
+  resolver: ForgeCLIExecutableResolver,
   request: GithubPullRequestsRequest,
   chunk: [String],
   chunkIndex: Int
-) async throws -> (Int, [String: GithubPullRequest]) {
+) async throws -> (Int, [String: ForgePullRequest]) {
   @Dependency(\.continuousClock) var clock
 
   func runChunkQuery(includeMergeQueueEntry: Bool) async throws -> (output: String, aliasMap: [String: String]) {
@@ -910,7 +813,7 @@ nonisolated private func isOutdatedGitHubCLI(_ error: ShellClientError) -> Bool 
 
 nonisolated private func runGh(
   shell: ShellClient,
-  resolver: GithubCLIExecutableResolver,
+  resolver: ForgeCLIExecutableResolver,
   arguments: [String],
   repoRoot: URL?
 ) async throws -> String {
@@ -920,13 +823,15 @@ nonisolated private func runGh(
     do {
       return try await shell.runLogin(executableURL, arguments, repoRoot, log: false).stdout
     } catch {
-      guard shouldRetryGhExecution(after: error) else {
+      guard ForgeCLIExecutableResolver.shouldRetryExecution(after: error) else {
         throw error
       }
       await resolver.invalidate()
       let executableURL = try await resolver.executableURL(shell: shell)
       return try await shell.runLogin(executableURL, arguments, repoRoot, log: false).stdout
     }
+  } catch is ForgeCLIResolutionError {
+    throw GithubCLIError.unavailable
   } catch let error as GithubCLIError {
     throw error
   } catch {
@@ -942,24 +847,4 @@ nonisolated private func runGh(
     }
     throw GithubCLIError.commandFailed(error.localizedDescription)
   }
-}
-
-nonisolated private func shouldRetryGhExecution(after error: Error) -> Bool {
-  if let shellError = error as? ShellClientError {
-    let combined = "\(shellError.stdout)\n\(shellError.stderr)".lowercased()
-    if combined.contains("no such file or directory") || combined.contains("command not found") {
-      return true
-    }
-    if shellError.exitCode == 127 {
-      return true
-    }
-  }
-  let nsError = error as NSError
-  if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError {
-    return true
-  }
-  if nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOENT) {
-    return true
-  }
-  return false
 }

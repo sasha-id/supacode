@@ -153,10 +153,10 @@ struct RepositoriesFeatureSidebarTests {
       name: "repo",
       worktrees: IdentifiedArray(uniqueElements: [worktree])
     )
-    let pullRequest = GithubPullRequest(
+    let pullRequest = ForgePullRequest(
       number: 7,
       title: "Live",
-      state: "OPEN",
+      state: .open,
       additions: 1,
       deletions: 0,
       isDraft: false,
@@ -177,6 +177,9 @@ struct RepositoriesFeatureSidebarTests {
     state.sidebarItems[id: worktreeID]?.pullRequest = pullRequest
     state.sidebarItems[id: worktreeID]?.pullRequestBranchAtQueryTime = "feature"
     state.inFlightPullRequestBranchSnapshotsByRepositoryID[repoID] = [worktreeID: "feature"]
+    // Production records the forge before summaries land; without it the
+    // stale-sweep gate rejects the payload.
+    state.resolvedForgeByRepositoryID[repoID] = .github
 
     let store = TestStore(initialState: state) {
       RepositoriesFeature()

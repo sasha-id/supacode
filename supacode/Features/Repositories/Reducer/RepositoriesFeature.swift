@@ -13,6 +13,11 @@ private enum CancelID {
   static let toastAutoDismiss = "repositories.toastAutoDismiss"
   static let githubIntegrationAvailability = "repositories.githubIntegrationAvailability"
   static let githubIntegrationRecovery = "repositories.githubIntegrationRecovery"
+  static let pullRequestDetail = "repositories.pullRequestDetail"
+
+  static func pullRequestRefresh(_ repositoryID: Repository.ID) -> String {
+    "repositories.pullRequestRefresh.\(repositoryID.rawValue)"
+  }
   static let worktreePromptLoad = "repositories.worktreePromptLoad"
   static let worktreePromptValidation = "repositories.worktreePromptValidation"
   static let resolveRemoteRepositories = "repositories.resolveRemoteRepositories"
@@ -23,6 +28,9 @@ private enum CancelID {
   static func worktreeLineChanges(_ worktreeID: Worktree.ID) -> String {
     "repositories.worktreeLineChanges.\(worktreeID)"
   }
+  static func pullRequestOpenFetch(_ worktreeID: Worktree.ID) -> String {
+    "repositories.pullRequestOpenFetch.\(worktreeID)"
+  }
 }
 
 nonisolated let repositoriesLogger = SupaLogger("Repositories")
@@ -30,20 +38,21 @@ private nonisolated let githubIntegrationRecoveryInterval: Duration = .seconds(1
 private nonisolated let toastAutoDismissDelay: Duration = .milliseconds(2500)
 private nonisolated let delayedPullRequestRefreshDelay: Duration = .seconds(2)
 
-// Resolve `(host, owner, repo)` for a repository root. `gh repo
-// view` honours the user's default-repo resolution (fork →
-// upstream), so it wins when available. The git remote parser is
-// the fallback for when `gh` is unavailable or unauthenticated.
-@Sendable
-private func resolveRemoteInfo(
-  repositoryRootURL: URL,
-  githubCLI: GithubCLIClient,
-  gitClient: GitClientDependency
-) async -> GithubRemoteInfo? {
-  if let info = await githubCLI.resolveRemoteInfo(repositoryRootURL) {
-    return info
+/// Injected so the open paths stay testable without launching a real browser.
+struct URLOpenerClient: Sendable {
+  var open: @Sendable (URL) -> Void
+}
+
+extension URLOpenerClient: DependencyKey {
+  static let liveValue = URLOpenerClient { NSWorkspace.shared.open($0) }
+  static let testValue = URLOpenerClient { _ in }
+}
+
+extension DependencyValues {
+  var urlOpener: URLOpenerClient {
+    get { self[URLOpenerClient.self] }
+    set { self[URLOpenerClient.self] = newValue }
   }
-  return await gitClient.remoteInfo(repositoryRootURL)
 }
 
 private nonisolated let worktreeCreationProgressLineLimit = 200
@@ -202,10 +211,15 @@ struct RepositoriesFeature {
     var githubIntegrationAvailability: GithubIntegrationAvailability = .unknown
     var pendingPullRequestRefreshByRepositoryID: [Repository.ID: PendingPullRequestRefresh] = [:]
     var inFlightPullRequestRefreshRepositoryIDs: Set<Repository.ID> = []
+    /// Forge serving each repository, cached from the last refresh resolution;
+    /// drives forge vocabulary and capability gating in synchronous UI builds.
+    var resolvedForgeByRepositoryID: [Repository.ID: ForgeID] = [:]
     /// Branch snapshot per worktree at query-start time; consumed when the result lands
     /// so `pullRequestChanged.branchAtQueryTime` matches the branch the watermark armed.
     var inFlightPullRequestBranchSnapshotsByRepositoryID: [Repository.ID: [Worktree.ID: String]] = [:]
     var queuedPullRequestRefreshByRepositoryID: [Repository.ID: PendingPullRequestRefresh] = [:]
+    /// Worktrees with an in-flight open-fetch; dedups repeated presses to one query.
+    var inFlightPullRequestOpenFetchWorktreeIDs: Set<Worktree.ID> = []
     var sidebarSelectedWorktreeIDs: Set<Worktree.ID> = []
     var nextPendingSidebarRevealID = 0
     var pendingSidebarReveal: PendingSidebarReveal?
@@ -354,6 +368,11 @@ struct RepositoriesFeature {
     /// sort that nesting forces shows up in `slotByID` / `hotkeySlots` (which
     /// the view reads to assign ⌃1..⌃0 hotkeys).
     case sidebarNestByBranchChanged
+    /// Fired by `SidebarListView.onChange` whenever
+    /// `@Shared(.sidebarSectionSort)` mutates. Rebuilds the cached
+    /// structure so repo/folder sections follow the selected sort. Does not
+    /// rewrite `sidebar.sections`.
+    case sidebarSectionSortChanged
     case setOpenPanelPresented(Bool)
     case requestAddRemoteRepository
     case requestEditRemoteRepository(Repository.ID)
@@ -531,9 +550,12 @@ struct RepositoriesFeature {
     case refreshGithubIntegrationAvailability
     case githubIntegrationAvailabilityUpdated(Bool)
     case repositoryPullRequestRefreshCompleted(Repository.ID)
+    case worktreePullRequestDetailLoaded(Worktree.ID, pullRequestNumber: Int, ForgePullRequestDetail)
+    case repositoryForgeResolved(Repository.ID, ForgeID)
+    case forgeIntegrationDisabled(ForgeID)
     case repositoryPullRequestsLoaded(
       repositoryID: Repository.ID,
-      pullRequestsByWorktreeID: [Worktree.ID: GithubPullRequest?]
+      pullRequestsByWorktreeID: [Worktree.ID: ForgePullRequest?]
     )
     case setGithubIntegrationEnabled(Bool)
     /// Installed editors resolved by `AppFeature`'s LaunchServices sweep. Mirrored
@@ -556,6 +578,14 @@ struct RepositoriesFeature {
     case autoDeleteExpiredArchivedWorktrees
     case setMoveNotifiedWorktreeToTop(Bool)
     case pullRequestAction(Worktree.ID, PullRequestAction)
+    /// Open the selected worktree's PR, re-fetching first when none is known.
+    case openSelectedWorktreePullRequest
+    case pullRequestOpenFetchLoaded(
+      worktreeID: Worktree.ID,
+      branch: String,
+      pullRequest: ForgePullRequest?
+    )
+    case pullRequestOpenFetchFailed(worktreeID: Worktree.ID, hasRemote: Bool)
     case showToast(StatusToast)
     case dismissToast
     case toggleInspectorPane(WorktreeInspectorPane)
@@ -600,6 +630,7 @@ struct RepositoriesFeature {
   enum StatusToast: Equatable {
     case inProgress(String)
     case success(String)
+    case info(String)
   }
 
   enum Alert: Hashable {
@@ -638,13 +669,14 @@ struct RepositoriesFeature {
 
   @Dependency(AnalyticsClient.self) private var analyticsClient
   @Dependency(GitClientDependency.self) private var gitClient
-  @Dependency(GithubCLIClient.self) private var githubCLI
+  @Dependency(ForgeRegistry.self) private var forgeRegistry
   @Dependency(GithubIntegrationClient.self) private var githubIntegration
   @Dependency(RepositoryPersistenceClient.self) private var repositoryPersistence
   @Dependency(ShellClient.self) private var shellClient
   @Dependency(\.continuousClock) private var clock
   @Dependency(\.date.now) private var now
   @Dependency(\.uuid) private var uuid
+  @Dependency(URLOpenerClient.self) private var urlOpener
 
   /// Host-aware git client: the SSH flavor for a remote worktree (so branch /
   /// diff lookups run on the host), the injected local client otherwise.
@@ -1594,6 +1626,7 @@ struct RepositoriesFeature {
 
       case .removeFailedRepository(let repositoryID):
         state.loadFailuresByID.removeValue(forKey: repositoryID)
+        state.resolvedForgeByRepositoryID.removeValue(forKey: repositoryID)
         state.repositoryRoots.removeAll {
           RepositoryID($0.standardizedFileURL.path(percentEncoded: false)) == repositoryID
         }
@@ -1657,6 +1690,7 @@ struct RepositoriesFeature {
 
       case .repositoryRemovalCompleted(
         let repositoryID, let outcome, let selectionWasRemoved):
+        state.resolvedForgeByRepositoryID.removeValue(forKey: repositoryID)
         // Aggregator entry point. Every repo-level removal
         // (successful or not) drains through here so bulk batches
         // fire a single terminal `.repositoriesRemoved` after the
@@ -1757,7 +1791,7 @@ struct RepositoriesFeature {
               // reloads prune an entry before the alert is read.
               var namesByRepositoryID: [Repository.ID: String] = [:]
               for id in batch.failureMessagesByRepositoryID.keys {
-                if let name = state.repositories[id: id]?.name {
+                if let name = state.repositoryName(for: id) {
                   namesByRepositoryID[id] = name
                 }
               }
@@ -2457,14 +2491,19 @@ struct RepositoriesFeature {
           state.queuedPullRequestRefreshByRepositoryID.removeAll()
           state.inFlightPullRequestRefreshRepositoryIDs.removeAll()
           state.inFlightPullRequestBranchSnapshotsByRepositoryID.removeAll()
+          let openFetchCancels = Self.cancelPullRequestOpenFetches(&state)
           let clock = clock
-          return .run { send in
-            while !Task.isCancelled {
-              try await clock.sleep(for: githubIntegrationRecoveryInterval)
-              await send(.refreshGithubIntegrationAvailability)
-            }
-          }
-          .cancellable(id: CancelID.githubIntegrationRecovery, cancelInFlight: true)
+          return .merge(
+            openFetchCancels + [
+              .run { send in
+                while !Task.isCancelled {
+                  try await clock.sleep(for: githubIntegrationRecoveryInterval)
+                  await send(.refreshGithubIntegrationAvailability)
+                }
+              }
+              .cancellable(id: CancelID.githubIntegrationRecovery, cancelInFlight: true)
+            ]
+          )
         }
         let pendingRefreshes = state.pendingPullRequestRefreshByRepositoryID.values.sorted {
           $0.repositoryRootURL.path(percentEncoded: false)
@@ -2485,6 +2524,68 @@ struct RepositoriesFeature {
                 )
               )
             }
+          )
+        )
+
+      case .forgeIntegrationDisabled(let forgeID):
+        // Clear the disabled forge's rows so stale proposal chips can't
+        // outlive the integration; other forges keep refreshing.
+        var teardownRepositoryIDs: Set<Repository.ID> = []
+        for (repositoryID, resolved) in state.resolvedForgeByRepositoryID where resolved == forgeID {
+          teardownRepositoryIDs.insert(repositoryID)
+        }
+        // A first sweep that has not recorded its forge yet could land after
+        // the teardown and paint chips for the disabled integration; cancel
+        // unresolved in-flight sweeps too (the next tick re-sweeps them).
+        for repositoryID in state.inFlightPullRequestRefreshRepositoryIDs
+        where state.resolvedForgeByRepositoryID[repositoryID] == nil {
+          teardownRepositoryIDs.insert(repositoryID)
+        }
+        guard !teardownRepositoryIDs.isEmpty else { return .none }
+        var teardownEffects: [Effect<Action>] = []
+        for repositoryID in teardownRepositoryIDs.sorted(by: { $0.rawValue < $1.rawValue }) {
+          state.resolvedForgeByRepositoryID.removeValue(forKey: repositoryID)
+          // Cancel in-flight sweeps and drop their bookkeeping, or a late
+          // completion repopulates rows with nothing left to correct them.
+          teardownEffects.append(.cancel(id: CancelID.pullRequestRefresh(repositoryID)))
+          state.inFlightPullRequestRefreshRepositoryIDs.remove(repositoryID)
+          state.inFlightPullRequestBranchSnapshotsByRepositoryID.removeValue(forKey: repositoryID)
+          state.queuedPullRequestRefreshByRepositoryID.removeValue(forKey: repositoryID)
+          state.pendingPullRequestRefreshByRepositoryID.removeValue(forKey: repositoryID)
+        }
+        // A late open-fetch result would re-cache a chip or open a URL for the
+        // torn-down forge; cancel the fetches scoped to its repositories.
+        for worktreeID in Array(state.inFlightPullRequestOpenFetchWorktreeIDs)
+        where state.repositoryID(containing: worktreeID).map(teardownRepositoryIDs.contains) == true {
+          teardownEffects.append(.cancel(id: CancelID.pullRequestOpenFetch(worktreeID)))
+          state.inFlightPullRequestOpenFetchWorktreeIDs.remove(worktreeID)
+        }
+        for row in state.sidebarItems
+        where teardownRepositoryIDs.contains(row.repositoryID) && row.pullRequest != nil {
+          teardownEffects.append(
+            state.updateWorktreePullRequestEffect(worktreeID: row.id, pullRequest: nil)
+          )
+        }
+        return .merge(teardownEffects)
+
+      case .repositoryForgeResolved(let repositoryID, let forgeID):
+        // A sweep that resolved just before its forge was disabled must not
+        // re-record the dead forge.
+        @Shared(.settingsFile) var settingsFile
+        guard settingsFile.global.forgeIntegrationEnabled(forID: forgeID.rawValue) else { return .none }
+        guard state.resolvedForgeByRepositoryID[repositoryID] != forgeID else { return .none }
+        state.resolvedForgeByRepositoryID[repositoryID] = forgeID
+        return .none
+
+      case .worktreePullRequestDetailLoaded(let worktreeID, let pullRequestNumber, let detail):
+        // The detail fetch outlives worktree deletion; a missing row is a no-op.
+        guard state.sidebarItems[id: worktreeID] != nil else { return .none }
+        return .send(
+          .sidebarItems(
+            .element(
+              id: worktreeID,
+              action: .pullRequestDetailApplied(pullRequestNumber: pullRequestNumber, detail)
+            )
           )
         )
 
@@ -2545,6 +2646,13 @@ struct RepositoriesFeature {
           host: repository.host
         ).currentSettings()
         let resolvedMergedAction = repositorySettings.mergedWorktreeAction ?? state.mergedWorktreeAction
+        // Live proposals with no recorded forge are a sweep that raced a
+        // teardown; reject them (all-nil clears always pass).
+        if state.resolvedForgeByRepositoryID[repositoryID] == nil,
+          pullRequestsByWorktreeID.values.contains(where: { $0 != nil })
+        {
+          return .none
+        }
         let branchSnapshot = state.inFlightPullRequestBranchSnapshotsByRepositoryID[repositoryID] ?? [:]
         var archiveWorktreeIDs: [Worktree.ID] = []
         var deleteWorktreeIDs: [Worktree.ID] = []
@@ -2557,8 +2665,8 @@ struct RepositoriesFeature {
           }
           let pullRequest = pullRequestsByWorktreeID[worktreeID] ?? nil
           let previousPullRequest = state.sidebarItems[id: worktreeID]?.pullRequest
-          let previousMerged = previousPullRequest?.state == "MERGED"
-          let nextMerged = pullRequest?.state == "MERGED"
+          let previousMerged = previousPullRequest?.state == .merged
+          let nextMerged = pullRequest?.state == .merged
           // Dispatch unconditionally so an identical-PR result still clears the row's watermark.
           rowEffects.append(
             state.updateWorktreePullRequestEffect(
@@ -2590,14 +2698,113 @@ struct RepositoriesFeature {
             }
           }
         }
+        let detailEffect = pullRequestDetailEffect(
+          state: state,
+          repository: repository,
+          dispatchIDs: dispatchIDs,
+          pullRequestsByWorktreeID: pullRequestsByWorktreeID
+        )
         let effects: [Effect<Action>] =
           rowEffects
+          + [detailEffect]
           + archiveWorktreeIDs.map { .send(.archiveWorktreeConfirmed($0, repositoryID)) }
           + deleteWorktreeIDs.map { .send(.deleteSidebarItemConfirmed($0, repositoryID)) }
         guard !effects.isEmpty else {
           return .none
         }
         return .merge(effects)
+
+      case .openSelectedWorktreePullRequest:
+        // A folder isn't a git repository, so it has no branch or pull request to look up.
+        guard let worktreeID = state.selectedWorktreeID,
+          state.sidebarItems[id: worktreeID]?.isFolder != true,
+          let worktree = state.worktree(for: worktreeID),
+          let repositoryID = state.repositoryID(containing: worktreeID),
+          let repository = state.repositories[id: repositoryID]
+        else {
+          return .none
+        }
+        if let pullRequest = state.sidebarItems[id: worktreeID]?.pullRequest,
+          let url = URL(string: pullRequest.url)
+        {
+          return openURLEffect(url)
+        }
+        // A remote repo has no local checkout for `gh` to query (gh-over-ssh is out of scope).
+        guard repository.host == nil else {
+          return .send(.showToast(.info("Pull requests aren't available for remote repositories.")))
+        }
+        // Gate on availability, not the settings toggle, so a fetch can't hang on an unusable integration.
+        guard state.githubIntegrationAvailability == .available else {
+          return .send(.showToast(.info("Git forge integration is unavailable.")))
+        }
+        guard state.inFlightPullRequestOpenFetchWorktreeIDs.insert(worktreeID).inserted else {
+          return .none
+        }
+        let repositoryRootURL = repository.rootURL
+        let repositoryHost = repository.host
+        let branch = worktree.name
+        let forgeRegistry = forgeRegistry
+        return .merge(
+          .send(.showToast(.inProgress("Checking for pull request…"))),
+          .run { send in
+            guard
+              let forgeID = await forgeRegistry.resolveForgeID(repositoryRootURL, repositoryHost),
+              let forge = forgeRegistry.client(forgeID),
+              let project = await forge.resolveProject(repositoryRootURL)
+            else {
+              repositoriesLogger.error(
+                "Open-PR fetch: no forge remote for \(repositoryRootURL.path(percentEncoded: false))."
+              )
+              await send(.pullRequestOpenFetchFailed(worktreeID: worktreeID, hasRemote: false))
+              return
+            }
+            do {
+              let prsByBranch = try await forge.fetchSummaries(project, [branch])
+              await send(
+                .pullRequestOpenFetchLoaded(
+                  worktreeID: worktreeID,
+                  branch: branch,
+                  pullRequest: prsByBranch[branch]
+                )
+              )
+            } catch {
+              repositoriesLogger.error(
+                "Open-PR fetch failed for branch \(branch): \(error.localizedDescription)."
+              )
+              await send(.pullRequestOpenFetchFailed(worktreeID: worktreeID, hasRemote: true))
+            }
+          }
+          .cancellable(id: CancelID.pullRequestOpenFetch(worktreeID), cancelInFlight: false)
+        )
+
+      case .pullRequestOpenFetchLoaded(let worktreeID, let branch, let pullRequest):
+        state.inFlightPullRequestOpenFetchWorktreeIDs.remove(worktreeID)
+        // Discard a result that outlived its request (integration torn down, or the worktree renamed/removed).
+        guard state.githubIntegrationAvailability == .available,
+          state.worktree(for: worktreeID)?.name == branch
+        else {
+          return .send(.dismissToast)
+        }
+        guard let pullRequest, let url = URL(string: pullRequest.url) else {
+          return .send(.showToast(.info("No pull request found for this worktree.")))
+        }
+        return .merge(
+          state.updateWorktreePullRequestEffect(
+            worktreeID: worktreeID,
+            pullRequest: pullRequest,
+            branchAtQueryTime: branch
+          ),
+          .send(.dismissToast),
+          openURLEffect(url)
+        )
+
+      case .pullRequestOpenFetchFailed(let worktreeID, let hasRemote):
+        state.inFlightPullRequestOpenFetchWorktreeIDs.remove(worktreeID)
+        let message =
+          hasRemote
+          ? "Couldn't check for pull requests."
+          : "No supported git forge found for this repository."
+        return .send(.showToast(.info(message)))
 
       case .pullRequestAction(let worktreeID, let action):
         guard let worktree = state.worktree(for: worktreeID),
@@ -2671,27 +2878,21 @@ struct RepositoriesFeature {
           }
 
         case .markReadyForReview:
-          let githubCLI = githubCLI
-          let gitClient = gitClient
-          let githubIntegration = githubIntegration
+          let forgeRegistry = forgeRegistry
           return .run { send in
-            guard await githubIntegration.isAvailable() else {
-              await send(
-                .presentAlert(
-                  title: "GitHub integration unavailable",
-                  message: "Enable GitHub integration to mark a pull request as ready."
-                )
+            guard
+              let (forge, _) = await ForgeDispatch.resolve(
+                registry: forgeRegistry,
+                repoRoot: repoRoot,
+                repoHost: repoHost,
+                send: send,
+                unavailableAction: "mark a pull request as ready"
               )
-              return
-            }
-            let remote = await resolveRemoteInfo(
-              repositoryRootURL: repoRoot,
-              githubCLI: githubCLI,
-              gitClient: gitClient
-            )
+            else { return }
+            let project = await forge.resolveProject(repoRoot)
             await send(.showToast(.inProgress("Marking PR ready…")))
             do {
-              try await githubCLI.markPullRequestReady(worktreeRoot, remote, pullRequest.number)
+              try await forge.markPullRequestReady(worktreeRoot, project, pullRequest.number)
               await send(.showToast(.success("Pull request marked ready")))
               await send(.delayedPullRequestRefresh(worktreeID))
             } catch {
@@ -2706,31 +2907,34 @@ struct RepositoriesFeature {
           }
 
         case .merge:
-          let githubCLI = githubCLI
-          let gitClient = gitClient
-          let githubIntegration = githubIntegration
+          let forgeRegistry = forgeRegistry
           return .run { send in
-            guard await githubIntegration.isAvailable() else {
-              await send(
-                .presentAlert(
-                  title: "GitHub integration unavailable",
-                  message: "Enable GitHub integration to merge a pull request."
-                )
+            guard
+              let (forge, capabilities) = await ForgeDispatch.resolve(
+                registry: forgeRegistry,
+                repoRoot: repoRoot,
+                repoHost: repoHost,
+                send: send,
+                unavailableAction: "merge a pull request"
               )
-              return
-            }
+            else { return }
             @Shared(.repositorySettings(repoRoot, host: repoHost)) var repositorySettings
             @Shared(.settingsFile) var settingsFile
-            let strategy =
+            let preferredStrategy =
               repositorySettings.pullRequestMergeStrategy ?? settingsFile.global.pullRequestMergeStrategy
-            let remote = await resolveRemoteInfo(
-              repositoryRootURL: repoRoot,
-              githubCLI: githubCLI,
-              gitClient: gitClient
-            )
+            // A strategy the forge cannot express per-merge (GitLab's method is
+            // a project setting) falls back to the project default.
+            let strategy =
+              capabilities.mergeStrategies.contains(preferredStrategy) ? preferredStrategy : .merge
+            if strategy != preferredStrategy {
+              repositoriesLogger.info(
+                "Merge strategy \(preferredStrategy.rawValue) unsupported on this forge; using the project default"
+              )
+            }
+            let project = await forge.resolveProject(repoRoot)
             await send(.showToast(.inProgress("Merging pull request…")))
             do {
-              try await githubCLI.mergePullRequest(worktreeRoot, remote, pullRequest.number, strategy)
+              try await forge.mergePullRequest(worktreeRoot, project, pullRequest.number, strategy)
               await send(.showToast(.success("Pull request merged")))
               await send(.worktreeInfoEvent(pullRequestRefresh))
               await send(.delayedPullRequestRefresh(worktreeID))
@@ -2746,27 +2950,21 @@ struct RepositoriesFeature {
           }
 
         case .close:
-          let githubCLI = githubCLI
-          let gitClient = gitClient
-          let githubIntegration = githubIntegration
+          let forgeRegistry = forgeRegistry
           return .run { send in
-            guard await githubIntegration.isAvailable() else {
-              await send(
-                .presentAlert(
-                  title: "GitHub integration unavailable",
-                  message: "Enable GitHub integration to close a pull request."
-                )
+            guard
+              let (forge, _) = await ForgeDispatch.resolve(
+                registry: forgeRegistry,
+                repoRoot: repoRoot,
+                repoHost: repoHost,
+                send: send,
+                unavailableAction: "close a pull request"
               )
-              return
-            }
-            let remote = await resolveRemoteInfo(
-              repositoryRootURL: repoRoot,
-              githubCLI: githubCLI,
-              gitClient: gitClient
-            )
+            else { return }
+            let project = await forge.resolveProject(repoRoot)
             await send(.showToast(.inProgress("Closing pull request…")))
             do {
-              try await githubCLI.closePullRequest(worktreeRoot, remote, pullRequest.number)
+              try await forge.closePullRequest(worktreeRoot, project, pullRequest.number)
               await send(.showToast(.success("Pull request closed")))
               await send(.worktreeInfoEvent(pullRequestRefresh))
               await send(.delayedPullRequestRefresh(worktreeID))
@@ -2782,53 +2980,34 @@ struct RepositoriesFeature {
           }
 
         case .copyCiFailureLogs:
-          let githubCLI = githubCLI
-          let githubIntegration = githubIntegration
+          let forgeRegistry = forgeRegistry
           return .run { send in
-            guard await githubIntegration.isAvailable() else {
-              await send(
-                .presentAlert(
-                  title: "GitHub integration unavailable",
-                  message: "Enable GitHub integration to copy CI failure logs."
-                )
+            guard
+              let (forge, _) = await ForgeDispatch.resolve(
+                registry: forgeRegistry,
+                repoRoot: repoRoot,
+                repoHost: repoHost,
+                send: send,
+                unavailableAction: "copy CI failure logs"
               )
-              return
-            }
-            guard !branchName.isEmpty else {
-              await send(
-                .presentAlert(
-                  title: "Branch name unavailable",
-                  message: "Supacode could not determine the pull request branch."
-                )
-              )
-              return
-            }
-            await send(.showToast(.inProgress("Fetching CI logs…")))
+            else { return }
             do {
-              guard let run = try await githubCLI.latestRun(worktreeRoot, branchName) else {
-                await send(.dismissToast)
-                await send(
-                  .presentAlert(
-                    title: "No workflow runs found",
-                    message: "Supacode could not find any workflow runs for this branch."
-                  )
+              guard
+                let run = try await ForgeDispatch.resolveFailingRun(
+                  forge: forge,
+                  worktreeRoot: worktreeRoot,
+                  branchName: branchName,
+                  copy: ForgeDispatch.FailingRunCopy(
+                    inProgressToast: "Fetching CI logs…",
+                    noFailingRunMessage: "Supacode could not find a failing workflow run to copy logs from."
+                  ),
+                  send: send
                 )
-                return
-              }
-              guard run.conclusion?.lowercased() == "failure" else {
-                await send(.dismissToast)
-                await send(
-                  .presentAlert(
-                    title: "No failing workflow run",
-                    message: "Supacode could not find a failing workflow run to copy logs from."
-                  )
-                )
-                return
-              }
-              let failedLogs = try await githubCLI.failedRunLogs(worktreeRoot, run.databaseId)
+              else { return }
+              let failedLogs = try await forge.failedRunLogs(worktreeRoot, run.databaseId)
               let logs =
                 if failedLogs.isEmpty {
-                  try await githubCLI.runLogs(worktreeRoot, run.databaseId)
+                  try await forge.runLogs(worktreeRoot, run.databaseId)
                 } else {
                   failedLogs
                 }
@@ -2859,50 +3038,31 @@ struct RepositoriesFeature {
           }
 
         case .rerunFailedJobs:
-          let githubCLI = githubCLI
-          let githubIntegration = githubIntegration
+          let forgeRegistry = forgeRegistry
           return .run { send in
-            guard await githubIntegration.isAvailable() else {
-              await send(
-                .presentAlert(
-                  title: "GitHub integration unavailable",
-                  message: "Enable GitHub integration to re-run failed jobs."
-                )
+            guard
+              let (forge, _) = await ForgeDispatch.resolve(
+                registry: forgeRegistry,
+                repoRoot: repoRoot,
+                repoHost: repoHost,
+                send: send,
+                unavailableAction: "re-run failed jobs"
               )
-              return
-            }
-            guard !branchName.isEmpty else {
-              await send(
-                .presentAlert(
-                  title: "Branch name unavailable",
-                  message: "Supacode could not determine the pull request branch."
-                )
-              )
-              return
-            }
-            await send(.showToast(.inProgress("Re-running failed jobs…")))
+            else { return }
             do {
-              guard let run = try await githubCLI.latestRun(worktreeRoot, branchName) else {
-                await send(.dismissToast)
-                await send(
-                  .presentAlert(
-                    title: "No workflow runs found",
-                    message: "Supacode could not find any workflow runs for this branch."
-                  )
+              guard
+                let run = try await ForgeDispatch.resolveFailingRun(
+                  forge: forge,
+                  worktreeRoot: worktreeRoot,
+                  branchName: branchName,
+                  copy: ForgeDispatch.FailingRunCopy(
+                    inProgressToast: "Re-running failed jobs…",
+                    noFailingRunMessage: "Supacode could not find a failing workflow run to re-run."
+                  ),
+                  send: send
                 )
-                return
-              }
-              guard run.conclusion?.lowercased() == "failure" else {
-                await send(.dismissToast)
-                await send(
-                  .presentAlert(
-                    title: "No failing workflow run",
-                    message: "Supacode could not find a failing workflow run to re-run."
-                  )
-                )
-                return
-              }
-              try await githubCLI.rerunFailedJobs(worktreeRoot, run.databaseId)
+              else { return }
+              try await forge.rerunFailedJobs(worktreeRoot, run.databaseId)
               await send(.showToast(.success("Failed jobs re-run started")))
               await send(.delayedPullRequestRefresh(worktreeID))
             } catch {
@@ -2924,9 +3084,15 @@ struct RepositoriesFeature {
           state.queuedPullRequestRefreshByRepositoryID.removeAll()
           state.inFlightPullRequestRefreshRepositoryIDs.removeAll()
           state.inFlightPullRequestBranchSnapshotsByRepositoryID.removeAll()
+          let githubIntegration = githubIntegration
           return .merge(
             .cancel(id: CancelID.githubIntegrationRecovery),
-            .send(.refreshGithubIntegrationAvailability)
+            // The cached probe must drop before the availability re-check reads
+            // it, or a just-enabled forge stays unavailable for a full TTL.
+            .concatenate(
+              .run { _ in await githubIntegration.invalidate() },
+              .send(.refreshGithubIntegrationAvailability)
+            )
           )
         }
         state.githubIntegrationAvailability = .disabled
@@ -2934,6 +3100,7 @@ struct RepositoriesFeature {
         state.queuedPullRequestRefreshByRepositoryID.removeAll()
         state.inFlightPullRequestRefreshRepositoryIDs.removeAll()
         state.inFlightPullRequestBranchSnapshotsByRepositoryID.removeAll()
+        let openFetchCancels = Self.cancelPullRequestOpenFetches(&state)
         let worktreeIDs = state.sidebarItems.compactMap { $0.pullRequest != nil ? $0.id : nil }
         var clearEffects: [Effect<Action>] = []
         for worktreeID in worktreeIDs {
@@ -2945,7 +3112,7 @@ struct RepositoriesFeature {
           )
         }
         return .merge(
-          clearEffects + [
+          clearEffects + openFetchCancels + [
             .cancel(id: CancelID.githubIntegrationAvailability),
             .cancel(id: CancelID.githubIntegrationRecovery),
           ]
@@ -3171,7 +3338,7 @@ struct RepositoriesFeature {
         switch toast {
         case .inProgress:
           return .cancel(id: CancelID.toastAutoDismiss)
-        case .success:
+        case .success, .info:
           let clock = clock
           return .run { send in
             try await clock.sleep(for: toastAutoDismissDelay)
@@ -3284,6 +3451,25 @@ struct RepositoriesFeature {
           guard !branches.isEmpty else {
             return .none
           }
+          // A per-repo forge override of "none" disables forge integration for
+          // this repository; clear any lingering rows instead of refreshing.
+          let repositoryForgeSettings = RepositorySettingsKey(
+            rootURL: repositoryRootURL,
+            host: state.repositories[id: repositoryID]?.host
+          ).currentSettings()
+          if repositoryForgeSettings.forgeID == ForgeResolver.noneSettingsID {
+            state.resolvedForgeByRepositoryID.removeValue(forKey: repositoryID)
+            var clearedPullRequests: [Worktree.ID: ForgePullRequest?] = [:]
+            for worktree in worktrees {
+              clearedPullRequests[worktree.id] = ForgePullRequest?.none
+            }
+            return .send(
+              .repositoryPullRequestsLoaded(
+                repositoryID: repositoryID,
+                pullRequestsByWorktreeID: clearedPullRequests
+              )
+            )
+          }
           switch state.githubIntegrationAvailability {
           case .available:
             if state.inFlightPullRequestRefreshRepositoryIDs.contains(repositoryID) {
@@ -3318,6 +3504,7 @@ struct RepositoriesFeature {
               refreshRepositoryPullRequests(
                 repositoryID: repositoryID,
                 repositoryRootURL: repositoryRootURL,
+                repositoryHost: state.repositories[id: repositoryID]?.host,
                 worktrees: worktrees,
                 branches: branches
               )
@@ -3381,6 +3568,11 @@ struct RepositoriesFeature {
         // lands in `slotByID` / `hotkeySlots`.
         return .none
 
+      case .sidebarSectionSortChanged:
+        // No-op handler: the post-reduce hook reads `sidebarSectionSort`
+        // and rebuilds `sidebarStructure` in the selected display order.
+        return .none
+
       case .setOpenPanelPresented(let isPresented):
         state.isOpenPanelPresented = isPresented
         return .none
@@ -3396,6 +3588,7 @@ struct RepositoriesFeature {
         return .none
 
       case .removeRemoteRepository(let repositoryID):
+        state.resolvedForgeByRepositoryID.removeValue(forKey: repositoryID)
         @Shared(.remoteRepositoryRoots) var remoteRepositoryRoots
         $remoteRepositoryRoots.withLock { roots in
           roots.removeAll { $0 == repositoryID.rawValue }
@@ -3987,7 +4180,10 @@ struct RepositoriesFeature {
         state.worktreeCreationPrompt = WorktreeCreationPromptFeature.State(
           repositoryID: repository.id,
           repositoryRootURL: repository.rootURL,
-          repositoryName: repository.name,
+          repositoryName: Repository.sidebarDisplayName(
+            custom: state.sidebar.customTitle(for: repository),
+            fallback: repository.name
+          ),
           automaticBaseRef: automaticBaseRef,
           defaultBranch: defaultBranch,
           remoteNames: remoteNames,
@@ -4381,7 +4577,9 @@ struct RepositoriesFeature {
 
       case .refreshGithubIntegrationAvailability, .githubIntegrationAvailabilityUpdated,
         .repositoryPullRequestRefreshCompleted, .worktreeBranchNameLoaded, .worktreeLineChangesLoaded,
-        .repositoryPullRequestsLoaded, .pullRequestAction, .setGithubIntegrationEnabled, .setMergedWorktreeAction,
+        .repositoryPullRequestsLoaded, .repositoryForgeResolved, .worktreePullRequestDetailLoaded,
+        .forgeIntegrationDisabled, .pullRequestAction, .setGithubIntegrationEnabled, .setMergedWorktreeAction,
+        .openSelectedWorktreePullRequest, .pullRequestOpenFetchLoaded, .pullRequestOpenFetchFailed,
         .setAutoDeleteArchivedWorktreesAfterDays, .autoDeleteExpiredArchivedWorktrees, .setMoveNotifiedWorktreeToTop,
         .setInstalledOpenActions, .openActionSettingsChanged, .resolveOpenActions, .openActionsResolved:
         // Real handling lives in `githubIntegrationReducer` (combined below) to keep `body`
@@ -4604,33 +4802,91 @@ struct RepositoriesFeature {
     }
   }
 
+  /// Cancels in-flight open-fetches so a late result can't re-cache or open after teardown.
+  private static func cancelPullRequestOpenFetches(_ state: inout State) -> [Effect<Action>] {
+    let cancels = state.inFlightPullRequestOpenFetchWorktreeIDs.map {
+      Effect<Action>.cancel(id: CancelID.pullRequestOpenFetch($0))
+    }
+    state.inFlightPullRequestOpenFetchWorktreeIDs.removeAll()
+    return cancels
+  }
+
+  private func openURLEffect(_ url: URL) -> Effect<Action> {
+    let urlOpener = urlOpener
+    return .run { _ in urlOpener.open(url) }
+  }
+
+  /// Detail tier: enrich only the selected worktree's open proposal, riding
+  /// the summary refresh that already carries the selection cooldown. `.none`
+  /// when the selection, state, or forge does not qualify.
+  private func pullRequestDetailEffect(
+    state: State,
+    repository: Repository,
+    dispatchIDs: Set<Worktree.ID>,
+    pullRequestsByWorktreeID: [Worktree.ID: ForgePullRequest?]
+  ) -> Effect<Action> {
+    guard
+      let selectedWorktreeID = state.selectedWorktreeID,
+      dispatchIDs.contains(selectedWorktreeID),
+      let selectedPullRequest = pullRequestsByWorktreeID[selectedWorktreeID] ?? nil,
+      selectedPullRequest.state == .open
+    else { return .none }
+    let forgeRegistry = forgeRegistry
+    let repositoryRootURL = repository.rootURL
+    let repositoryHost = repository.host
+    let number = selectedPullRequest.number
+    return .run { send in
+      guard
+        let forgeID = await forgeRegistry.resolveForgeID(repositoryRootURL, repositoryHost),
+        let capabilities = forgeRegistry.capabilities(forgeID),
+        capabilities.providesDetailTier,
+        let forge = forgeRegistry.client(forgeID),
+        let project = await forge.resolveProject(repositoryRootURL)
+      else { return }
+      do {
+        guard let detail = try await forge.fetchDetail(project, number) else { return }
+        await send(
+          .worktreePullRequestDetailLoaded(
+            selectedWorktreeID,
+            pullRequestNumber: number,
+            detail
+          )
+        )
+      } catch {
+        // Enrichment-only, so the UI degrades silently; the log is the one
+        // forensic trail for a systematically failing detail fetch.
+        repositoriesLogger.error("Detail fetch failed for \(project.path)!\(number): \(error)")
+      }
+    }
+    .cancellable(id: CancelID.pullRequestDetail, cancelInFlight: true)
+  }
+
   private func refreshRepositoryPullRequests(
     repositoryID: Repository.ID,
     repositoryRootURL: URL,
+    repositoryHost: RemoteHost?,
     worktrees: [Worktree],
     branches: [String]
   ) -> Effect<Action> {
-    let gitClient = gitClient
-    let githubCLI = githubCLI
+    let forgeRegistry = forgeRegistry
     return .run { send in
       guard
-        let remoteInfo = await resolveRemoteInfo(
-          repositoryRootURL: repositoryRootURL,
-          githubCLI: githubCLI,
-          gitClient: gitClient
-        )
+        let forgeID = await forgeRegistry.resolveForgeID(repositoryRootURL, repositoryHost),
+        let forge = forgeRegistry.client(forgeID)
       else {
+        repositoriesLogger.debug("No forge resolved for \(repositoryID); skipping refresh")
+        await send(.repositoryPullRequestRefreshCompleted(repositoryID))
+        return
+      }
+      await send(.repositoryForgeResolved(repositoryID, forgeID))
+      guard let project = await forge.resolveProject(repositoryRootURL) else {
+        repositoriesLogger.debug("No project resolved for \(repositoryID); skipping refresh")
         await send(.repositoryPullRequestRefreshCompleted(repositoryID))
         return
       }
       do {
-        let prsByBranch = try await githubCLI.batchPullRequests(
-          remoteInfo.host,
-          remoteInfo.owner,
-          remoteInfo.repo,
-          branches
-        )
-        var pullRequestsByWorktreeID: [Worktree.ID: GithubPullRequest?] = [:]
+        let prsByBranch = try await forge.fetchSummaries(project, branches)
+        var pullRequestsByWorktreeID: [Worktree.ID: ForgePullRequest?] = [:]
         for worktree in worktrees {
           pullRequestsByWorktreeID[worktree.id] = prsByBranch[worktree.name]
         }
@@ -4641,11 +4897,14 @@ struct RepositoriesFeature {
           )
         )
       } catch {
+        // Rows stay unchanged by design; the log is the only forensic trail.
+        repositoriesLogger.error("Pull request refresh failed for \(repositoryID): \(error)")
         await send(.repositoryPullRequestRefreshCompleted(repositoryID))
         return
       }
       await send(.repositoryPullRequestRefreshCompleted(repositoryID))
     }
+    .cancellable(id: CancelID.pullRequestRefresh(repositoryID), cancelInFlight: true)
   }
 
   private func loadRepositories(_ roots: [URL], animated: Bool = false) -> Effect<Action> {
@@ -5308,7 +5567,7 @@ struct RepositoriesFeature {
   ) -> AlertState<Alert> {
     let worktreeName = state.worktree(for: worktreeID)?.name
     let repoName = state.repositoryID(containing: worktreeID)
-      .flatMap { state.repositories[id: $0]?.name }
+      .flatMap { state.repositoryName(for: $0) }
     let parts = [repoName, worktreeName].compactMap(\.self)
     if parts.isEmpty {
       repositoriesLogger.debug("blockingScriptFailureAlert: worktree \(worktreeID) not found in state")
@@ -5608,8 +5867,12 @@ extension RepositoriesFeature.State {
     return sidebarItems[id: id]
   }
 
+  /// Display name for a repository: the customized sidebar title when one is
+  /// set, else the directory name. `nil` when the repo isn't in the roster.
   func repositoryName(for id: Repository.ID) -> String? {
-    repositories[id: id]?.name
+    repositories[id: id].map {
+      Repository.sidebarDisplayName(custom: sidebar.customTitle(for: $0), fallback: $0.name)
+    }
   }
 
   func orderedRepositoryRoots() -> [URL] {
@@ -5721,8 +5984,12 @@ extension RepositoriesFeature.State {
     worktree.isMainWorktree
   }
 
+  func forgeCapabilities(for repositoryID: Repository.ID) -> ForgeCapabilities {
+    resolvedForgeByRepositoryID[repositoryID].flatMap(ForgeCapabilities.forID) ?? .github
+  }
+
   func isWorktreeMerged(_ worktree: Worktree) -> Bool {
-    sidebarItems[id: worktree.id]?.pullRequest?.state == "MERGED"
+    sidebarItems[id: worktree.id]?.pullRequest?.state == .merged
   }
 
   func orderedPinnedWorktreeIDs(in repository: Repository) -> [Worktree.ID] {
@@ -5969,13 +6236,9 @@ extension RepositoriesFeature.State {
   /// has composed an order the reducer can't derive on its own (e.g. highlight
   /// sections hoisted above per-repo rows).
   func hotkeyWorktreeSlots(for ids: [Worktree.ID]) -> [HotkeyWorktreeSlot] {
-    let nameByRepoID = Dictionary(uniqueKeysWithValues: repositories.map { ($0.id, $0.name) })
     return ids.compactMap { id in
       guard let item = sidebarItems[id: id] else { return nil }
-      let repositoryName = Repository.sidebarDisplayName(
-        custom: sidebar.sections[item.repositoryID]?.title,
-        fallback: nameByRepoID[item.repositoryID] ?? ""
-      )
+      let repositoryName = repositoryName(for: item.repositoryID) ?? ""
       return HotkeyWorktreeSlot(
         id: item.id,
         name: SidebarDisplayName.resolved(custom: item.customTitle, fallback: item.name) ?? item.name,
@@ -6224,7 +6487,7 @@ extension RepositoriesFeature.State {
   /// The row's own equality guard short-circuits the PR-value mutation.
   func updateWorktreePullRequestEffect(
     worktreeID: Worktree.ID,
-    pullRequest: GithubPullRequest?,
+    pullRequest: ForgePullRequest?,
     branchAtQueryTime: String? = nil,
   ) -> Effect<RepositoriesFeature.Action> {
     guard let row = sidebarItems[id: worktreeID] else { return .none }

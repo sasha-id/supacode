@@ -346,10 +346,7 @@ final class PaneWindowManager {
     guard let row = repositories.sidebarItems[id: worktreeID] else { return "" }
     let worktreeName = SidebarDisplayName.resolved(custom: row.customTitle, fallback: row.name) ?? row.name
     guard let repositoryID = repositories.repositoryID(containing: worktreeID) else { return worktreeName }
-    let repositoryName = Repository.sidebarDisplayName(
-      custom: repositories.sidebar.sections[repositoryID]?.title,
-      fallback: repositories.repositoryName(for: repositoryID) ?? "Repository"
-    )
+    let repositoryName = repositories.repositoryName(for: repositoryID) ?? "Repository"
     return "\(repositoryName) / \(worktreeName)"
   }
 
@@ -652,13 +649,6 @@ private struct WindowedPaneRootView: View {
           token: pane.selectedTab?.content.id
         ) {
           performOnSelectedSurface(of: pane) { $0.navigateSearch(.previous) }
-        }
-        .focusedSceneAction(
-          \.endSearchAction,
-          enabled: pane.selectedTab != nil,
-          token: pane.selectedTab?.content.id
-        ) {
-          performOnSelectedSurface(of: pane) { $0.performBindingAction("end_search") }
         }
       } else {
         // The reconcile closes this window on the same layout change.

@@ -13,13 +13,17 @@ struct AppFeatureSettingsChangedTests {
   @Test(.dependencies) func settingsChangedPropagatesRepositorySettings() async {
     var settings = GlobalSettings.default
     settings.githubIntegrationEnabled = false
+    // The availability gate follows the union of enabled forges.
+    settings.setForgeIntegrationEnabled(false, forID: "gitlab")
     settings.mergedWorktreeAction = .archive
     settings.moveNotifiedWorktreeToTop = true
     let store = TestStore(initialState: AppFeature.State()) {
       AppFeature()
     }
 
-    await store.send(.settings(.delegate(.settingsChanged(settings))))
+    await store.send(.settings(.delegate(.settingsChanged(settings)))) {
+      $0.lastKnownEnabledForgeIDs = []
+    }
     await store.receive(\.repositories.setGithubIntegrationEnabled) {
       $0.repositories.githubIntegrationAvailability = .disabled
     }
@@ -315,5 +319,93 @@ struct AppFeatureSettingsChangedTests {
     // another split of the same worktree keeps its warning.
     #expect(!store.state.agentPresence.hasError(in: [focused]))
     #expect(store.state.agentPresence.hasError(in: [background]))
+  }
+
+  @Test(.dependencies) func settingsChangedRegistersNewGlobalHotkey() async {
+    var settings = GlobalSettings.default
+    let chord = AppShortcutOverride(keyCode: 49, modifiers: [.command, .shift])
+    settings.globalToggleVisibilityHotkey = chord
+    let received = LockIsolated<[AppShortcutOverride?]>([])
+    let store = TestStore(initialState: AppFeature.State()) {
+      AppFeature()
+    } withDependencies: {
+      $0.appLifecycleClient.updateGlobalHotkey = { override in
+        received.withValue { $0.append(override) }
+        return true
+      }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.settings(.delegate(.settingsChanged(settings))))
+    await store.receive(\.settings.setGlobalHotkeyRegistrationFailed) {
+      $0.settings.globalHotkeyRegistrationFailed = false
+    }
+    #expect(store.state.lastKnownGlobalHotkey == chord)
+    #expect(received.value == [chord])
+    await store.skipReceivedActions()
+  }
+
+  @Test(.dependencies) func settingsChangedUnregistersClearedGlobalHotkey() async {
+    let chord = AppShortcutOverride(keyCode: 49, modifiers: [.command, .shift])
+    var initial = GlobalSettings.default
+    initial.globalToggleVisibilityHotkey = chord
+    var state = AppFeature.State(settings: SettingsFeature.State(settings: initial))
+    state.lastKnownGlobalHotkey = chord
+    let received = LockIsolated<[AppShortcutOverride?]>([])
+    let store = TestStore(initialState: state) {
+      AppFeature()
+    } withDependencies: {
+      // A cleared chord unregisters and never flags a failure, even if the monitor returns false.
+      $0.appLifecycleClient.updateGlobalHotkey = { override in
+        received.withValue { $0.append(override) }
+        return false
+      }
+    }
+    store.exhaustivity = .off
+
+    var cleared = initial
+    cleared.globalToggleVisibilityHotkey = nil
+    await store.send(.settings(.delegate(.settingsChanged(cleared))))
+    await store.receive(\.settings.setGlobalHotkeyRegistrationFailed) {
+      $0.settings.globalHotkeyRegistrationFailed = false
+    }
+    #expect(received.value == [nil])
+    await store.skipReceivedActions()
+  }
+
+  @Test(.dependencies) func settingsChangedRoutesGlobalHotkeyRegistrationFailure() async {
+    var settings = GlobalSettings.default
+    settings.globalToggleVisibilityHotkey = AppShortcutOverride(keyCode: 49, modifiers: [.command, .shift])
+    let store = TestStore(initialState: AppFeature.State()) {
+      AppFeature()
+    } withDependencies: {
+      $0.appLifecycleClient.updateGlobalHotkey = { _ in false }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.settings(.delegate(.settingsChanged(settings))))
+    await store.receive(\.settings.setGlobalHotkeyRegistrationFailed) {
+      $0.settings.globalHotkeyRegistrationFailed = true
+    }
+    await store.skipReceivedActions()
+  }
+
+  @Test(.dependencies) func settingsChangedIgnoresUnchangedGlobalHotkey() async {
+    let chord = AppShortcutOverride(keyCode: 49, modifiers: [.command, .shift])
+    var settings = GlobalSettings.default
+    settings.globalToggleVisibilityHotkey = chord
+    var state = AppFeature.State(settings: SettingsFeature.State(settings: settings))
+    state.lastKnownGlobalHotkey = chord
+    let store = TestStore(initialState: state) {
+      AppFeature()
+    } withDependencies: {
+      // Unchanged chord must not touch the monitor; the unimplemented stub traps if it does.
+      $0.appLifecycleClient.updateGlobalHotkey = unimplemented(
+        "updateGlobalHotkey", placeholder: true)
+    }
+    store.exhaustivity = .off
+
+    await store.send(.settings(.delegate(.settingsChanged(settings))))
+    await store.skipReceivedActions()
   }
 }

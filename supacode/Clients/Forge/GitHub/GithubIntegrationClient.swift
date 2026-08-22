@@ -3,6 +3,8 @@ import SupacodeSettingsShared
 
 struct GithubIntegrationClient: Sendable {
   var isAvailable: @MainActor @Sendable () async -> Bool
+  /// Drops the cached probe so an enablement change re-checks immediately.
+  var invalidate: @Sendable () async -> Void
 }
 
 private actor GithubIntegrationAvailabilityCache {
@@ -55,10 +57,14 @@ extension GithubIntegrationClient: DependencyKey {
   static let liveValue = GithubIntegrationClient(
     isAvailable: {
       await githubIntegrationIsAvailable()
+    },
+    invalidate: {
+      await githubIntegrationAvailabilityCache.clear()
     }
   )
   static let testValue = GithubIntegrationClient(
-    isAvailable: { true }
+    isAvailable: { true },
+    invalidate: {}
   )
 }
 
@@ -69,15 +75,25 @@ extension DependencyValues {
   }
 }
 
+// Gates the shared refresh machinery for every forge: true when any enabled
+// forge's CLI is present.
 @MainActor
 private func githubIntegrationIsAvailable() async -> Bool {
   @Shared(.settingsFile) var settingsFile
   @Dependency(GithubCLIClient.self) var githubCLI
-  guard settingsFile.global.githubIntegrationEnabled else {
+  @Dependency(GitLabCLIClient.self) var gitlabCLI
+  let enabled = Set(ForgeRegistry.enabledForgeIDs(in: settingsFile.global))
+  guard !enabled.isEmpty else {
     await githubIntegrationAvailabilityCache.clear()
     return false
   }
   return await githubIntegrationAvailabilityCache.value {
-    await githubCLI.isAvailable()
+    if enabled.contains(.github), await githubCLI.isAvailable() {
+      return true
+    }
+    if enabled.contains(.gitlab), await gitlabCLI.isAvailable() {
+      return true
+    }
+    return false
   }
 }

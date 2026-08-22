@@ -9,28 +9,29 @@ enum PullRequestBadgeStyle {
   static let openColor = Color.pullRequestOpen
   static let queuedColor = Color.pullRequestQueued
 
-  static func style(state: String?, number: Int?, isQueued: Bool = false) -> (text: String, color: Color)? {
-    guard let state = state?.uppercased() else {
-      return nil
-    }
+  static func style(
+    state: PullRequestState?,
+    number: Int?,
+    isQueued: Bool = false,
+    numberSigil: String = "#"
+  ) -> (text: String, color: Color)? {
     switch state {
-    case "MERGED":
-      return (text: number.map { "#\($0)" } ?? "MERGED", color: mergedColor)
-    case "OPEN":
-      return (text: number.map { "#\($0)" } ?? "OPEN", color: isQueued ? queuedColor : openColor)
-    default:
+    case .merged:
+      return (text: number.map { "\(numberSigil)\($0)" } ?? "MERGED", color: mergedColor)
+    case .open:
+      return (text: number.map { "\(numberSigil)\($0)" } ?? "OPEN", color: isQueued ? queuedColor : openColor)
+    case .closed, .unknown, .none:
       return nil
     }
   }
 
-  static func helpText(state: String?, url: URL?) -> String {
-    let state = state?.uppercased()
+  static func helpText(state: PullRequestState?, url: URL?) -> String {
     switch state {
-    case "MERGED":
+    case .merged:
       return url == nil ? "Pull request merged" : "Open merged pull request on GitHub"
-    case "OPEN":
+    case .open:
       return url == nil ? "Pull request open" : "Open pull request on GitHub"
-    default:
+    case .closed, .unknown, .none:
       return url == nil ? "Pull request" : "Open pull request on GitHub"
     }
   }

@@ -160,7 +160,11 @@ struct AppFeature {
     var lastKnownSystemNotificationsEnabled: Bool
     var lastKnownAgentPresenceBadgesEnabled: Bool
     var lastKnownAppVisibility: AppVisibility
+    /// Enabled forge ids at the last settings pass, so a forge flipping off
+    /// can tear down its rows. Nil until the first settings change lands.
+    var lastKnownEnabledForgeIDs: Set<ForgeID>?
     var lastKnownTerminalHibernationEnabled: Bool
+    var lastKnownGlobalHotkey: AppShortcutOverride?
     var pendingDeeplinks: [Deeplink] = []
     var isDeeplinkReferenceRequested = false
     /// Cached projection of every primitive the menu-bar `WorktreeCommands`
@@ -201,6 +205,7 @@ struct AppFeature {
       lastKnownAgentPresenceBadgesEnabled = settings.agentPresenceBadgesEnabled
       lastKnownAppVisibility = settings.appVisibility
       lastKnownTerminalHibernationEnabled = settings.terminalHibernationEnabled
+      lastKnownGlobalHotkey = settings.globalToggleVisibilityHotkey
       // Seed from settings so `state.allScripts` doesn't start empty before the
       // first `settingsChanged` delegate fires. Globals aren't worktree-scoped,
       // so deselection (line below in `selectedWorktreeChanged(nil)`)
@@ -334,7 +339,6 @@ struct AppFeature {
     case searchSelection
     case navigateSearchNext
     case navigateSearchPrevious
-    case endSearch
     case systemNotificationsPermissionFailed(errorMessage: String?)
     case deeplinkReceived(URL, source: ActionSource = .urlScheme, responseFD: Int32? = nil)
     case deeplink(
@@ -388,10 +392,18 @@ struct AppFeature {
         return .none
 
       case .appLaunched:
+        // A chord restored from disk fires no settingsChanged delta, so register it once here.
+        let startupHotkey = state.settings.globalToggleVisibilityHotkey
         return .merge(
           refreshInstalledOpenActionsEffect(current: state.installedOpenActions),
           .send(.repositories(.task)),
           .send(.settings(.task)),
+          .run { @MainActor send in
+            guard startupHotkey != nil else { return }
+            if !appLifecycleClient.updateGlobalHotkey(startupHotkey) {
+              await send(.settings(.setGlobalHotkeyRegistrationFailed(true)))
+            }
+          },
           .run { _ in
             await MainActor.run {
               NSApplication.shared.dockTile.badgeLabel = nil
@@ -610,15 +622,10 @@ struct AppFeature {
           .send(
             .settings(
               .repositoriesChanged(
-                repositories.map {
-                  SettingsRepositorySummary(
-                    id: $0.id.rawValue,
-                    name: $0.name,
-                    isGitRepository: $0.isGitRepository,
-                    host: $0.host,
-                    rootURL: $0.rootURL
-                  )
-                }
+                Self.settingsRepositorySummaries(
+                  repositories: repositories,
+                  sidebar: state.repositories.sidebar
+                )
               )
             )
           ),
@@ -666,6 +673,47 @@ struct AppFeature {
           }
         }
         return .merge(effects)
+
+      // A "Customize Appearance" save writes the shared sidebar state without
+      // firing `repositoriesChanged`, so re-send the settings summaries here.
+      // `core` runs before the child reducer applies the save, hence the
+      // explicit title override.
+      case .repositories(
+        .repositoryCustomization(.presented(.delegate(.save(let repositoryID, let title, _))))
+      ):
+        return .send(
+          .settings(
+            .repositoriesChanged(
+              Self.settingsRepositorySummaries(
+                repositories: state.repositories.repositories,
+                sidebar: state.repositories.sidebar,
+                titleOverride: (repositoryID, title)
+              )
+            )
+          )
+        )
+
+      // Folder (non-git) repos are renamed through the worktree-appearance
+      // path: their title lives on the synthetic folder-worktree item. Same
+      // re-send as above, gated to folders so git worktree renames (never
+      // shown in settings) stay cheap.
+      case .repositories(
+        .worktreeCustomization(.presented(.delegate(.save(_, let repositoryID, let title, _))))
+      ),
+        .repositories(.setWorktreeAppearance(_, let repositoryID, let title, _)):
+        guard state.repositories.repositories[id: repositoryID]?.isGitRepository == false
+        else { return .none }
+        return .send(
+          .settings(
+            .repositoriesChanged(
+              Self.settingsRepositorySummaries(
+                repositories: state.repositories.repositories,
+                sidebar: state.repositories.sidebar,
+                titleOverride: (repositoryID, title)
+              )
+            )
+          )
+        )
 
       case .repositories(.delegate(.openWorktreeInApp(let worktreeID, let action))):
         guard let worktree = state.repositories.worktree(for: worktreeID) else {
@@ -720,11 +768,28 @@ struct AppFeature {
         let dockIconReappeared =
           state.lastKnownAppVisibility.hidesDockIcon && !settings.appVisibility.hidesDockIcon
         state.lastKnownAppVisibility = settings.appVisibility
+        let newGlobalHotkey = settings.globalToggleVisibilityHotkey
+        let globalHotkeyChanged = newGlobalHotkey != state.lastKnownGlobalHotkey
+        state.lastKnownGlobalHotkey = newGlobalHotkey
         // Compare IDs as a set: name/command edits and pure reorders should not re-prune recency.
         let globalScriptIDsChanged = Set(state.globalScripts.map(\.id)) != Set(settings.globalScripts.map(\.id))
         state.globalScripts = settings.globalScripts
+        // The shared availability machine and the watcher gate every forge's
+        // refreshes, so they follow the union of enabled forges; a forge that
+        // flips off gets its rows torn down individually.
+        let enabledForgeIDs = Set(ForgeRegistry.enabledForgeIDs(in: settings))
+        let anyForgeIntegrationEnabled = !enabledForgeIDs.isEmpty
+        let disabledForgeIDs = state.lastKnownEnabledForgeIDs?.subtracting(enabledForgeIDs) ?? []
+        state.lastKnownEnabledForgeIDs = enabledForgeIDs
+        // Registry order keeps multi-forge teardown dispatch deterministic.
+        var forgeTeardownEffects: [Effect<Action>] = []
+        for forgeID in ForgeRegistry.registeredForgeIDs {
+          guard disabledForgeIDs.contains(forgeID) else { continue }
+          forgeTeardownEffects.append(.send(.repositories(.forgeIntegrationDisabled(forgeID))))
+        }
         var effects: [Effect<Action>] = [
-          .send(.repositories(.setGithubIntegrationEnabled(settings.githubIntegrationEnabled))),
+          .send(.repositories(.setGithubIntegrationEnabled(anyForgeIntegrationEnabled))),
+          .merge(forgeTeardownEffects),
           .send(.repositories(.setMergedWorktreeAction(settings.mergedWorktreeAction))),
           .send(.repositories(.setMoveNotifiedWorktreeToTop(settings.moveNotifiedWorktreeToTop))),
           // The global default editor feeds every repo's resolved open action, and the
@@ -763,7 +828,7 @@ struct AppFeature {
         effects += [
           .run { _ in
             await worktreeInfoWatcher.send(
-              .setPullRequestTrackingEnabled(settings.githubIntegrationEnabled)
+              .setPullRequestTrackingEnabled(anyForgeIntegrationEnabled)
             )
           },
           .run { _ in
@@ -803,6 +868,14 @@ struct AppFeature {
               if dockIconReappeared {
                 _ = appLifecycleClient.surfaceMainWindow()
               }
+            }
+          )
+        }
+        if globalHotkeyChanged {
+          effects.append(
+            .run { @MainActor send in
+              let succeeded = appLifecycleClient.updateGlobalHotkey(newGlobalHotkey)
+              await send(.settings(.setGlobalHotkeyRegistrationFailed(newGlobalHotkey != nil && !succeeded)))
             }
           )
         }
@@ -1243,14 +1316,6 @@ struct AppFeature {
         }
         return .run { _ in
           await terminalClient.send(.navigateSearchPrevious(worktree))
-        }
-
-      case .endSearch:
-        guard let worktree = state.repositories.worktree(for: state.repositories.selectedWorktreeID) else {
-          return .none
-        }
-        return .run { _ in
-          await terminalClient.send(.endSearch(worktree))
         }
 
       case .settings(.repositorySettings(.delegate(.settingsChanged(let rootURL, let host)))):
@@ -2106,6 +2171,29 @@ struct AppFeature {
         }
       }
     )
+  }
+
+  /// Settings sidebar names resolve like the main sidebar's: a "Customize
+  /// Appearance" title overrides the repository's directory name, otherwise
+  /// identically-named directories are indistinguishable in settings.
+  private static func settingsRepositorySummaries(
+    repositories: IdentifiedArrayOf<Repository>,
+    sidebar: SidebarState,
+    titleOverride: (repositoryID: Repository.ID, title: String?)? = nil
+  ) -> [SettingsRepositorySummary] {
+    repositories.map { repository in
+      let customTitle =
+        repository.id == titleOverride?.repositoryID
+        ? titleOverride?.title
+        : sidebar.customTitle(for: repository)
+      return SettingsRepositorySummary(
+        id: repository.id.rawValue,
+        name: Repository.sidebarDisplayName(custom: customTitle, fallback: repository.name),
+        isGitRepository: repository.isGitRepository,
+        host: repository.host,
+        rootURL: repository.rootURL
+      )
+    }
   }
 
   /// Re-sweeps LaunchServices off the main thread, debounced so a launch that is
@@ -3263,7 +3351,7 @@ struct AppFeature {
         && state.repositories.alert == nil
         && (state.repositories.sidebarItems[id: worktreeID]?.lifecycle ?? .idle) == .idle
       guard folderEligible else {
-        let folderName = state.repositories.repositories[id: repositoryID]?.name ?? "This folder"
+        let folderName = state.repositories.repositoryName(for: repositoryID) ?? "This folder"
         state.alert = AlertState {
           TextState("Delete unavailable")
         } actions: {
@@ -3680,7 +3768,13 @@ struct AppFeature {
   ) -> Effect<Action> {
     let worktreeName = state.repositories.worktree(for: worktreeID)?.name ?? "Unknown"
     let repoName = state.repositories.repositoryID(containing: worktreeID)
-      .flatMap { state.repositories.repositories[id: $0]?.name }
+      .flatMap { state.repositories.repositories[id: $0] }
+      .map { repository in
+        Repository.sidebarDisplayName(
+          custom: state.repositories.sidebar.customTitle(for: repository),
+          fallback: repository.name
+        )
+      }
     // Close any previously pending FD so the CLI does not hang.
     let supersededEffect: Effect<Action> =
       state.deeplinkInputConfirmation?.responseFD.map {
@@ -3823,7 +3917,9 @@ struct AppFeature {
       case .shortcuts: .shortcuts
       case .scripts: .scripts
       case .updates: .updates
-      case .github: .github
+      // `github` stays a permanent parsing alias for the Git Forges pane.
+      case .github: .forges
+      case .forges: .forges
       }
     return .send(.settings(.setSelection(settingsSection)))
   }

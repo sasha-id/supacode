@@ -906,6 +906,26 @@ struct AppFeatureDeeplinkTests {
     #expect(store.state.deeplinkInputConfirmation?.action == .delete)
   }
 
+  @Test(.dependencies) func deeplinkConfirmationNamesCustomizedRepositoryTitle() async {
+    let worktree = makeWorktree()
+    var repositoriesState = makeRepositoriesState(worktree: worktree)
+    repositoriesState.$sidebar.withLock { sidebar in
+      sidebar.sections[Repository.ID("/tmp/repo"), default: .init()].title = "Backend"
+    }
+    let store = TestStore(
+      initialState: AppFeature.State(
+        repositories: repositoriesState,
+        settings: SettingsFeature.State(),
+      )
+    ) {
+      AppFeature()
+    }
+    store.exhaustivity = .off
+
+    await store.send(.deeplink(.worktree(id: worktree.id, action: .delete)))
+    #expect(store.state.deeplinkInputConfirmation?.repositoryName == "Backend")
+  }
+
   @Test(.dependencies) func deleteWorktreeDeeplinkSkipsConfirmationWhenSettingEnabled() async {
     let worktree = makeWorktree()
     var settings = SettingsFeature.State()
@@ -3437,11 +3457,11 @@ struct AppFeatureDeeplinkTests {
     $settings.withLock { $0.archiveScript = "" }
   }
 
-  private func makeMergedPullRequest() -> GithubPullRequest {
-    GithubPullRequest(
+  private func makeMergedPullRequest() -> ForgePullRequest {
+    ForgePullRequest(
       number: 1,
       title: "PR",
-      state: "MERGED",
+      state: .merged,
       additions: 0,
       deletions: 0,
       isDraft: false,

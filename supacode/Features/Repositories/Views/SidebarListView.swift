@@ -17,6 +17,7 @@ struct SidebarListView: View {
   @Shared(.sidebarGroupPinnedRows) private var groupPinnedRows: Bool
   @Shared(.sidebarGroupActiveRows) private var groupActiveRows: Bool
   @Shared(.sidebarNestWorktreesByBranch) private var nestWorktreesByBranch: Bool
+  @Shared(.sidebarSectionSort) private var sectionSort: SidebarSectionSort
 
   var body: some View {
     let state = store.state
@@ -55,13 +56,15 @@ struct SidebarListView: View {
             terminalManager: terminalManager
           )
         }
-        .onMove { offsets, destination in
-          handleRepositoryMove(
-            offsets: offsets,
-            destination: destination,
-            structure: structure
-          )
-        }
+        .onMove(
+          perform: sectionSort.allowsReordering
+            ? { offsets, destination in
+              handleRepositoryMove(
+                offsets: offsets,
+                destination: destination,
+                structure: structure
+              )
+            } : nil)
         // The only rule in the sidebar separates two repositories, and
         // `SidebarRowChrome` draws it on the row that starts one. Left to
         // itself, `.plain` would also rule between every pair of worktrees.
@@ -85,6 +88,13 @@ struct SidebarListView: View {
       }
       .onChange(of: nestWorktreesByBranch, initial: false) { _, _ in
         store.send(.sidebarNestByBranchChanged)
+      }
+      .onChange(of: sectionSort, initial: true) { oldValue, newValue in
+        // `initial: true` so a change made while the sidebar column is
+        // collapsed still lands on the next appear (the View menu writes
+        // `@Shared` even when this view is unmounted). Animate a real toggle;
+        // the initial appear (oldValue == newValue) resyncs without motion.
+        store.send(.sidebarSectionSortChanged, animation: oldValue == newValue ? nil : .default)
       }
       .dropDestination(for: URL.self) { urls, _ in
         let fileURLs = urls.filter(\.isFileURL)

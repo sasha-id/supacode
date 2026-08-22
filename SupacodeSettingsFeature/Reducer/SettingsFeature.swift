@@ -61,6 +61,7 @@ public struct SettingsFeature {
     public var analyticsEnabled: Bool
     public var crashReportsEnabled: Bool
     public var githubIntegrationEnabled: Bool
+    public var gitlabIntegrationEnabled: Bool
     public var deleteBranchOnDeleteWorktree: Bool
     public var mergedWorktreeAction: MergedWorktreeAction
     public var promptForWorktreeCreation: Bool
@@ -88,6 +89,10 @@ public struct SettingsFeature {
     public var chromeTextSize: ChromeTextSize
     public var automaticRepositoryRefreshEnabled: Bool
     public var hoverFocusMode: HoverFocusMode
+    public var globalToggleVisibilityHotkey: AppShortcutOverride?
+    /// True when the last registration of the global hotkey failed (chord
+    /// unavailable). Transient UI state, never persisted.
+    public var globalHotkeyRegistrationFailed = false
     public var cliInstallState = CLIInstallState.checking
     /// Installed editors in menu order, resolved once off the picker's body.
     public var installedOpenActions: [OpenWorktreeAction]
@@ -148,6 +153,7 @@ public struct SettingsFeature {
       analyticsEnabled = settings.analyticsEnabled
       crashReportsEnabled = settings.crashReportsEnabled
       githubIntegrationEnabled = settings.githubIntegrationEnabled
+      gitlabIntegrationEnabled = settings.forgeIntegrationEnabled(forID: "gitlab")
       deleteBranchOnDeleteWorktree = settings.deleteBranchOnDeleteWorktree
       mergedWorktreeAction = settings.mergedWorktreeAction
       promptForWorktreeCreation = settings.promptForWorktreeCreation
@@ -174,6 +180,7 @@ public struct SettingsFeature {
       chromeTextSize = settings.chromeTextSize
       automaticRepositoryRefreshEnabled = settings.automaticRepositoryRefreshEnabled
       hoverFocusMode = settings.hoverFocusMode
+      globalToggleVisibilityHotkey = settings.globalToggleVisibilityHotkey
       defaultWorktreeBaseDirectoryPath =
         SupacodePaths.normalizedWorktreeBaseDirectoryPath(settings.defaultWorktreeBaseDirectoryPath) ?? ""
     }
@@ -194,6 +201,7 @@ public struct SettingsFeature {
         analyticsEnabled: analyticsEnabled,
         crashReportsEnabled: crashReportsEnabled,
         githubIntegrationEnabled: githubIntegrationEnabled,
+        forgeEnabledByID: gitlabIntegrationEnabled ? [:] : ["gitlab": false],
         deleteBranchOnDeleteWorktree: deleteBranchOnDeleteWorktree,
         mergedWorktreeAction: mergedWorktreeAction,
         promptForWorktreeCreation: promptForWorktreeCreation,
@@ -222,7 +230,8 @@ public struct SettingsFeature {
         terminalHibernationEnabled: terminalHibernationEnabled,
         chromeTextSize: chromeTextSize,
         automaticRepositoryRefreshEnabled: automaticRepositoryRefreshEnabled,
-        hoverFocusMode: hoverFocusMode
+        hoverFocusMode: hoverFocusMode,
+        globalToggleVisibilityHotkey: globalToggleVisibilityHotkey
       )
     }
   }
@@ -234,6 +243,8 @@ public struct SettingsFeature {
     case setSelection(SettingsSection?)
     case setSystemNotificationsEnabled(Bool)
     case setAppVisibility(AppVisibility)
+    case setGlobalToggleHotkey(AppShortcutOverride?)
+    case setGlobalHotkeyRegistrationFailed(Bool)
     case setAutomatedActionPolicy(AutomatedActionPolicy)
     case showNotificationPermissionAlert(errorMessage: String?)
     case updateShortcut(id: AppShortcutID, override: AppShortcutOverride?)
@@ -356,6 +367,7 @@ public struct SettingsFeature {
         state.analyticsEnabled = normalizedSettings.analyticsEnabled
         state.crashReportsEnabled = normalizedSettings.crashReportsEnabled
         state.githubIntegrationEnabled = normalizedSettings.githubIntegrationEnabled
+        state.gitlabIntegrationEnabled = normalizedSettings.forgeIntegrationEnabled(forID: "gitlab")
         state.deleteBranchOnDeleteWorktree = normalizedSettings.deleteBranchOnDeleteWorktree
         state.mergedWorktreeAction = normalizedSettings.mergedWorktreeAction
         state.promptForWorktreeCreation = normalizedSettings.promptForWorktreeCreation
@@ -382,6 +394,7 @@ public struct SettingsFeature {
         state.chromeTextSize = normalizedSettings.chromeTextSize
         state.automaticRepositoryRefreshEnabled = normalizedSettings.automaticRepositoryRefreshEnabled
         state.hoverFocusMode = normalizedSettings.hoverFocusMode
+        state.globalToggleVisibilityHotkey = normalizedSettings.globalToggleVisibilityHotkey
         state.defaultWorktreeBaseDirectoryPath = normalizedSettings.defaultWorktreeBaseDirectoryPath ?? ""
         state.syncGlobalDefaults(from: normalizedSettings)
         synchronizeRepositorySelection(for: &state)
@@ -415,6 +428,22 @@ public struct SettingsFeature {
         state.appVisibility = visibility
         state.syncGlobalDefaults(from: state.globalSettings)
         return persist(state)
+
+      case .setGlobalToggleHotkey(let override):
+        // Presence encodes "bound", so collapse a disabled chord to nil; the row
+        // and the monitor both read nil-or-enabled and would otherwise disagree.
+        let normalized = override?.isEnabled == true ? override : nil
+        guard state.globalToggleVisibilityHotkey != normalized else { return .none }
+        state.globalToggleVisibilityHotkey = normalized
+        // A fresh chord clears the stale registration-failure warning; the
+        // pending registration decides whether it comes back.
+        state.globalHotkeyRegistrationFailed = false
+        state.syncGlobalDefaults(from: state.globalSettings)
+        return persist(state)
+
+      case .setGlobalHotkeyRegistrationFailed(let failed):
+        state.globalHotkeyRegistrationFailed = failed
+        return .none
 
       case .setAutomatedActionPolicy(let policy):
         state.automatedActionPolicy = policy

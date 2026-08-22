@@ -671,7 +671,8 @@ struct GithubCLIClientTests {
   }
 
   @Test func defaultFallbackExecutableURLsOrdersPathsAndDropsHomeWhenAbsent() {
-    let withHome = GithubCLIExecutableResolver.defaultFallbackExecutableURLs(
+    let withHome = ForgeCLIExecutableResolver.defaultFallbackExecutableURLs(
+      executableName: "gh",
       environment: ["HOME": "/Users/tester"]
     )
     #expect(
@@ -682,7 +683,10 @@ struct GithubCLIClientTests {
       ]
     )
 
-    let withoutHome = GithubCLIExecutableResolver.defaultFallbackExecutableURLs(environment: [:])
+    let withoutHome = ForgeCLIExecutableResolver.defaultFallbackExecutableURLs(
+      executableName: "gh",
+      environment: [:]
+    )
     #expect(
       withoutHome.map(\.path) == [
         "/opt/homebrew/bin/gh",
@@ -880,28 +884,6 @@ struct GithubCLIClientTests {
     let info = await client.resolveRemoteInfo(URL(fileURLWithPath: "/tmp/repo"))
 
     #expect(info == GithubRemoteInfo(host: "github.com", owner: "upstream-org", repo: "upstream-repo"))
-  }
-
-  @Test func defaultBranchSucceedsDespiteBannerPollutedStdout() async throws {
-    let stdout = "conda activate base\n" + #"{"defaultBranchRef":{"name":"main"}}"#
-    let client = GithubCLIClient.live(shell: Self.ghShell(stdout: stdout))
-
-    let branch = try await client.defaultBranch(URL(fileURLWithPath: "/tmp/repo"))
-
-    #expect(branch == "main")
-  }
-
-  @Test func defaultBranchThrowsCommandFailedOnNonJsonOutput() async {
-    let client = GithubCLIClient.live(shell: Self.ghShell(stdout: "not a repo"))
-
-    do {
-      _ = try await client.defaultBranch(URL(fileURLWithPath: "/tmp/repo"))
-      Issue.record("Expected defaultBranch to throw")
-    } catch GithubCLIError.commandFailed {
-      // Expected.
-    } catch {
-      Issue.record("Unexpected error type: \(error.localizedDescription)")
-    }
   }
 
   @Test func latestRunSucceedsDespiteBannerPollutedArray() async throws {

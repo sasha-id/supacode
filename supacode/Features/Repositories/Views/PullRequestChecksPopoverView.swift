@@ -3,17 +3,17 @@ import SupacodeSettingsShared
 import SwiftUI
 
 struct PullRequestChecksPopoverView: View {
-  let pullRequest: GithubPullRequest
-  let checks: [GithubPullRequestStatusCheck]
+  let pullRequest: ForgePullRequest
+  let checks: [ForgePullRequestStatusCheck]
   private let breakdown: PullRequestCheckBreakdown
-  private let sortedChecks: [GithubPullRequestStatusCheck]
+  private let sortedChecks: [ForgePullRequestStatusCheck]
   @Environment(\.analyticsClient) private var analyticsClient
   @Environment(\.openURL) private var openURL
   @Shared(.settingsFile) private var settingsFile
 
   init(
-    pullRequest: GithubPullRequest,
-    checks: [GithubPullRequestStatusCheck]
+    pullRequest: ForgePullRequest,
+    checks: [ForgePullRequestStatusCheck]
   ) {
     self.pullRequest = pullRequest
     self.checks = checks
@@ -34,7 +34,7 @@ struct PullRequestChecksPopoverView: View {
 
   var body: some View {
     let pullRequestURL = URL(string: pullRequest.url)
-    let stateLabel = pullRequest.state.uppercased()
+    let stateLabel = pullRequest.state.displayLabel
     let draftLabel = pullRequest.isDraft ? "\(stateLabel)/DRAFT" : stateLabel
     let titlePrefix = Text("\(draftLabel) - ").foregroundStyle(.secondary)
     let titleSuffix = Text(verbatim: " #\(pullRequest.number)")
@@ -50,8 +50,8 @@ struct PullRequestChecksPopoverView: View {
     let summaryLine = Text(
       "\(authorLogin) wants to merge \(commitsCount, format: .number) \(commitsLabel) into \(baseRef) from \(headRef)"
     ).foregroundStyle(.secondary)
-    let additionsText = Text("+\(pullRequest.additions, format: .number)")
-    let deletionsText = Text("-\(pullRequest.deletions, format: .number)")
+    let additionsText = pullRequest.additions.map { Text("+\($0, format: .number)") }
+    let deletionsText = pullRequest.deletions.map { Text("-\($0, format: .number)") }
     let hasConflicts = PullRequestMergeReadiness(pullRequest: pullRequest).isConflicting
     ScrollView {
       VStack(alignment: .leading) {
@@ -77,10 +77,14 @@ struct PullRequestChecksPopoverView: View {
           .appFont(.subheadline)
           .lineLimit(1)
         HStack {
-          additionsText
-            .foregroundStyle(.green)
-          deletionsText
-            .foregroundStyle(.red)
+          if let additionsText {
+            additionsText
+              .foregroundStyle(.green)
+          }
+          if let deletionsText {
+            deletionsText
+              .foregroundStyle(.red)
+          }
           if hasConflicts {
             Text("•")
               .foregroundStyle(.secondary)
@@ -168,7 +172,7 @@ struct PullRequestChecksPopoverView: View {
     }
   }
 
-  private static func sortRank(for state: GithubPullRequestCheckState) -> Int {
+  private static func sortRank(for state: ForgePullRequestCheckState) -> Int {
     switch state {
     case .failure:
       return 0

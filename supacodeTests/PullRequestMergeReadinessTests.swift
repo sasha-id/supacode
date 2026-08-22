@@ -14,7 +14,6 @@ struct PullRequestMergeReadinessTests {
     let readiness = PullRequestMergeReadiness(pullRequest: pullRequest)
 
     #expect(readiness.blockingReason == .mergeConflicts)
-    #expect(readiness.isBlocking)
     #expect(readiness.label == "Merge conflicts")
     #expect(readiness.isConflicting)
   }
@@ -37,8 +36,8 @@ struct PullRequestMergeReadinessTests {
       mergeable: "MERGEABLE",
       mergeStateStatus: "CLEAN",
       checks: [
-        GithubPullRequestStatusCheck(status: "COMPLETED", conclusion: "FAILURE", state: nil),
-        GithubPullRequestStatusCheck(status: "COMPLETED", conclusion: "FAILURE", state: nil),
+        ForgePullRequestStatusCheck(status: "COMPLETED", conclusion: "FAILURE", state: nil),
+        ForgePullRequestStatusCheck(status: "COMPLETED", conclusion: "FAILURE", state: nil),
       ]
     )
 
@@ -57,11 +56,11 @@ struct PullRequestMergeReadinessTests {
     let readiness = PullRequestMergeReadiness(pullRequest: pullRequest)
 
     #expect(readiness.blockingReason == nil)
-    #expect(!readiness.isBlocking)
+    #expect(readiness.assessment == .mergeable)
     #expect(readiness.label == "Mergeable")
   }
 
-  @Test func mergeReadinessFallsBackToBlockedForOtherStates() {
+  @Test func mergeReadinessIsCheckingWhileMergeabilityIsUnknown() {
     let pullRequest = makePullRequest(
       mergeable: "UNKNOWN",
       mergeStateStatus: "BEHIND"
@@ -69,8 +68,20 @@ struct PullRequestMergeReadinessTests {
 
     let readiness = PullRequestMergeReadiness(pullRequest: pullRequest)
 
-    #expect(readiness.blockingReason == .blocked)
-    #expect(readiness.label == "Blocked")
+    #expect(readiness.assessment == .checking)
+    #expect(readiness.blockingReason == nil)
+    #expect(readiness.label == "Checking")
+  }
+
+  @Test func mergeReadinessIsCheckingWhenMergeabilityIsMissing() {
+    let pullRequest = makePullRequest(
+      mergeable: nil,
+      mergeStateStatus: nil
+    )
+
+    let readiness = PullRequestMergeReadiness(pullRequest: pullRequest)
+
+    #expect(readiness.assessment == .checking)
   }
 }
 
@@ -78,13 +89,13 @@ private func makePullRequest(
   reviewDecision: String? = nil,
   mergeable: String? = nil,
   mergeStateStatus: String? = nil,
-  checks: [GithubPullRequestStatusCheck] = [],
-  mergeQueueEntry: GithubMergeQueueEntry? = nil
-) -> GithubPullRequest {
-  GithubPullRequest(
+  checks: [ForgePullRequestStatusCheck] = [],
+  mergeQueueEntry: ForgeMergeQueueEntry? = nil
+) -> ForgePullRequest {
+  ForgePullRequest(
     number: 1,
     title: "PR",
-    state: "OPEN",
+    state: .open,
     additions: 0,
     deletions: 0,
     isDraft: false,
@@ -98,7 +109,7 @@ private func makePullRequest(
     baseRefName: "main",
     commitsCount: 1,
     authorLogin: "khoi",
-    statusCheckRollup: checks.isEmpty ? nil : GithubPullRequestStatusCheckRollup(checks: checks),
+    statusCheckRollup: checks.isEmpty ? nil : ForgePullRequestStatusCheckRollup(checks: checks),
     mergeQueueEntry: mergeQueueEntry
   )
 }

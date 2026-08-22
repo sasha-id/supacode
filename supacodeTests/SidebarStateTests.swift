@@ -1,4 +1,5 @@
 import Foundation
+import IdentifiedCollections
 import OrderedCollections
 import Testing
 
@@ -593,5 +594,121 @@ struct SidebarStateTests {
 
     #expect(carried?.title == "Unpinned-Payload")
     #expect(carried?.color == .blue)
+  }
+
+  // MARK: - customTitle(for:)
+
+  private func repository(id: String, isGitRepository: Bool) -> Repository {
+    Repository(
+      id: Repository.ID(id),
+      rootURL: URL(fileURLWithPath: id),
+      name: URL(fileURLWithPath: id).lastPathComponent,
+      worktrees: [],
+      isGitRepository: isGitRepository
+    )
+  }
+
+  @Test func customTitleReadsSectionTitleForGitRepository() {
+    var state = SidebarState()
+    state.sections[repoA] = .init(title: "Backend")
+
+    #expect(state.customTitle(for: repository(id: repoA.rawValue, isGitRepository: true)) == "Backend")
+  }
+
+  @Test func customTitleReadsFolderTitleFromSyntheticItem() {
+    var state = SidebarState()
+    state.setCustomization(
+      title: "Files",
+      color: nil,
+      worktree: WorktreeID(repoA.rawValue),
+      in: repoA
+    )
+
+    #expect(state.customTitle(for: repository(id: repoA.rawValue, isGitRepository: false)) == "Files")
+  }
+
+  // The sidebar renders a folder through `SidebarFolderRow`, which reads the
+  // row's own title and never the section, so the row has to win here too.
+  @Test func customTitlePrefersFolderItemOverSectionTitle() {
+    var state = SidebarState()
+    state.sections[repoA] = .init(title: "Stale Section")
+    state.setCustomization(
+      title: "Files",
+      color: nil,
+      worktree: WorktreeID(repoA.rawValue),
+      in: repoA
+    )
+
+    #expect(state.customTitle(for: repository(id: repoA.rawValue, isGitRepository: false)) == "Files")
+  }
+
+  @Test func customColorFollowsTheSameDualRuleAsTheTitle() {
+    var state = SidebarState()
+    state.sections[repoA] = .init(color: .purple)
+    state.setCustomization(
+      title: nil,
+      color: .teal,
+      worktree: WorktreeID(repoA.rawValue),
+      in: repoA
+    )
+
+    #expect(state.customColor(for: repository(id: repoA.rawValue, isGitRepository: false)) == .teal)
+    #expect(state.customColor(for: repository(id: repoA.rawValue, isGitRepository: true)) == .purple)
+  }
+
+  // A repository that never loaded has no kind to branch on, so the section
+  // wins: for a git repo the item keyed by the repo root is the main worktree
+  // row, whose title is not the repository's.
+  @Test func customTitleForUnloadedRepositoryPrefersSectionTitle() {
+    var state = SidebarState()
+    state.sections[repoA] = .init(title: "Section")
+    state.setCustomization(
+      title: "Row",
+      color: nil,
+      worktree: WorktreeID(repoA.rawValue),
+      in: repoA
+    )
+
+    #expect(state.customTitleForUnloadedRepository(repoA) == "Section")
+  }
+
+  @Test func customTitleForUnloadedRepositoryFallsBackToFolderItem() {
+    var state = SidebarState()
+    state.setCustomization(
+      title: "Files",
+      color: nil,
+      worktree: WorktreeID(repoA.rawValue),
+      in: repoA
+    )
+
+    #expect(state.customTitleForUnloadedRepository(repoA) == "Files")
+  }
+
+  @Test func customTitleIgnoresSyntheticItemForGitRepository() {
+    // A git worktree can be keyed by the repo root path itself; its per-worktree
+    // title must never become the repository title.
+    var state = SidebarState()
+    state.setCustomization(
+      title: "Just A Worktree",
+      color: nil,
+      worktree: WorktreeID(repoA.rawValue),
+      in: repoA
+    )
+
+    #expect(state.customTitle(for: repository(id: repoA.rawValue, isGitRepository: true)) == nil)
+  }
+
+  @Test func customTitleIsNilWhenNothingCustomized() {
+    let state = SidebarState()
+
+    #expect(state.customTitle(for: repository(id: repoA.rawValue, isGitRepository: true)) == nil)
+    #expect(state.customTitle(for: repository(id: repoA.rawValue, isGitRepository: false)) == nil)
+  }
+
+  @Test func customColorIsNilWhenNothingCustomized() {
+    let state = SidebarState()
+
+    #expect(state.customColor(for: repository(id: repoA.rawValue, isGitRepository: true)) == nil)
+    #expect(state.customColor(for: repository(id: repoA.rawValue, isGitRepository: false)) == nil)
   }
 }

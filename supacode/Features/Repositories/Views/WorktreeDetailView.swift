@@ -43,12 +43,10 @@ struct WorktreeDetailView: View {
       selectedWorktree: selectedWorktree,
       selectedWorktreeSummaries: selectedWorktreeSummaries
     )
-    let hasActiveWorktree =
-      selectedWorktree != nil
-      && loadingInfo == nil
-      && !shouldShowMultiSelectionSummary(
-        repositories: repositories, selectedWorktreeSummaries: selectedWorktreeSummaries)
-      && selectedWorktree?.isMissing != true
+    let hasActiveWorktree = hasActiveWorktree(
+      repositories: repositories, loadingInfo: loadingInfo,
+      selectedWorktree: selectedWorktree, selectedWorktreeSummaries: selectedWorktreeSummaries
+    )
     // `toolbarNotificationGroupsCache` is observed inside `ToolbarNotificationsButtonHost`
     // instead; reading it here would re-render the body on every notification.
     let repositoriesStore = store.scope(state: \.repositories, action: \.repositories)
@@ -63,6 +61,8 @@ struct WorktreeDetailView: View {
       selectedRow: selectedRow,
       repositories: repositories
     )
+    let inspectorCapabilities = Self.inspectorCapabilities(
+      repositories: repositories, selectedWorktree: selectedWorktree)
     // Read the manager's stored color here (tracked body evaluation, not the
     // deferred toolbar closure) so the toolbar scheme invalidates on change.
     let toolbarScheme: ColorScheme =
@@ -83,6 +83,8 @@ struct WorktreeDetailView: View {
       selectedSlice: selectedRow,
       selectedWorktreeSummaries: selectedWorktreeSummaries
     )
+    // Applied before `.inspector` so the toast stays within the content, not over the inspector.
+    .statusToastOverlay(store: repositoriesStore)
     .toolbar(removing: .title)
     .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
     .toolbar {
@@ -115,6 +117,7 @@ struct WorktreeDetailView: View {
         isCheckingPullRequest: isCheckingPullRequest,
         pullRequest: inspectorPullRequest,
         repositoriesStore: repositoriesStore,
+        capabilities: inspectorCapabilities,
         terminalManager: terminalManager,
         fileOpenActions: state.installedOpenActions.filter(\.canOpenFiles),
         resolvedOpenAction: resolvedSelection,
@@ -142,13 +145,25 @@ struct WorktreeDetailView: View {
   private static func inspectorPullRequest(
     selectedWorktree: Worktree?,
     selectedRow: SelectedWorktreeSlice?
-  ) -> GithubPullRequest? {
+  ) -> ForgePullRequest? {
     selectedWorktree.flatMap { worktree in
       if case .git(let pullRequest) = toolbarKind(for: worktree, selectedRow: selectedRow) {
         return pullRequest
       }
       return nil
     }
+  }
+
+  /// Capabilities of the selected repo's resolved forge; GitHub until resolved.
+  private static func inspectorCapabilities(
+    repositories: RepositoriesFeature.State,
+    selectedWorktree: Worktree?
+  ) -> ForgeCapabilities {
+    guard
+      let selectedWorktree,
+      let repositoryID = repositories.repositoryID(containing: selectedWorktree.id)
+    else { return .github }
+    return repositories.forgeCapabilities(for: repositoryID)
   }
 
   /// Whether a pull-request refresh is in flight for the selected worktree's repo.
@@ -235,6 +250,19 @@ struct WorktreeDetailView: View {
       return false
     }
     return !repositories.isInitialLoadComplete
+  }
+
+  private func hasActiveWorktree(
+    repositories: RepositoriesFeature.State,
+    loadingInfo: WorktreeLoadingInfo?,
+    selectedWorktree: Worktree?,
+    selectedWorktreeSummaries: [MultiSelectedWorktreeSummary]
+  ) -> Bool {
+    selectedWorktree != nil
+      && loadingInfo == nil
+      && !shouldShowMultiSelectionSummary(
+        repositories: repositories, selectedWorktreeSummaries: selectedWorktreeSummaries)
+      && selectedWorktree?.isMissing != true
   }
 
   @ViewBuilder
@@ -376,9 +404,6 @@ struct WorktreeDetailView: View {
       .focusedSceneAction(\.navigateSearchPreviousAction, enabled: hasActiveWorktree) {
         store.send(.navigateSearchPrevious)
       }
-      .focusedSceneAction(\.endSearchAction, enabled: hasActiveWorktree) {
-        store.send(.endSearch)
-      }
       .focusedSceneAction(\.runScriptAction, enabled: hasActiveWorktree) {
         store.send(.runScript)
       }
@@ -411,6 +436,24 @@ struct WorktreeDetailView: View {
   ) {
     guard let worktreeID = worktree?.id else { return }
     store.send(.repositories(.pullRequestAction(worktreeID, action)))
+  }
+
+  /// Toolbar back/forward host. Reads the worktree-history enablement in its own
+  /// View body so the chevrons invalidate only this leaf when history changes.
+  /// `repositoriesStore` is optional so previews can mount it without a `Store`.
+  fileprivate struct WorktreeHistoryToolbarButtonsHost: View {
+    let repositoriesStore: StoreOf<RepositoriesFeature>?
+
+    var body: some View {
+      if let repositoriesStore {
+        WorktreeHistoryToolbarButtons(
+          canGoBack: repositoriesStore.canNavigateWorktreeHistoryBackward,
+          canGoForward: repositoriesStore.canNavigateWorktreeHistoryForward,
+          onBack: { repositoriesStore.send(.worktreeHistoryBack) },
+          onForward: { repositoriesStore.send(.worktreeHistoryForward) }
+        )
+      }
+    }
   }
 
   /// Toolbar notification bell host. Reads `toolbarNotificationGroupsCache`
@@ -480,7 +523,7 @@ struct WorktreeDetailView: View {
     // Folders have no git remote, so the PR payload is scoped to
     // `.git` — this makes "folder with a pull request" unrepresentable.
     enum Kind {
-      case git(pullRequest: GithubPullRequest?)
+      case git(pullRequest: ForgePullRequest?)
       case folder
     }
 
@@ -518,7 +561,7 @@ struct WorktreeDetailView: View {
       return action.remoteOpenDisabledReason(host: remoteOpenHost, remotePath: remoteOpenPath)
     }
 
-    var pullRequest: GithubPullRequest? {
+    var pullRequest: ForgePullRequest? {
       if case .git(let pullRequest) = kind { pullRequest } else { nil }
     }
 
@@ -588,6 +631,11 @@ struct WorktreeDetailView: View {
     let onSelectNotification: (Worktree.ID, WorktreeTerminalNotification) -> Void
 
     var body: some ToolbarContent {
+      // Leading in every detail state so history stays reachable while a worktree loads.
+      ToolbarItem(placement: .navigation) {
+        WorktreeHistoryToolbarButtonsHost(repositoriesStore: repositoriesStore)
+      }
+
       if showsToolbarPlaceholder {
         ToolbarPlaceholderContent(scheme: scheme, includesStatusSkeleton: !showsLoadingWorktree)
         if showsLoadingWorktree {
@@ -794,7 +842,7 @@ struct WorktreeDetailView: View {
 
   /// Trailing git + notifications status toggles, always real controls (never skeletons).
   fileprivate struct TrailingStatusToolbarContent: ToolbarContent {
-    let pullRequest: GithubPullRequest?
+    let pullRequest: ForgePullRequest?
     let repositoriesStore: StoreOf<RepositoriesFeature>?
     let terminalManager: WorktreeTerminalManager
     let inspectorPane: WorktreeInspectorPane
@@ -1463,4 +1511,73 @@ private struct WorktreeToolbarPreview: View {
 
 #Preview("Worktree Toolbar") {
   WorktreeToolbarPreview()
+}
+
+extension View {
+  fileprivate func statusToastOverlay(store: StoreOf<RepositoriesFeature>) -> some View {
+    overlay(alignment: .bottomTrailing) {
+      StatusToastOverlay(store: store)
+    }
+  }
+}
+
+/// Observes only `statusToast`, so toast changes don't invalidate the detail body.
+private struct StatusToastOverlay: View {
+  let store: StoreOf<RepositoriesFeature>
+
+  var body: some View {
+    StatusToastView(toast: store.statusToast)
+      .padding()
+  }
+}
+
+struct StatusToastView: View {
+  let toast: RepositoriesFeature.StatusToast?
+
+  var body: some View {
+    Group {
+      if let toast {
+        HStack(spacing: 6) {
+          StatusToastIcon(toast: toast)
+          Text(toast.message)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassEffect(.regular, in: .capsule)
+        .transition(.opacity)
+      }
+    }
+    .animation(.easeInOut(duration: 0.2), value: toast)
+  }
+}
+
+private struct StatusToastIcon: View {
+  let toast: RepositoriesFeature.StatusToast
+
+  var body: some View {
+    switch toast {
+    case .inProgress:
+      ProgressView()
+        .controlSize(.small)
+    case .success:
+      Image(systemName: "checkmark.circle.fill")
+        .foregroundStyle(.green)
+        .accessibilityHidden(true)
+    case .info:
+      Image(systemName: "info.circle.fill")
+        .foregroundStyle(.secondary)
+        .accessibilityHidden(true)
+    }
+  }
+}
+
+extension RepositoriesFeature.StatusToast {
+  var message: String {
+    switch self {
+    case .inProgress(let message), .success(let message), .info(let message):
+      message
+    }
+  }
 }

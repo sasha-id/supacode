@@ -63,18 +63,23 @@ extension RepositorySettingsFeature.State: @retroactive CustomDumpRepresentable 
   }
 }
 
-extension GithubPullRequest: CustomDumpRepresentable {
+extension ForgePullRequest: CustomDumpRepresentable {
   var customDumpValue: Any {
     (
       number: number,
       state: state,
       isDraft: isDraft,
-      reviewDecision: reviewDecision
+      reviewDecision: reviewDecision,
+      mergeable: mergeable,
+      mergeStateStatus: mergeStateStatus,
+      statusCheckRollup: statusCheckRollup,
+      forgeBlockedReason: forgeBlockedReason,
+      updatedAt: updatedAt
     )
   }
 }
 
-extension GithubPullRequestStatusCheckRollup: CustomDumpRepresentable {
+extension ForgePullRequestStatusCheckRollup: CustomDumpRepresentable {
   var customDumpValue: Any {
     checks.count
   }
