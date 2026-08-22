@@ -320,6 +320,11 @@ final class GhosttySurfaceView: NSView, Identifiable {
   /// until the free lands: libghostty keeps unretained pointers to it and to
   /// the bridge for the duration of its own teardown.
   func closeSurfaceDeferringFree() {
+    // Blank the view before detaching: until the free lands, the dying child's
+    // renderer thread still paints into the mounted IOSurface — visibly, the
+    // "[Process exited]" overlay — for as long as the collapse commit keeps
+    // this view on screen. Never un-hidden: a wake mounts a fresh view.
+    isHidden = true
     guard let surface = detachSurface() else { return }
     Task { @MainActor [self] in
       withExtendedLifetime(self) {
