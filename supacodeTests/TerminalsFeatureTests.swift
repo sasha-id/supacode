@@ -273,6 +273,95 @@ struct TerminalsFeatureTests {
     await harness.store.finish()
   }
 
+  @Test(.dependencies) func deselectionPastRecencyCancelsAPendingWake() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeHibernationHarness()
+    harness.selectedContent.hibernate()
+    await harness.store.send(.selectedWorktreeChanged(harness.worktreeID)) {
+      $0.selectedWorktreeID = harness.worktreeID
+      $0.recentWorktreeIDs = [harness.worktreeID]
+      $0.hibernationArmedTabs = [harness.hiddenTab]
+      $0.wakeRequestedTabs = [harness.selectedTab]
+    }
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
+    }
+    // Scrub past the recency window before the wake's deferral elapses; the
+    // first two hops keep the worktree retained, the third drops its cover.
+    let others = ["/tmp/other-1", "/tmp/other-2", "/tmp/other-3"].map { Worktree.ID($0) }
+    await harness.store.send(.selectedWorktreeChanged(others[0])) {
+      $0.selectedWorktreeID = others[0]
+      $0.recentWorktreeIDs = [others[0], harness.worktreeID]
+      $0.wakeRequestedTabs = []
+    }
+    await harness.store.send(.selectedWorktreeChanged(others[1])) {
+      $0.selectedWorktreeID = others[1]
+      $0.recentWorktreeIDs = [others[1], others[0], harness.worktreeID]
+    }
+    await harness.store.send(.selectedWorktreeChanged(others[2])) {
+      $0.selectedWorktreeID = others[2]
+      $0.recentWorktreeIDs = [others[2], others[1], others[0]]
+    }
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.wakingTabs = []
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
+    }
+    // The deferral elapsing spawns nothing: the effect died with the cancel.
+    await harness.clock.advance(by: LayoutFeature.wakeDeferral)
+    #expect(harness.selectedContent.renderer == nil)
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = false }
+    await harness.store.send(.hibernationPolicyChanged) {
+      $0.hibernationArmedTabs = []
+    }
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies) func memoryPressureCancelsAPendingWakeOnAHiddenTab() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeHibernationHarness()
+    harness.selectedContent.hibernate()
+    await harness.store.send(.selectedWorktreeChanged(harness.worktreeID)) {
+      $0.selectedWorktreeID = harness.worktreeID
+      $0.recentWorktreeIDs = [harness.worktreeID]
+      $0.hibernationArmedTabs = [harness.hiddenTab]
+      $0.wakeRequestedTabs = [harness.selectedTab]
+    }
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
+    }
+    // Deselect while the wake still defers; recency keeps the tab covered.
+    await harness.store.send(.selectedWorktreeChanged(Worktree.ID("/tmp/other"))) {
+      $0.selectedWorktreeID = Worktree.ID("/tmp/other")
+      $0.recentWorktreeIDs = [Worktree.ID("/tmp/other"), harness.worktreeID]
+      $0.wakeRequestedTabs = []
+    }
+    await harness.store.send(.task)
+    harness.pressure.yield()
+    // Pressure drops the recency cover and the sweep reaches the hidden pane:
+    // the mid-wake tab has no renderer for the hibernatable gate, so the sweep
+    // cancels its wake instead of letting the spawn land right after.
+    await harness.store.receive(\.memoryPressureWarning) {
+      $0.recentWorktreeIDs = [Worktree.ID("/tmp/other")]
+      $0.hibernationArmedTabs = []
+    }
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.wakingTabs = []
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
+    }
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 3
+    }
+    await harness.clock.advance(by: LayoutFeature.wakeDeferral)
+    #expect(harness.selectedContent.renderer == nil)
+    #expect(harness.hiddenContent.renderer == nil)
+    harness.pressure.finish()
+    await harness.store.finish()
+  }
+
   @Test(.dependencies) func windowedPaneKeepsItsSelectionAwakeWhileTheWorktreeIsUnselected() async {
     @Shared(.settingsFile) var settingsFile
     $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }

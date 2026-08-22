@@ -205,6 +205,9 @@ struct LayoutFeature {
     case toggleZoom(paneID: PaneID)
     case hibernateTab(id: TabID)
     case wakeTab(id: TabID)
+    /// Drops a wake still in flight for a tab that stopped being worth showing
+    /// (it went hidden mid-deferral), so the spawn never runs.
+    case cancelWake(id: TabID)
     case runtime(RuntimeEvent)
     /// A content asked to close tabs in its pane; gated by the
     /// confirm-close-tab mode.
@@ -238,7 +241,7 @@ struct LayoutFeature {
   // alter structure; exempt them from the per-action layout walk.
   private static func isExemptFromConsistencyCheck(_ action: Action) -> Bool {
     switch action {
-    case .resizePane, .beginTabRename, .endTabRename:
+    case .resizePane, .beginTabRename, .endTabRename, .cancelWake:
       return true
     case .newTab, .splitPane, .closeTab, .closePane, .selectTab, .renameTab, .focusPane,
       .moveTab, .moveTabToSplit, .moveTabToSpanningSplit, .enterWindowMode, .exitWindowMode,
@@ -333,6 +336,8 @@ struct LayoutFeature {
         return reduceHibernateTab(&state, tabID: tabID)
       case .wakeTab(let tabID):
         return reduceWakeTab(&state, tabID: tabID)
+      case .cancelWake(let tabID):
+        return cancelPendingWake(&state, tabID: tabID)
       case .runtime(let event):
         return reduceRuntimeEvent(&state, event: event)
       case .contentRequestedClose(let contentID, let scope):

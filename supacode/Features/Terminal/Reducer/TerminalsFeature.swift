@@ -104,7 +104,7 @@ struct TerminalsFeature {
   // action has to declare itself; classify as `.structural` when unsure.
   static func changeScope(_ action: LayoutFeature.Action) -> LayoutChangeScope {
     switch action {
-    case .resizePane, .beginTabRename, .endTabRename, .runtime(.titleCommitted):
+    case .resizePane, .beginTabRename, .endTabRename, .cancelWake, .runtime(.titleCommitted):
       return .bookkeeping
     case .newTab, .splitPane, .closeTab, .closePane, .selectTab, .renameTab, .focusPane,
       .moveTab, .moveTabToSplit, .moveTabToSpanningSplit, .enterWindowMode, .exitWindowMode,
@@ -296,6 +296,13 @@ extension TerminalsFeature {
               retained.insert(tab.id)
               continue
             }
+            // A wake still deferring for a tab that just went hidden would
+            // spawn a surface nobody shows and nothing recency-retains; drop it
+            // before the spawn lands. Scrubbing through N hibernated worktrees
+            // then costs N-1 cancellations instead of N-1 full spawns.
+            if layout.wakingTabs.contains(tab.id) {
+              effects.append(.send(.layouts(.element(id: layout.id, action: .cancelWake(id: tab.id)))))
+            }
             guard enabled, !state.hibernationArmedTabs.contains(tab.id) else { continue }
             // Arm only live renderers; hibernated tabs have nothing to tear
             // down and re-arm on wake through this same funnel.
@@ -418,6 +425,12 @@ extension TerminalsFeature {
         )
         for tab in pane.tabs
         where Self.isTabHidden(tab, pane: pane, paneShowsContent: showsContent) {
+          // A hidden tab whose wake is still deferring has no renderer yet, so
+          // the hibernatable gate below would skip it and the spawn would land
+          // right after the pressure event — cancel the wake instead.
+          if layout.wakingTabs.contains(tab.id) {
+            effects.append(.send(.layouts(.element(id: layout.id, action: .cancelWake(id: tab.id)))))
+          }
           guard contentRuntime.content(for: tab.content.id)?.isHibernatable == true else { continue }
           // Disarm first: a timer left over a hibernated tab would fire into
           // the ineligible re-arm branch and never settle.
