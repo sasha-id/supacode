@@ -61,8 +61,11 @@ nonisolated struct ContentGeometry: Equatable, Sendable {
   /// Display scale for rasterization until the view joins a window.
   let scale: CGFloat
 
-  // Only `candidate`, `restored`, and `fallback` may produce values, so every
-  // geometry in circulation satisfies its producer's validation.
+  // Only `candidate`, `restored`, `fallback`, and `halved` may produce values.
+  // `halved` derives from an already-valid instance and needs no input
+  // validation of its own; the other three validate raw input before
+  // constructing, so every geometry in circulation satisfies its producer's
+  // validation.
   private init(pixelSize: CGSize, scale: CGFloat) {
     self.pixelSize = pixelSize
     self.scale = scale
@@ -160,5 +163,25 @@ extension ContentGeometry {
       pixelSize: CGSize(width: pointSize.width * scale, height: pointSize.height * scale),
       scale: scale
     )
+  }
+
+  /// Halves the geometry along a split's axis, so a freshly spawned split
+  /// surface's PTY grid starts near its post-layout size instead of at the
+  /// anchor's full size: a horizontal split (panes side by side) halves
+  /// width, a vertical split (panes stacked) halves height. Floors an odd
+  /// extent; the resize pass after mount corrects the remainder.
+  func halved(along axis: SplitDirection) -> ContentGeometry {
+    switch axis {
+    case .horizontal:
+      ContentGeometry(
+        pixelSize: CGSize(width: (pixelSize.width / 2).rounded(.down), height: pixelSize.height),
+        scale: scale
+      )
+    case .vertical:
+      ContentGeometry(
+        pixelSize: CGSize(width: pixelSize.width, height: (pixelSize.height / 2).rounded(.down)),
+        scale: scale
+      )
+    }
   }
 }

@@ -51,6 +51,10 @@ extension RepositoriesFeature.State {
     let notificationGroups = toolbarNotificationGroupsCache
     let menuBarSections = menuBarSectionsCache
 
+    // Drop the input-signature gate so the recompute below actually runs;
+    // otherwise an input missing from `SidebarStructureInputs` would leave a
+    // stale structure AND a green convergence check.
+    sidebarStructureInputs.last = nil
     applyCacheRecomputes(.allSidebar)
 
     let message = "Declared CacheInvalidations were insufficient: a full recompute changed"

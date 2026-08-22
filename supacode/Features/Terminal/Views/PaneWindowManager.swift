@@ -404,7 +404,7 @@ final class PaneWindowManager {
     window.minSize = NSSize(width: 320, height: 240)
     window.title =
       terminalManager.layoutState(for: worktreeID)?.layout.panes[id: paneID]
-      .flatMap(WindowedPaneRootView.title(for:)) ?? "Terminal"
+      .map { WindowedPaneRootView.title(for: $0, runtime: ContentRuntime.liveValue) } ?? "Terminal"
     window.center()
     cascadePoint = window.cascadeTopLeft(from: cascadePoint)
     let headerModel = PaneWindowHeaderModel()
@@ -566,16 +566,14 @@ private struct WindowedPaneRootView: View {
             windowedPaneIDs: [],
             store: store,
             runtime: runtime,
-            surfaceState: { [weak manager] surfaceID in
-              manager?.hostIfExists(for: worktreeID)?.surfaceStates[surfaceID]
-            },
+            services: manager.renderServices(for: worktreeID),
             context: .windowed
           )
         }
         .onAppear {
-          updateWindowTitle(Self.title(for: pane))
+          updateWindowTitle(Self.title(for: pane, runtime: runtime))
         }
-        .onChange(of: Self.title(for: pane)) { _, title in
+        .onChange(of: Self.title(for: pane, runtime: runtime)) { _, title in
           updateWindowTitle(title)
         }
         .focusedSceneAction(
@@ -687,9 +685,9 @@ private struct WindowedPaneRootView: View {
     action(surface)
   }
 
-  static func title(for pane: Pane) -> String {
+  static func title(for pane: Pane, runtime: ContentRuntime) -> String {
     guard let tab = pane.selectedTab else { return "Terminal" }
-    return tab.customTitle ?? tab.title
+    return TabTitle.resolved(for: tab, runtime: runtime)
   }
 }
 

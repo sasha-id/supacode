@@ -27,6 +27,10 @@ final class WorktreeContentHost {
   /// Routes a topology mutation into the worktree's `LayoutFeature`.
   @ObservationIgnored var sendLayoutAction: (LayoutFeature.Action) -> Void = { _ in }
   @ObservationIgnored var onNotificationReceived: ((UUID, String, String, Bool) -> Void)?
+  /// A content reported a new title. Nothing in TCA moved — the title lives on
+  /// the content's chrome — so this exists only to re-arm the persistence
+  /// debounce, which pulls the title back at snapshot time.
+  @ObservationIgnored var onReportedTitleChanged: (() -> Void)?
   @ObservationIgnored var onNotificationIndicatorChanged: (() -> Void)?
   @ObservationIgnored var onFocusChanged: ((UUID) -> Void)?
   @ObservationIgnored var onFocusedSurfaceColorChanged: (() -> Void)?
@@ -59,6 +63,11 @@ final class WorktreeContentHost {
   /// surface is live and its window is key; it targets whatever pane is focused
   /// then, so it follows the user, and is cleared on worktree deselection.
   @ObservationIgnored private var pendingFocusClaim = false
+  /// Text a focus request carried while its surface was still being
+  /// provisioned, bound to the content it was aimed at, so a deferred wake
+  /// never eats input. The claim that resolves delivers it only when it lands
+  /// on that same content and drops it otherwise.
+  @ObservationIgnored private var pendingFocusText: (surfaceID: UUID, text: String)?
   @ObservationIgnored private(set) var isWorktreeSelected = false
   private var lastWindowIsKey: Bool?
   private var lastWindowIsVisible: Bool?
@@ -201,13 +210,18 @@ final class WorktreeContentHost {
     focusedContentID == surfaceID
   }
 
+  /// Whether the content is the selected tab of a pane open in its own window.
+  private func isInWindowedPane(_ surfaceID: UUID) -> Bool {
+    guard let pane = layout()?.panes.first(where: { $0.selectedTab?.content.id.rawValue == surfaceID })
+    else { return false }
+    return windowedPaneIDs().contains(pane.id)
+  }
+
   /// All five must hold for an arriving notification to be born read. A
   /// windowed pane's surface keys off its own window, not the main one.
   private func isViewedSurface(_ surfaceID: UUID) -> Bool {
     guard isFocusedSurface(surfaceID) else { return false }
-    if let pane = layout()?.panes.first(where: { $0.selectedTab?.content.id.rawValue == surfaceID }),
-      windowedPaneIDs().contains(pane.id)
-    {
+    if isInWindowedPane(surfaceID) {
       guard let window = liveSurface(surfaceID)?.window else { return false }
       return window.isKeyWindow && window.occlusionState.contains(.visible)
     }
@@ -533,7 +547,22 @@ final class WorktreeContentHost {
   /// The tab's content-owned strip chrome, nil for non-terminal contents.
   private func terminalChrome(for tabID: TabID) -> TerminalTabChrome? {
     guard let contentID = tab(withID: tabID)?.content.id else { return nil }
-    return runtime.content(for: contentID)?.chrome as? TerminalTabChrome
+    return terminalChrome(for: contentID)
+  }
+
+  private func terminalChrome(for contentID: ContentID) -> TerminalTabChrome? {
+    runtime.content(for: contentID)?.chrome as? TerminalTabChrome
+  }
+
+  /// A live or dormant terminal reported a title. Agent TUIs rewrite it several
+  /// times a second, so it lands on the content's observable chrome — only the
+  /// one tab label re-renders — and never as a layout action. The lock is
+  /// resolved at display and snapshot time, so a script tab's title survives
+  /// its shell's reports.
+  func updateReportedTitle(for contentID: ContentID, title: String) {
+    guard let chrome = terminalChrome(for: contentID), chrome.reportedTitle != title else { return }
+    chrome.reportedTitle = title
+    onReportedTitleChanged?()
   }
 
   func emitTaskStatusIfChanged() {
@@ -673,7 +702,10 @@ final class WorktreeContentHost {
     isWorktreeSelected = selected
     // Leaving the worktree cancels an unresolved focus claim; re-selecting
     // re-arms it through `focusSelectedTab`.
-    if !selected { pendingFocusClaim = false }
+    if !selected {
+      pendingFocusClaim = false
+      pendingFocusText = nil
+    }
     reassertSurfaceActivity()
   }
 
@@ -685,7 +717,7 @@ final class WorktreeContentHost {
     if tabID(containing: surfaceID) != nil,
       let title = liveSurface(surfaceID)?.bridge.state.title, !title.isEmpty
     {
-      sendLayoutAction(.runtime(.titleChanged(id: ContentID(rawValue: surfaceID), title: title)))
+      updateReportedTitle(for: ContentID(rawValue: surfaceID), title: title)
     }
     emitFocusChangedIfNeeded(surfaceID)
   }
@@ -711,15 +743,28 @@ final class WorktreeContentHost {
       pendingFocusClaim = true
       return
     }
-    claimFocus(surface)
+    claimFocus(surface, contentID: contentID)
   }
 
   /// Makes the focused surface first responder and reconciles every surface's
   /// focus flag, so only the focused pane shows a cursor.
-  private func claimFocus(_ surface: GhosttySurfaceView) {
+  private func claimFocus(_ surface: GhosttySurfaceView, contentID: UUID) {
     pendingFocusClaim = false
     if surface.window?.firstResponder !== surface {
       surface.requestFocus()
+    }
+    if let pending = pendingFocusText {
+      pendingFocusText = nil
+      if pending.surfaceID == contentID {
+        surface.sendText(pending.text)
+      } else {
+        // The claim landed on a terminal the text was not aimed at — the user
+        // moved on while the wake provisioned. Typing it here would run it in
+        // the wrong shell, so it dies with the claim.
+        Self.logger.warning(
+          "focusAndInsertText: dropped \(pending.text.count) latched characters; focus resolved on another surface"
+        )
+      }
     }
     // The host is created after the window-activity observer fires, so it can
     // miss the initial key event and leave `lastWindowIsKey` nil; sync from the
@@ -743,13 +788,26 @@ final class WorktreeContentHost {
       let surface = liveSurface(contentID),
       surface.window?.isKeyWindow == true
     else { return false }
-    claimFocus(surface)
+    claimFocus(surface, contentID: contentID)
     return true
   }
 
   func focusAndInsertText(_ text: String) {
-    guard let contentID = focusedContentID, let surface = liveSurface(contentID) else {
-      Self.logger.warning("focusAndInsertText: no focused surface")
+    guard let contentID = focusedContentID else {
+      Self.logger.warning("focusAndInsertText: no focused content")
+      return
+    }
+    guard let surface = liveSurface(contentID) else {
+      // A wake provisions off the reducer turn, so the target surface may not
+      // exist yet; latch the text against that content instead of dropping it.
+      // Same target appends, so type-ahead during a wake arrives whole.
+      Self.logger.info("focusAndInsertText: no live surface yet; latching \(text.count) characters")
+      if pendingFocusText?.surfaceID == contentID {
+        pendingFocusText?.text.append(text)
+      } else {
+        pendingFocusText = (surfaceID: contentID, text: text)
+      }
+      focusSelectedTab()
       return
     }
     Self.logger.info("focusAndInsertText: inserting \(text.count) characters")
@@ -757,9 +815,15 @@ final class WorktreeContentHost {
     surface.sendText(text)
   }
 
-  /// Whether a content may claim AppKit first responder.
+  /// Whether a content may claim AppKit first responder when its view is
+  /// re-attached. A deselected worktree keeps its tree mounted, so a remount
+  /// inside one (hibernation wake, split rebuild) would otherwise pull first
+  /// responder off the worktree on screen — the reclaim in
+  /// `GhosttySurfaceView.viewDidMoveToWindow` takes it from a sibling terminal.
+  /// A windowed pane is exempt: it reclaims inside its own window.
   func shouldClaimFocus(_ surfaceID: UUID) -> Bool {
-    focusedContentID == surfaceID
+    guard focusedContentID == surfaceID else { return false }
+    return isSelected() || isInWindowedPane(surfaceID)
   }
 
   /// Cross-tab focus by content id (deeplinks, unread jumps): wake and select
@@ -772,7 +836,12 @@ final class WorktreeContentHost {
     }
     sendLayoutAction(.wakeTab(id: tabID))
     sendLayoutAction(.selectTab(id: tabID))
-    guard let surface = liveSurface(surfaceID) else { return false }
+    guard let surface = liveSurface(surfaceID) else {
+      // The wake is still provisioning; latch the claim so it lands when the
+      // surface appears instead of reporting a failure the user can see.
+      focusSelectedTab()
+      return true
+    }
     surface.requestFocus()
     return true
   }
@@ -1100,6 +1169,9 @@ final class WorktreeContentHost {
     lastCustomNotificationAt.removeValue(forKey: surfaceID)
     pendingExplicitSurfaceCloseIDs.remove(surfaceID)
     bypassCloseConfirmationSurfaceIDs.remove(surfaceID)
+    if pendingFocusText?.surfaceID == surfaceID {
+      pendingFocusText = nil
+    }
   }
 
   /// A content hibernated: keep its counter and dedupe state, cancel nothing
@@ -1178,7 +1250,7 @@ final class WorktreeContentHost {
   private func updateDormantTabTitle(surfaceID: UUID, title: String) {
     let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, isDormantSurface(surfaceID) else { return }
-    sendLayoutAction(.runtime(.titleChanged(id: ContentID(rawValue: surfaceID), title: trimmed)))
+    updateReportedTitle(for: ContentID(rawValue: surfaceID), title: trimmed)
   }
 
   /// Full teardown on prune or quit: watchers stop, bookkeeping clears.

@@ -398,6 +398,7 @@ struct AppFeature {
           refreshInstalledOpenActionsEffect(current: state.installedOpenActions),
           .send(.repositories(.task)),
           .send(.settings(.task)),
+          .send(.terminals(.task)),
           .run { @MainActor send in
             guard startupHotkey != nil else { return }
             if !appLifecycleClient.updateGlobalHotkey(startupHotkey) {
@@ -2045,11 +2046,10 @@ struct AppFeature {
         // The manager already detached the layout; nothing app-level remains.
         return .none
 
-      case .terminals(.layouts(.element(let worktreeID, .wakeTab(let tabID)))):
+      case .terminals(.layouts(.element(let worktreeID, .runtime(.wakeCompleted(let tabID))))):
         // A woken content is a fresh instance whose chrome missed any presence
         // fan-out that ran while the tab was unprovisioned (restored layouts);
-        // replay the current snapshot. Effect-deferred: the core reducer runs
-        // before the terminals scope, so the wake has not provisioned yet.
+        // replay the current snapshot.
         guard
           let contentID = state.terminals.layouts[id: worktreeID]?.layout
             .pane(containingTab: tabID)?.tabs[id: tabID]?.content.id
@@ -2140,13 +2140,13 @@ struct AppFeature {
   ) -> Effect<Action> {
     @Shared(.settingsFile) var settingsFile: SettingsFile
     let badgesEnabled = settingsFile.global.agentPresenceBadgesEnabled
-    // Hoisted: `surfaceToItemID` is a computed property that rebuilds the dict
-    // per access; reading it once keeps this loop O(surfaces) not O(rows × surfaces).
-    let surfaceToItemID = state.repositories.surfaceToItemID
+    // Resolved by scanning the rows rather than through `surfaceToItemID`: that
+    // computed property materializes a dictionary of every row's surfaces on
+    // each access, and an agent storm only ever needs the rows behind `surfaces`.
     var affectedRowIDs: Set<SidebarItemID> = []
-    for surfaceID in surfaces {
-      guard let rowID = surfaceToItemID[surfaceID] else { continue }
-      affectedRowIDs.insert(rowID)
+    for row in state.repositories.sidebarItems
+    where row.surfaceIDs.contains(where: surfaces.contains) {
+      affectedRowIDs.insert(row.id)
     }
     return agentSnapshotEffects(
       for: affectedRowIDs,

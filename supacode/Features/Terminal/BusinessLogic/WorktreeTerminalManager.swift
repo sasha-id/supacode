@@ -16,6 +16,18 @@ final class WorktreeTerminalManager {
   @ObservationIgnored private let surfaceBindingActionPerformer: ((GhosttySurfaceView, String) -> Void)?
   private(set) var socketServer: AgentHookSocketServer?
   private var hosts: [Worktree.ID: WorktreeContentHost] = [:]
+  /// One render-services instance per worktree, so the pane tree's render
+  /// context keeps a stable identity across view updates.
+  @ObservationIgnored private var renderServicesByWorktree: [Worktree.ID: PaneRenderServices] = [:]
+  private struct SplitChrome {
+    let generation: Int
+    let divider: Color
+    let overlay: UnfocusedSplitOverlay
+  }
+  /// Config-derived split chrome, resolved once per Ghostty config reload.
+  /// Each resolve is three FFI config lookups, and a freshly built `Color` per
+  /// view pass would make the pane render context compare unequal every time.
+  @ObservationIgnored private var splitChromeCache: SplitChrome?
   /// The windowed-pane windows, reconciled after every layout change.
   @ObservationIgnored let paneWindows = PaneWindowManager()
   /// The app store; topology commands route into `TerminalsFeature` through it.
@@ -388,18 +400,7 @@ final class WorktreeTerminalManager {
     case .selectRelativeTab(let worktree, let forward):
       selectRelativeTab(forward: forward, in: worktree)
     case .focusSurface(let worktree, let tabID, let surfaceID, let input):
-      let host = host(for: worktree)
-      // Surface-first: the tab ID is a hint; the surface's actual owner wins.
-      guard let owningTab = host.tabID(containing: surfaceID) ?? presentTab(tabID, in: worktree.id) else {
-        terminalLogger.warning("focusSurface: surface \(surfaceID) not found in worktree \(worktree.id).")
-        break
-      }
-      sendLayout(worktree.id, .wakeTab(id: owningTab))
-      sendLayout(worktree.id, .selectTab(id: owningTab))
-      host.liveSurface(surfaceID)?.requestFocus()
-      if let input, !input.isEmpty {
-        host.focusAndInsertText(input + "\r")
-      }
+      focusSurface(in: worktree, tabID: tabID, surfaceID: surfaceID, input: input)
     case .splitSurface(
       let worktree, let tabID, let surfaceID, let direction, let input, let id, let focusing
     ):
@@ -478,6 +479,27 @@ final class WorktreeTerminalManager {
     let target = focusedPane.tabs[targetIndex]
     sendLayout(worktree.id, .wakeTab(id: target.id))
     sendLayout(worktree.id, .selectTab(id: target.id))
+  }
+
+  private func focusSurface(in worktree: Worktree, tabID: TabID, surfaceID: UUID, input: String?) {
+    let host = host(for: worktree)
+    // Surface-first: the tab ID is a hint; the surface's actual owner wins.
+    guard let owningTab = host.tabID(containing: surfaceID) ?? presentTab(tabID, in: worktree.id) else {
+      terminalLogger.warning("focusSurface: surface \(surfaceID) not found in worktree \(worktree.id).")
+      return
+    }
+    sendLayout(worktree.id, .wakeTab(id: owningTab))
+    sendLayout(worktree.id, .selectTab(id: owningTab))
+    if let surface = host.liveSurface(surfaceID) {
+      surface.requestFocus()
+    } else {
+      // A wake provisions off the reducer turn; latch the claim so it lands
+      // when the surface appears.
+      host.focusSelectedTab()
+    }
+    if let input, !input.isEmpty {
+      host.focusAndInsertText(input + "\r")
+    }
   }
 
   /// The tab ID when it exists in the worktree's layout, else nil.
@@ -584,6 +606,9 @@ final class WorktreeTerminalManager {
         markLayoutDirty(worktreeID: previousID)
       }
       selectedWorktreeID = id
+      // Both trees stay mounted across a switch, so AppKit hands the keyboard
+      // to nobody; `WorktreeTerminalStackView` moves first responder over once
+      // the incoming tree is on screen.
       hosts[id ?? WorktreeID("")]?.setWorktreeSelected(true)
       // Deselecting arms grace timers, selecting wakes the visible tabs; the
       // reducer owns both through the selection action.
@@ -718,9 +743,12 @@ final class WorktreeTerminalManager {
     for worktree: Worktree,
     runSetupScriptIfNew: () -> Bool = { false }
   ) -> WorktreeContentHost {
-    // Unconditional: attach is idempotent and a hydrated layout still needs
-    // its minted-title prefix stamped.
-    sendTerminals(.attachLayout(worktreeID: worktree.id, titlePrefix: worktree.name))
+    // Attach only mints the layout and stamps the minted-title prefix, so a
+    // hydrated layout already carrying this prefix needs no send. The nil
+    // comparison covers the not-yet-attached case.
+    if layoutState(for: worktree.id)?.titlePrefix != worktree.name {
+      sendTerminals(.attachLayout(worktreeID: worktree.id, titlePrefix: worktree.name))
+    }
     if let existing = hosts[worktree.id] {
       if runSetupScriptIfNew() {
         existing.enableSetupScriptIfNeeded()
@@ -775,6 +803,12 @@ final class WorktreeTerminalManager {
       self?.emitNotificationIndicatorCountIfNeeded()
       self?.emitProjection(for: worktree.id)
     }
+    // Only the debounce: the title itself is read back off the chrome when the
+    // snapshot is built, so a title storm costs one coalesced write, not one
+    // store send per report.
+    host.onReportedTitleChanged = { [weak self] in
+      self?.markLayoutDirty(worktreeID: worktree.id)
+    }
     host.onFocusChanged = { [weak self] surfaceID in
       self?.emit(.focusChanged(worktreeID: worktree.id, surfaceID: surfaceID))
       self?.refreshFocusedSurfaceBackground()
@@ -811,9 +845,13 @@ final class WorktreeTerminalManager {
 
   /// Fires the layout-changed side effects the reducer cannot: persistence,
   /// content lifecycle, surface activity, the pane windows, and the sidebar
-  /// projection. Called for every layout action, not only topology changes.
-  func handleLayoutChanged(for worktreeID: Worktree.ID) {
+  /// projection. Called for every layout action, so everything past the
+  /// persistence debounce is gated on `.structural`: a ratio drag or a
+  /// reported title moves no surface and adds none, and those arrive at frame
+  /// rate.
+  func handleLayoutChanged(for worktreeID: Worktree.ID, scope: LayoutChangeScope) {
     markLayoutDirty(worktreeID: worktreeID)
+    guard scope == .structural else { return }
     hosts[worktreeID]?.reconcileContentLifecycle()
     // Zoom and selection changes flip which surfaces render; re-derive
     // occlusion and focus so hidden panes stop drawing.
@@ -873,38 +911,48 @@ final class WorktreeTerminalManager {
     )
   }
 
+  /// Hands the content's last reported title back to the layout. The title is
+  /// carried by the content's chrome alone, so every teardown that keeps the
+  /// tab — a reattach rebuild, quit-time termination — must commit it first or
+  /// the tab falls back to its creation-time name.
+  private func commitReportedTitle(of contentID: ContentID, worktreeID: Worktree.ID) {
+    guard let title = ContentRuntime.liveValue.content(for: contentID)?.chrome?.reportedTitle,
+      !title.isEmpty
+    else { return }
+    sendLayout(worktreeID, .runtime(.titleCommitted(id: contentID, title: title)))
+  }
+
   /// An unexpected zmx exit: probe the session, then spare, kill, or reattach.
   func handleUnexpectedZmxClose(_ view: GhosttySurfaceView, worktreeID: Worktree.ID) {
     let surfaceID = view.id
     Task { @MainActor [weak self] in
-      let probe = await self?.zmxClient.listSessionsWithClients()
+      // One native connect to this session's socket, never a `zmx ls` sweep:
+      // the listing subprocess round-trips every live session and blocks on
+      // the dying daemon for its kill grace period, which held the collapsed
+      // pane's empty chrome on screen for the whole wait.
+      let outcome = await self?.zmxClient.probeSession(ZmxSessionID.make(surfaceID: surfaceID))
       guard let self, let host = self.hosts[worktreeID], host.liveSurface(surfaceID) === view else { return }
       guard let tabID = host.tabID(containing: surfaceID) else { return }
-      let sessionID = ZmxSessionID.make(surfaceID: surfaceID)
-      let session = probe?.first { $0.name == sessionID }
-      guard let probe else {
-        // Failed probe: never destroy on no signal; close but spare the session.
-        self.sessionsToSpare.insert(surfaceID)
-        self.sendLayout(worktreeID, .closeTab(id: tabID))
-        return
-      }
-      _ = probe
-      guard let session else {
+      switch outcome {
+      case .dead:
         // Session already dead; the close's kill is local cleanup. The end
         // was not user-initiated, so a remote host-side session survives.
         self.sessionsToKillLocalOnly.insert(surfaceID)
         self.sendLayout(worktreeID, .closeTab(id: tabID))
-        return
-      }
-      if session.clients == 0 {
+      case .alive(otherClients: 0):
         // Reattachable: rebuild the same content at its persisted geometry.
+        self.commitReportedTitle(of: ContentID(rawValue: surfaceID), worktreeID: worktreeID)
         ContentRuntime.liveValue.remove(ContentID(rawValue: surfaceID), tombstone: false)
         self.sendLayout(worktreeID, .wakeTab(id: tabID))
-        return
+      case .alive:
+        // Another client attached: close without killing.
+        self.sessionsToSpare.insert(surfaceID)
+        self.sendLayout(worktreeID, .closeTab(id: tabID))
+      case .unknown, nil:
+        // No definitive signal: never destroy; close but spare the session.
+        self.sessionsToSpare.insert(surfaceID)
+        self.sendLayout(worktreeID, .closeTab(id: tabID))
       }
-      // Another client attached (or unknown count): close without killing.
-      self.sessionsToSpare.insert(surfaceID)
-      self.sendLayout(worktreeID, .closeTab(id: tabID))
     }
   }
 
@@ -1329,6 +1377,19 @@ final class WorktreeTerminalManager {
     // The wake runs even when not focusing: splitting a dormant pane would
     // otherwise land in a frozen layout.
     sendLayout(worktree.id, .wakeTab(id: selectedTab))
+    // The wake above is deferred, so a hibernated anchor still has no renderer
+    // here; its frozen grid is the real geometry, not the window fallback.
+    let geometry: ContentGeometry
+    if ContentRuntime.liveValue.renderer(for: anchorContent) != nil {
+      geometry = ContentRuntime.liveValue.spawnGeometry(near: anchorContent)
+    } else if case .terminal(let anchorState)? = anchorPane.tabs[id: selectedTab]?.content.state,
+      let grid = anchorState.frozenGrid,
+      let restored = ContentGeometry.restored(grid)
+    {
+      geometry = restored
+    } else {
+      geometry = ContentRuntime.liveValue.spawnGeometry(near: anchorContent)
+    }
     let resolvedInput = BlockingScriptRunner.makeCommandInput(script: input ?? "")
     let launch: LaunchOverride? = resolvedInput.map { LaunchOverride(initialInput: $0) }
     let spec = NewTabSpec(
@@ -1336,7 +1397,7 @@ final class WorktreeTerminalManager {
       contentID: id.map(ContentID.init(rawValue:)),
       title: "\(worktree.name) \(nextTabIndex(in: layout, prefix: worktree.name))",
       content: .terminal(TerminalContentState(workingDirectory: nil, launch: launch)),
-      geometry: ContentRuntime.liveValue.spawnGeometry(near: anchorContent),
+      geometry: geometry,
       select: focusing,
       inheritedFrom: anchorContent
     )
@@ -1541,7 +1602,11 @@ final class WorktreeTerminalManager {
   /// (freshest tree + agent records), mutated into the in-memory `@Shared` dict
   /// on main, then merged into `layouts.json` off main.
   func markLayoutDirty(worktreeID: Worktree.ID) {
-    layoutDirtyTasks[worktreeID]?.cancel()
+    // Max-latency coalesce, not a trailing debounce: the pending flush already
+    // covers this mutation (the snapshot is captured at fire time), while
+    // cancel-and-re-arm would let a title storm postpone persistence — splits
+    // and closes included — for as long as the storm lasts.
+    guard layoutDirtyTasks[worktreeID] == nil else { return }
     layoutDirtyTasks[worktreeID] = Task { [weak self, layoutDebounceSleep] in
       try? await layoutDebounceSleep(Self.layoutDebounceDuration)
       guard !Task.isCancelled else { return }
@@ -1760,10 +1825,16 @@ final class WorktreeTerminalManager {
     for host in hosts.values {
       host.tearDown()
     }
-    for surfaceID in trackedSurfaceIDs {
-      guard let content = ContentRuntime.liveValue.content(for: ContentID(rawValue: surfaceID)) else { continue }
-      content.hibernate()
-      ContentRuntime.liveValue.remove(content.id, tombstone: false)
+    for (worktreeID, host) in hosts {
+      for surfaceID in host.allSurfaceIDs {
+        let contentID = ContentID(rawValue: surfaceID)
+        guard let content = ContentRuntime.liveValue.content(for: contentID) else { continue }
+        // The quit-time snapshot save runs after this sweep has emptied the
+        // runtime, so the titles have to be in the layout by then.
+        commitReportedTitle(of: contentID, worktreeID: worktreeID)
+        content.hibernate()
+        ContentRuntime.liveValue.remove(contentID, tombstone: false)
+      }
     }
     emitHasAnyTerminalSurfaceIfNeeded()
     // This instance's tracked local sessions are killed. A remote surface's
@@ -2070,15 +2141,39 @@ final class WorktreeTerminalManager {
 
   var ghosttyRuntime: GhosttyRuntime { runtime }
 
-  func unfocusedSplitOverlay() -> (fill: Color?, opacity: Double) {
-    (runtime.unfocusedSplitFill(), runtime.unfocusedSplitOverlayOpacity())
+  func unfocusedSplitOverlay() -> UnfocusedSplitOverlay {
+    splitChrome().overlay
   }
 
   // The user's `split-divider-color`, or the opaque asset fallback when unset.
   // Opaque, not a system separator: the terminal body is cut out of the window
   // tint, so a translucent divider would let the window blur show through the gap.
   func splitDividerColor() -> Color {
-    runtime.splitDividerColor() ?? Color(.splitDivider)
+    splitChrome().divider
+  }
+
+  private func splitChrome() -> SplitChrome {
+    let generation = configGeneration
+    if let splitChromeCache, splitChromeCache.generation == generation {
+      return splitChromeCache
+    }
+    let chrome = SplitChrome(
+      generation: generation,
+      divider: runtime.splitDividerColor() ?? Color(.splitDivider),
+      overlay: UnfocusedSplitOverlay(
+        fill: runtime.unfocusedSplitFill(), opacity: runtime.unfocusedSplitOverlayOpacity())
+    )
+    splitChromeCache = chrome
+    return chrome
+  }
+
+  /// The worktree's pane render services, created once and reused so the pane
+  /// tree's render context stays diffable across view updates.
+  func renderServices(for worktreeID: Worktree.ID) -> PaneRenderServices {
+    if let existing = renderServicesByWorktree[worktreeID] { return existing }
+    let services = PaneRenderServices(worktreeID: worktreeID, manager: self)
+    renderServicesByWorktree[worktreeID] = services
+    return services
   }
 
   private func emit(_ event: TerminalClient.Event) {
@@ -2185,6 +2280,7 @@ final class WorktreeTerminalManager {
   /// Clears the worktree-keyed lastEmittedProjections during prune; emit's purge has
   /// already cleared the coalesce keys, which this re-clears as a guard against drift.
   private func invalidateCaches(forPrunedWorktree id: Worktree.ID) {
+    renderServicesByWorktree.removeValue(forKey: id)
     lastEmittedProjections.removeValue(forKey: id)
     pendingShedProjectionReplays.remove(id)
     for key in Self.invalidatedCoalesceKeys(by: .worktreeStateTornDown(worktreeID: id)) {
@@ -2249,5 +2345,12 @@ final class WorktreeTerminalManager {
     // hasAny can only flip when this worktree's surface set actually changed,
     // which `projectionChanged` already implies.
     emitHasAnyTerminalSurfaceIfNeeded()
+  }
+}
+
+/// Identity equality, so the views carrying this reference stay diffable.
+extension WorktreeTerminalManager: Equatable {
+  nonisolated static func == (lhs: WorktreeTerminalManager, rhs: WorktreeTerminalManager) -> Bool {
+    lhs === rhs
   }
 }

@@ -35,6 +35,10 @@ struct ZmxClient: Sendable {
   /// a successful empty listing. A `clients` of nil marks a session whose count
   /// is unknown (err/status line), which the reaper must also spare.
   var listSessionsWithClients: @Sendable () async -> [ZmxSessionListParser.Entry]?
+  /// Probes one session's daemon socket natively (no subprocess, no full-list
+  /// sweep) for the unexpected-close path. Defaults to `.unknown` — the
+  /// never-destroy signal — so memberwise test constructions stay safe.
+  var probeSession: @Sendable (_ sessionID: String) async -> ZmxSessionProbe.Outcome = { _ in .unknown }
 }
 
 /// Cached probe result so we log the bypass reason exactly once per process
@@ -243,6 +247,15 @@ extension ZmxClient {
         // exit); preserve it so the reaper never kills against a failed probe.
         guard let stdout = await runZmx(["ls"], captureStdout: true) else { return nil }
         return ZmxSessionListParser.parse(stdout)
+      },
+      probeSession: { sessionID in
+        // Same socket-dir resolution as the wrapped shell (see `socketDir`).
+        let path = ZmxSocketBudget.socketDir() + "/" + sessionID
+        return await withCheckedContinuation { continuation in
+          DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: ZmxSessionProbe.probe(socketPath: path))
+          }
+        }
       }
     )
   }()
@@ -252,7 +265,9 @@ extension ZmxClient {
     isBundled: { false },
     killSession: { _ in },
     killRemoteSession: { _, _ in },
-    listSessionsWithClients: { [] }
+    listSessionsWithClients: { [] },
+    // Matches the empty listing above: no zmx means no session to find.
+    probeSession: { _ in .dead }
   )
 }
 

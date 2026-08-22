@@ -312,13 +312,108 @@ struct SidebarStructure: Equatable, Sendable {
   )
 }
 
+/// Snapshot of every input `computeSidebarStructure` reads, diffed before the
+/// rebuild so the leaf ticks that invalidate `.sidebarStructure` at agent /
+/// terminal frequency only pay the full render-plan walk when something the
+/// walk actually consumes moved. Anything added to the walk's inputs must be
+/// added here too, or the structure goes stale.
+struct SidebarStructureInputs: Equatable {
+  /// The per-leaf fields the walk reads. The rest of a row (notification
+  /// bodies, per-surface unread counts, PR detail, diff stats, individual
+  /// agent instances) is invisible to it, so a tick that moves only those
+  /// leaves this snapshot unchanged.
+  struct Row: Equatable {
+    let id: SidebarItemID
+    let repositoryID: Repository.ID
+    let name: String
+    let customTitle: String?
+    let branchName: String
+    let isMainWorktree: Bool
+    let isMissing: Bool
+    let lifecycle: SidebarItemFeature.State.Lifecycle
+    let hasUnseenNotifications: Bool
+    let classification: SidebarActiveClassification?
+
+    init(_ state: SidebarItemFeature.State) {
+      self.id = state.id
+      self.repositoryID = state.repositoryID
+      self.name = state.name
+      self.customTitle = state.customTitle
+      self.branchName = state.branchName
+      self.isMainWorktree = state.isMainWorktree
+      self.isMissing = state.isMissing
+      self.lifecycle = state.lifecycle
+      self.hasUnseenNotifications = state.hasUnseenNotifications
+      self.classification = SidebarActiveClassification.classify(state)
+    }
+  }
+
+  let rows: [Row]
+  let repositories: IdentifiedArrayOf<Repository>
+  let repositoryRoots: [URL]
+  let loadFailuresByID: [Repository.ID: String]
+  /// Only the nil-ness of `gitEnvironmentError` reaches the walk.
+  let isGitEnvironmentBlocked: Bool
+  let isInitialLoadComplete: Bool
+  let pendingWorktrees: [PendingWorktree]
+  let sidebar: SidebarState
+  let sidebarGrouping: SidebarGrouping
+  let nestWorktreesByBranch: Bool
+  let moveNotifiedWorktreeToTop: Bool
+  let groupPinned: Bool
+  let groupActive: Bool
+  let sectionSort: SidebarSectionSort
+
+  init(
+    state: RepositoriesFeature.State,
+    groupPinned: Bool,
+    groupActive: Bool,
+    sectionSort: SidebarSectionSort
+  ) {
+    self.rows = state.sidebarItems.map(Row.init)
+    self.repositories = state.repositories
+    self.repositoryRoots = state.repositoryRoots
+    self.loadFailuresByID = state.loadFailuresByID
+    self.isGitEnvironmentBlocked = state.gitEnvironmentError != nil
+    self.isInitialLoadComplete = state.isInitialLoadComplete
+    self.pendingWorktrees = state.pendingWorktrees
+    self.sidebar = state.sidebar
+    self.sidebarGrouping = state.sidebarGrouping
+    self.nestWorktreesByBranch = state.sidebarNestWorktreesByBranch
+    self.moveNotifiedWorktreeToTop = state.moveNotifiedWorktreeToTop
+    self.groupPinned = groupPinned
+    self.groupActive = groupActive
+    self.sectionSort = sectionSort
+  }
+}
+
+/// Holder that keeps the last `SidebarStructureInputs` out of `State`
+/// equality. The snapshot is a pure function of the rest of `State` and no
+/// consumer reads it, so letting it participate would make two states that
+/// render identically compare unequal and force every TestStore case to
+/// mirror a cache key it never sees.
+struct SidebarStructureInputsCache: Equatable {
+  var last: SidebarStructureInputs?
+
+  static func == (lhs: Self, rhs: Self) -> Bool { true }
+}
+
 extension RepositoriesFeature.State {
   /// Equatable-diffs the freshly-built structure against the cached one so a
-  /// no-op rebuild doesn't invalidate SwiftUI observation.
+  /// no-op rebuild doesn't invalidate SwiftUI observation, behind an input
+  /// snapshot so an unchanged input set skips the rebuild itself.
   mutating func recomputeSidebarStructureIfChanged() {
     @Shared(.sidebarGroupPinnedRows) var groupPinned
     @Shared(.sidebarGroupActiveRows) var groupActive
     @Shared(.sidebarSectionSort) var sectionSort
+    let inputs = SidebarStructureInputs(
+      state: self,
+      groupPinned: groupPinned,
+      groupActive: groupActive,
+      sectionSort: sectionSort
+    )
+    guard sidebarStructureInputs.last != inputs else { return }
+    sidebarStructureInputs.last = inputs
     let new = computeSidebarStructure(
       groupPinned: groupPinned,
       groupActive: groupActive,

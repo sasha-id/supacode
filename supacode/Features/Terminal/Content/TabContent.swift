@@ -187,15 +187,16 @@ final class TerminalContent: TabContent {
   func hibernate() {
     guard let surfaceView else { return }
     state = recordedState(from: surfaceView)
-    surfaceView.closeSurface()
+    surfaceView.closeSurfaceDeferringFree()
     self.surfaceView = nil
     searchToolbar.surfaceView = nil
   }
 
-  // Free the Ghostty surface at event time: deferring to the view's dealloc
-  // would run it mid-render when SwiftUI drops the last reference.
+  // Detach the Ghostty surface at event time: leaving it to the view's dealloc
+  // would run teardown mid-render when SwiftUI drops the last reference. The
+  // free itself is deferred, so the layout redraws without waiting on it.
   func tearDown() {
-    surfaceView?.closeSurface()
+    surfaceView?.closeSurfaceDeferringFree()
     surfaceView = nil
     searchToolbar.surfaceView = nil
   }

@@ -100,6 +100,8 @@ final class GhosttySurfaceView: NSView, Identifiable {
   // Only ever holds sizes actually pushed to ghostty_surface_set_size; a rejected
   // degenerate size must be re-evaluated on the next layout pass.
   private var lastAppliedBackingSize: CGSize = .zero
+  // A size that arrived while this view was hidden, deferred to the reveal.
+  private var needsSizeSyncOnReveal = false
   private var lastPerformKeyEvent: TimeInterval?
   private var currentCursor: NSCursor = .iBeam
   private var focused = false
@@ -146,6 +148,11 @@ final class GhosttySurfaceView: NSView, Identifiable {
       }
     }
   }
+  /// Strong hold on the wrapper `scrollWrapper` tracks weakly, so the wrapper
+  /// outlives the host container it happens to be mounted in. Cleared in
+  /// `detachSurface`, which is what breaks the cycle the wrapper's own strong
+  /// reference back to this view forms.
+  private var ownedScrollWrapper: GhosttySurfaceScrollView?
   var onFocusChange: ((Bool) -> Void)?
   /// Asks the owning state to re-derive activity because user input reached an
   /// occluded surface, passing the window's fresh key/visibility readings so
@@ -309,19 +316,56 @@ final class GhosttySurfaceView: NSView, Identifiable {
     return ghostty_surface_needs_confirm_quit(surface)
   }
 
+  /// The view a host container mounts for this surface, built once and reused
+  /// across containers. A rebuilt wrapper would re-parent the surface and start
+  /// it back at zero size, and the renderer drops completed frames whose size
+  /// does not match the layer's for as long as that mismatch lasts.
+  func hostedView() -> NSView {
+    if let ownedScrollWrapper { return ownedScrollWrapper }
+    let wrapper = GhosttySurfaceScrollView(surfaceView: self)
+    ownedScrollWrapper = wrapper
+    return wrapper
+  }
+
   func closeSurface() {
-    clearNotificationObservers()
-    if let surface {
-      if let surfaceRef {
-        runtime.unregisterSurface(surfaceRef)
-        self.surfaceRef = nil
+    guard let surface = detachSurface() else { return }
+    ghostty_surface_free(surface)
+  }
+
+  /// Detaches now, frees later. `ghostty_surface_free` joins the search,
+  /// renderer, and IO threads and tears down the Metal renderer, so running it
+  /// inline stalls the interaction that closed the surface. The view is held
+  /// until the free lands: libghostty keeps unretained pointers to it and to
+  /// the bridge for the duration of its own teardown.
+  func closeSurfaceDeferringFree() {
+    // Blank the view before detaching: until the free lands, the dying child's
+    // renderer thread still paints into the mounted IOSurface — visibly, the
+    // "[Process exited]" overlay — for as long as the collapse commit keeps
+    // this view on screen. Never un-hidden: a wake mounts a fresh view.
+    isHidden = true
+    guard let surface = detachSurface() else { return }
+    Task { @MainActor [self] in
+      withExtendedLifetime(self) {
+        ghostty_surface_free(surface)
       }
-      ghostty_surface_free(surface)
-      self.surface = nil
-      bridge.surface = nil
-      lastOcclusion = nil
-      lastSurfaceFocus = nil
     }
+  }
+
+  /// Drops every app-side reference to the surface and hands back the C value
+  /// still owing a free; nil when there is nothing left to free.
+  private func detachSurface() -> ghostty_surface_t? {
+    clearNotificationObservers()
+    ownedScrollWrapper = nil
+    guard let surface else { return nil }
+    if let surfaceRef {
+      runtime.unregisterSurface(surfaceRef)
+      self.surfaceRef = nil
+    }
+    self.surface = nil
+    bridge.surface = nil
+    lastOcclusion = nil
+    lastSurfaceFocus = nil
+    return surface
   }
 
   private func updateScreenObservers() {
@@ -482,6 +526,13 @@ final class GhosttySurfaceView: NSView, Identifiable {
     notifySizeChanged()
   }
 
+  override func viewDidUnhide() {
+    super.viewDidUnhide()
+    guard needsSizeSyncOnReveal else { return }
+    needsSizeSyncOnReveal = false
+    notifySizeChanged()
+  }
+
   private func notifySizeChanged() {
     if let scrollWrapper {
       scrollWrapper.updateSurfaceSize()
@@ -543,7 +594,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
     guard surface != nil else { return }
     guard self.focused != focused else { return }
     self.focused = focused
-    if focused {
+    if focused, bridge.state.bellCount != 0 {
       bridge.state.bellCount = 0
     }
     setSurfaceFocus(focused)
@@ -691,7 +742,11 @@ final class GhosttySurfaceView: NSView, Identifiable {
       interpretKeyEvents([event])
       return
     }
-    bridge.state.bellCount = 0
+    // Guarded: an unconditional write invalidates every observer of the bridge
+    // state on every keystroke, key repeat included.
+    if bridge.state.bellCount != 0 {
+      bridge.state.bellCount = 0
+    }
     let (translationEvent, translationMods) = translationState(event, surface: surface)
     let action = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
     keyTextAccumulator = []
@@ -953,8 +1008,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   // The responder chain delivers flagsChanged only to the first responder, so forward it to
   // every other surface; a hovered but unfocused terminal still needs to refresh its links.
+  // Only surfaces actually on screen need that refresh, so skip anything not currently visible.
   private func localEventFlagsChanged(_ event: NSEvent) -> NSEvent? {
     guard window != nil, window?.firstResponder !== self else { return event }
+    guard !isHiddenOrHasHiddenAncestor, lastOcclusion != false else { return event }
     flagsChanged(with: event)
     return event
   }
@@ -964,6 +1021,14 @@ final class GhosttySurfaceView: NSView, Identifiable {
     // Off-window backing conversion is 1x; re-measuring a detached view would
     // halve the applied size and poison the hibernation freeze.
     guard window != nil || !hasBeenInWindow else { return }
+    // A deselected worktree keeps its tree mounted and AppKit lays hidden
+    // subtrees out anyway, so a window resize would otherwise reflow every
+    // off-screen grid per drag frame. The very first size still applies: the
+    // PTY must never run at the placeholder grid.
+    if isHiddenOrHasHiddenAncestor, lastAppliedBackingSize != .zero {
+      needsSizeSyncOnReveal = true
+      return
+    }
     let backingSize = convertToBacking(contentSize ?? bounds.size)
     let currentSize = ghostty_surface_size(surface)
     let decision = ResizePolicy.decision(
@@ -1822,16 +1887,20 @@ final class GhosttySurfaceView: NSView, Identifiable {
   }
 
   private func keyboardLayoutId() -> String? {
-    let sources = [
-      TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-      TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-      TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
-    ]
+    if let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
+      return value as String
+    }
 
-    for source in sources.compactMap({ $0 }) {
-      guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
-        continue
-      }
+    if let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
+      return value as String
+    }
+
+    if let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
       let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
       return value as String
     }
@@ -2216,14 +2285,14 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
     synchronizeScrollView()
     synchronizeSurfaceView()
     synchronizeCoreSurface()
-    // This wrapper is the tint's subtract mask; the rebuild runs inline so
-    // the hole lands in the same frame as the surface's geometry.
-    NotificationCenter.default.post(name: .ghosttyTintMaskRegionDidChange, object: self)
+    // This wrapper is the tint's subtract mask, so its hole follows the
+    // surface's geometry.
+    WindowTintMaskRegistry.regionGeometryDidChange(self)
   }
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
-    NotificationCenter.default.post(name: .ghosttyTintMaskRegionDidChange, object: self)
+    WindowTintMaskRegistry.regionDidMoveToWindow(self)
   }
 
   func updateSurfaceSize() {

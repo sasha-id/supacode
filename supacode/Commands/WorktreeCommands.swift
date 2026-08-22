@@ -5,10 +5,6 @@ import SupacodeSettingsFeature
 import SupacodeSettingsShared
 import SwiftUI
 
-#if DEBUG
-  private nonisolated let commandsRenderLogger = SupaLogger("DetailRender")
-#endif
-
 /// Umbrella that wires the worktree-related menu-bar contributions. Each
 /// child is its own `Commands` struct so SwiftUI re-renders only the one
 /// whose observed inputs changed; e.g. the static Select Worktree submenu
@@ -37,9 +33,6 @@ private struct WorktreeMainMenu: Commands {
   @FocusedValue(\.stopRunScriptAction) private var stopRunScriptAction
 
   var body: some Commands {
-    #if DEBUG
-      let _: Void = commandsRenderLogger.info("WorktreeMainMenu.body re-rendered")
-    #endif
     let snapshot = store.worktreeMenuSnapshot
     let overrides = snapshot.shortcutOverrides
     let selectNext = AppShortcuts.selectNextWorktree.effective(from: overrides)
@@ -191,9 +184,6 @@ private struct WorktreeFileMenu: Commands {
   @FocusedValue(\.confirmWorktreeAction) private var confirmWorktreeAction
 
   var body: some Commands {
-    #if DEBUG
-      let _: Void = commandsRenderLogger.info("WorktreeFileMenu.body re-rendered")
-    #endif
     let overrides = store.worktreeMenuSnapshot.shortcutOverrides
     let openRepo = AppShortcuts.openRepository.effective(from: overrides)
     let addRemoteRepo = AppShortcuts.addRemoteRepository.effective(from: overrides)

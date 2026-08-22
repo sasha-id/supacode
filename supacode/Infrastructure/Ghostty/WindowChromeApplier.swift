@@ -5,6 +5,21 @@ import SwiftUI
 
 private nonisolated let chromeLogger = SupaLogger("WindowChrome")
 
+/// The undocumented CoreGraphics window-server calls Ghostty uses to apply
+/// background blur (`ghostty_set_window_background_blur`); bound here so the
+/// opaque path can clear a radius that setter refuses to touch at opacity 1.
+private enum CGS {
+  @_silgen_name("CGSSetWindowBackgroundBlurRadius")
+  static func setWindowBackgroundBlurRadius(
+    _ connection: UnsafeMutableRawPointer,
+    _ windowNumber: UInt,
+    _ radius: Int32
+  ) -> Int32
+
+  @_silgen_name("CGSDefaultConnectionForThread")
+  static func defaultConnectionForThread() -> UnsafeMutableRawPointer
+}
+
 struct WindowAppearanceState: Equatable {
   let opacity: Double
   let isFullScreen: Bool
@@ -68,6 +83,24 @@ enum WindowChromeApplier {
     window.isOpaque = true
     window.titlebarAppearsTransparent = !next.isFullScreen
     window.backgroundColor = tintColor
+    // Ghostty's blur setter early-returns at full opacity, so flipping from
+    // translucent to opaque would leave the compositor blur registered on the
+    // window; clear it through the same connection Ghostty set it on.
+    if window.windowNumber > 0 {
+      _ = CGS.setWindowBackgroundBlurRadius(
+        CGS.defaultConnectionForThread(),
+        UInt(window.windowNumber),
+        0
+      )
+    }
+  }
+
+  // The surface holes only earn their keep while the background is translucent:
+  // at full opacity a hole reveals `window.backgroundColor`, which `apply()` has
+  // already set to this same tint, so the mask is invisible while still costing
+  // the region walk, a path rebuild, and an alpha-blended full-window layer.
+  nonisolated static func tintMaskIsNeeded(backgroundOpacity: Double) -> Bool {
+    backgroundOpacity < 1
   }
 
   // Even-odd mask inputs: the full `bounds` fill plus a hole per region, clipped
@@ -85,6 +118,15 @@ enum WindowChromeApplier {
       rects.append(clipped)
     }
     return rects
+  }
+
+  // The registry hands regions back in an unspecified order, and even-odd
+  // filling is order-independent, so holes are normalized to a stable order
+  // before the dedupe compares them.
+  nonisolated static func normalizedHoleRects(_ rects: [CGRect]) -> [CGRect] {
+    rects.sorted {
+      ($0.minY, $0.minX, $0.width, $0.height) < ($1.minY, $1.minX, $1.width, $1.height)
+    }
   }
 
   // Stable per-color key for the dedupe (NSColor equality is color-space fragile).
@@ -234,11 +276,12 @@ final class WindowChromeObserverNSView: NSView {
 }
 
 // Mounted from ContentView. Installs a single tint layer in the window's frame
-// view, behind the content view, carrying the focused-surface tint with each
-// terminal surface's rect masked OUT of it. The tint shows behind the chrome
-// (sidebar / toolbar / tab bar / empty detail); the surface holes reveal the
-// window blur so a translucent surface composites over blur, never over the
-// tint.
+// view, behind the content view, carrying the focused-surface tint so it shows
+// behind the chrome (sidebar / toolbar / tab bar / empty detail). While the
+// background is translucent each terminal surface's rect is masked OUT of it,
+// so the holes reveal the window blur and a surface composites over blur, never
+// over the tint. At full opacity — the default — the fill is opaque and no mask
+// is cut.
 struct WindowTintBackdrop: NSViewRepresentable {
   let runtime: GhosttyRuntime
 
@@ -299,9 +342,9 @@ final class WindowTintBackdropFinder: NSView {
 final class TintBackdropView: NSView {
   private let runtime: GhosttyRuntime
   private nonisolated(unsafe) var observers: [NSObjectProtocol] = []
-  // Coalesces the surface-rect walk to one rebuild per runloop tick: a worktree
-  // switch / split resize fires dozens of layout + frame notifications, and each
-  // synchronous rebuild walked the whole window hierarchy, which stalled the switch.
+  // One rebuild per runloop turn: a worktree switch, a split resize, and
+  // sustained terminal output each fire dozens of layout + region
+  // notifications, and re-cutting the mask layer on every one is pure churn.
   private var maskRebuildScheduled = false
 
   init(runtime: GhosttyRuntime) {
@@ -349,11 +392,11 @@ final class TintBackdropView: NSView {
         Task { @MainActor [weak self] in self?.refreshColor() }
       }
     )
-    // Rebuild inline (queue: nil runs on the posting main thread) so the mask
-    // tracks the region in the SAME frame its layout/attach/detach lands. A
-    // deferred rebuild lags a runloop: a vacated hole flashes the transparent
-    // backing. The post is from main and a rebuild only reads geometry, so it is
-    // safe to run inside the region's layout pass.
+    // Regions post from their own layout / attach / detach pass, always on main
+    // (queue: nil delivers inline there), so this only marks the mask dirty;
+    // the flush runs in a queued main-actor task, coalescing every post in
+    // the turn into one rebuild. That task is not ordered against the frame's
+    // CATransaction commit, so a vacated hole may trail its frame by one hop.
     observers.append(
       center.addObserver(
         forName: .ghosttyTintMaskRegionDidChange, object: nil, queue: nil
@@ -362,7 +405,7 @@ final class TintBackdropView: NSView {
         nonisolated(unsafe) let notification = notification
         MainActor.assumeIsolated {
           guard let self else { return }
-          // An attached region rebuilds only its own window's backdrop; a
+          // An attached region dirties only its own window's backdrop; a
           // detached one (window nil) may be leaving any window, so everyone
           // rebuilds and the vacated hole heals.
           if let region = notification.object as? NSView, let regionWindow = region.window,
@@ -370,18 +413,18 @@ final class TintBackdropView: NSView {
           {
             return
           }
-          self.rebuildMask()
+          self.setNeedsMaskRebuild()
         }
       }
     )
+    // A config reload can flip translucency in either direction, so this rebuilds
+    // straight away instead of marking dirty: `setNeedsMaskRebuild` is gated on
+    // translucency and would not schedule the pass that drops a stale mask.
     observers.append(
       center.addObserver(
         forName: .ghosttyRuntimeConfigDidChange, object: nil, queue: .main
       ) { [weak self] _ in
-        Task { @MainActor [weak self] in
-          self?.refreshColor()
-          self?.setNeedsMaskRebuild()
-        }
+        Task { @MainActor [weak self] in self?.refresh() }
       }
     )
   }
@@ -400,7 +443,12 @@ final class TintBackdropView: NSView {
       .withAlphaComponent(runtime.backgroundOpacity()).cgColor
   }
 
+  private var needsTintMask: Bool {
+    WindowChromeApplier.tintMaskIsNeeded(backgroundOpacity: runtime.backgroundOpacity())
+  }
+
   private func setNeedsMaskRebuild() {
+    guard needsTintMask else { return }
     guard !maskRebuildScheduled else { return }
     maskRebuildScheduled = true
     Task { @MainActor [weak self] in
@@ -410,32 +458,39 @@ final class TintBackdropView: NSView {
     }
   }
 
-  // Each mounted surface wrapper is punched as a hole so behind it there is
-  // only blur, and the surface paints its own OSC 11 color over that blur at
-  // the same opacity (no double background, seamless with the chrome). A
-  // wrapper posts from its own layout pass and the rebuild runs inline on
-  // that post, so the hole lands in the same pass as the geometry it tracks.
+  // While the background is translucent, each mounted surface wrapper is punched
+  // as a hole so behind it there is only blur, and the surface paints its own
+  // OSC 11 color over that blur at the same opacity (no double background,
+  // seamless with the chrome). An opaque background needs no holes, so the whole
+  // walk is skipped and any mask left from a translucent config is dropped.
   private var lastAppliedHoleRects: [CGRect]?
   private var lastAppliedMaskBounds = CGRect.null
 
   private func rebuildMask() {
-    guard layer != nil else { return }
+    guard let layer else { return }
+    guard needsTintMask else {
+      lastAppliedHoleRects = nil
+      lastAppliedMaskBounds = .null
+      layer.mask = nil
+      return
+    }
     var holeRects: [CGRect] = []
-    if let frameView = superview {
-      for region in Self.maskRegions(in: frameView)
+    if let window {
+      for region in WindowTintMaskRegistry.regions(in: window)
       where !region.isHiddenOrHasHiddenAncestor {
         let rect = region.convert(region.bounds, to: self)
         // `maskHoleRects` drops a hole spanning the whole backdrop (it would
         // even-odd-cancel the entire tint), so surface the doubled-tint outcome
-        // rather than let it drop silently like the no-superview branch below.
+        // rather than let it drop silently like the detached branch below.
         if rect.intersection(bounds) == bounds {
           chromeLogger.warning("Tint mask region spans the full backdrop; hole dropped, tint will double")
         }
         holeRects.append(rect)
       }
+      holeRects = WindowChromeApplier.normalizedHoleRects(holeRects)
     } else {
       // No holes get punched, so the tint would double behind the terminal body.
-      chromeLogger.warning("Tint backdrop has no superview; mask rebuilt without region holes")
+      chromeLogger.warning("Tint backdrop has no window; mask rebuilt without region holes")
     }
     // Most layout passes move nothing relative to the backdrop; skip the
     // layer churn when the mask would be identical.
@@ -452,22 +507,53 @@ final class TintBackdropView: NSView {
     mask.frame = bounds
     mask.path = path
     mask.fillRule = .evenOdd
-    layer?.mask = mask
-  }
-
-  private static func maskRegions(in root: NSView) -> [WindowTintMaskRegion] {
-    var result: [WindowTintMaskRegion] = []
-    if let region = root as? WindowTintMaskRegion {
-      result.append(region)
-    }
-    for subview in root.subviews {
-      result.append(contentsOf: maskRegions(in: subview))
-    }
-    return result
+    layer.mask = mask
   }
 }
 
 // A view whose bounds are cut out of the window tint (the terminal body over
-// which surfaces composite). Conformers drive the tint mask via
-// `.ghosttyTintMaskRegionDidChange` on layout and window attach/detach.
+// which surfaces composite). Conformers drive the tint mask through
+// `WindowTintMaskRegistry` on layout and window attach/detach.
 protocol WindowTintMaskRegion: NSView {}
+
+// The live mask regions, so a rebuild reads the mounted regions directly
+// instead of walking the window's view tree. Entries are weak: a region freed
+// without a detach (window teardown) drops out on its own.
+@MainActor
+enum WindowTintMaskRegistry {
+  private static let liveRegions = NSHashTable<NSView>.weakObjects()
+
+  // Attach registers, detach unregisters, and either way the mask has to be
+  // re-cut. The window a detaching region is leaving is no longer readable
+  // here, so the notification carries the region and each backdrop decides for
+  // itself whether the change is its own.
+  static func regionDidMoveToWindow(_ region: some WindowTintMaskRegion) {
+    let view: NSView = region
+    if view.window == nil {
+      liveRegions.remove(view)
+    } else {
+      liveRegions.add(view)
+    }
+    Self.postRegionDidChange(view)
+  }
+
+  // A registered region moved or resized within its window.
+  static func regionGeometryDidChange(_ region: some WindowTintMaskRegion) {
+    let view: NSView = region
+    Self.postRegionDidChange(view)
+  }
+
+  // A container hid or revealed whole branches without moving any region, so
+  // the mask has to be re-cut even though no region's geometry changed.
+  static func regionVisibilityDidChange(in container: NSView) {
+    Self.postRegionDidChange(container)
+  }
+
+  static func regions(in window: NSWindow) -> [NSView] {
+    liveRegions.allObjects.filter { $0.window === window }
+  }
+
+  private static func postRegionDidChange(_ region: NSView) {
+    NotificationCenter.default.post(name: .ghosttyTintMaskRegionDidChange, object: region)
+  }
+}

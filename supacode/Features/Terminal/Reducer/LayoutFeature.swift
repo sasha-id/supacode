@@ -121,6 +121,11 @@ struct LayoutFeature {
     /// The tab whose strip shows the inline rename field; owned here so the
     /// menu command reaches it and it survives structural rebuilds.
     var editingTabID: TabID?
+    /// Tabs whose surface is being built off the interaction turn. Their panes
+    /// render the wake placeholder instead of the unavailable state, and a
+    /// second wake for the same tab is ignored while one is in flight. Never
+    /// persisted.
+    var wakingTabs: Set<TabID> = []
     /// Panes shown in their own windows; the tree keeps their leaves as
     /// placeholders. Never persisted: a relaunch re-attaches them inline.
     var windowedPaneIDs: Set<PaneID> = []
@@ -130,10 +135,19 @@ struct LayoutFeature {
     @Presents var alert: AlertState<Action.Alert>?
   }
 
-  /// Events pushed by the content-runtime plumbing.
+  /// Events pushed by the content-runtime plumbing. Individual title reports
+  /// are NOT here: they arrive at keystroke frequency, so they land on the
+  /// content's own `TabChrome` and reach persistence through the snapshot
+  /// pull. Only the once-per-content commit below crosses into the layout.
   nonisolated enum RuntimeEvent: Equatable, Sendable {
     case killConfirmed(id: ContentID)
-    case titleChanged(id: ContentID, title: String)
+    /// A deferred wake finished provisioning the tab's content; the live
+    /// surface replaces the placeholder and the stored snapshot refreshes.
+    case wakeCompleted(tab: TabID)
+    /// The content's last reported title, handed back before the content
+    /// leaves the runtime; the chrome that carried it dies with it, and the
+    /// layout's own title is what the tab falls back to afterwards.
+    case titleCommitted(id: ContentID, title: String)
   }
 
   /// What `focusPane` aims at. One payload instead of two `focusPane`
@@ -191,6 +205,9 @@ struct LayoutFeature {
     case toggleZoom(paneID: PaneID)
     case hibernateTab(id: TabID)
     case wakeTab(id: TabID)
+    /// Drops a wake still in flight for a tab that stopped being worth showing
+    /// (it went hidden mid-deferral), so the spawn never runs.
+    case cancelWake(id: TabID)
     case runtime(RuntimeEvent)
     /// A content asked to close tabs in its pane; gated by the
     /// confirm-close-tab mode.
@@ -220,26 +237,41 @@ struct LayoutFeature {
 
   private static let logger = SupaLogger("LayoutFeature")
 
-  // Ratio drags and title reports arrive at frame rate and cannot alter
-  // structure; exempt them from the per-action layout walk.
+  // Ratio drags and the inline rename field arrive at frame rate and cannot
+  // alter structure; exempt them from the per-action layout walk.
   private static func isExemptFromConsistencyCheck(_ action: Action) -> Bool {
     switch action {
-    case .resizePane, .runtime(.titleChanged), .beginTabRename, .endTabRename:
+    case .resizePane, .beginTabRename, .endTabRename, .cancelWake:
       return true
     case .newTab, .splitPane, .closeTab, .closePane, .selectTab, .renameTab, .focusPane,
       .moveTab, .moveTabToSplit, .moveTabToSpanningSplit, .enterWindowMode, .exitWindowMode,
       .equalizePanes, .toggleZoom, .hibernateTab, .wakeTab, .runtime(.killConfirmed),
-      .contentRequestedClose, .contentRequestedNewTab, .contentRequestedSplit,
-      .contentRequestedFocus, .contentRequestedFocusSplit, .contentRequestedToggleZoom,
-      .contentRequestedResize, .contentRequestedGotoTab, .contentRequestedMoveTab, .alert:
+      .runtime(.wakeCompleted), .runtime(.titleCommitted), .contentRequestedClose, .contentRequestedNewTab,
+      .contentRequestedSplit, .contentRequestedFocus, .contentRequestedFocusSplit,
+      .contentRequestedToggleZoom, .contentRequestedResize, .contentRequestedGotoTab,
+      .contentRequestedMoveTab, .alert:
       return false
     }
+  }
+
+  /// How long a wake waits before building its surface. One 60 Hz frame, not
+  /// zero: a zero sleep resumes as a main-queue job that CFRunLoop drains in
+  /// the same iteration, ahead of the `kCFRunLoopBeforeWaiting` observer where
+  /// CoreAnimation commits the frame the interaction dirtied — so the build
+  /// would still land on the click's frame. Outlasting the iteration is what
+  /// makes the placeholder paint first.
+  static let wakeDeferral: Duration = .milliseconds(16)
+
+  /// Per-tab cancellation key for the in-flight wake provisioning.
+  nonisolated enum WakeID: Hashable, Sendable {
+    case tab(TabID)
   }
 
   @Dependency(ContentRuntime.self) private var contentRuntime
   @Dependency(ContentSessionKiller.self) private var sessionKiller
   @Dependency(LayoutContentFactory.self) private var layoutContentFactory
   @Dependency(SplitZoomPolicy.self) private var splitZoomPolicy
+  @Dependency(\.continuousClock) private var clock
   @Dependency(\.uuid) private var uuid
 
   var body: some Reducer<State, Action> {
@@ -304,6 +336,8 @@ struct LayoutFeature {
         return reduceHibernateTab(&state, tabID: tabID)
       case .wakeTab(let tabID):
         return reduceWakeTab(&state, tabID: tabID)
+      case .cancelWake(let tabID):
+        return cancelPendingWake(&state, tabID: tabID)
       case .runtime(let event):
         return reduceRuntimeEvent(&state, event: event)
       case .contentRequestedClose(let contentID, let scope):
@@ -566,19 +600,20 @@ extension LayoutFeature {
     guard var pane = state.layout.pane(containingTab: tabID), let index = pane.tabs.index(id: tabID) else {
       return .none
     }
-    let reaping = reap(pane.tabs[index].content.id, worktree: state.id)
-    releaseTabBookkeeping(&state, tabID: tabID)
+    let contentID = pane.tabs[index].content.id
+    let released = releaseTabBookkeeping(&state, tabID: tabID)
     pane.tabs.remove(at: index)
     guard !pane.tabs.isEmpty else {
       collapse(&state, paneID: pane.id)
-      return reaping
+      // Cheap to reap inline: the detach defers the surface free off this turn.
+      return .merge(released, reap(contentID, worktree: state.id))
     }
     if pane.selectedTabID == tabID {
       // Selection retargets to the previous tab, else the first.
       pane.selectedTabID = index > 0 ? pane.tabs[index - 1].id : pane.tabs.first?.id
     }
     state.layout.panes[id: pane.id] = pane
-    return reaping
+    return .merge(released, reap(contentID, worktree: state.id))
   }
 
   private func reduceMoveTab(
@@ -704,53 +739,80 @@ extension LayoutFeature {
   }
 
   private func reduceHibernateTab(_ state: inout State, tabID: TabID) -> Effect<Action> {
+    // A wake still in flight would mount a surface into the tab that just
+    // asked to drop one.
+    let cancelWake = cancelPendingWake(&state, tabID: tabID)
     guard var pane = state.layout.pane(containingTab: tabID), let contentID = pane.tabs[id: tabID]?.content.id else {
-      return .none
+      return cancelWake
     }
     // Fetch before acting so a missing entry never hibernates without landing
     // its snapshot.
     guard let content = contentRuntime.content(for: contentID) else {
       Self.logger.warning("hibernateTab found no runtime content for \(contentID.rawValue)")
-      return .none
+      return cancelWake
     }
     content.hibernate()
     // Land the frozen grid recorded at hibernation in persisted state.
     pane.tabs[id: tabID]?.content = content.snapshot()
     state.layout.panes[id: pane.id] = pane
     state.renderEpoch &+= 1
-    return .none
+    return cancelWake
   }
 
+  /// Marks the tab as waking and hands the surface build to an effect. Nothing
+  /// libghostty or zmx touches may run here: `ghostty_surface_new` compiles
+  /// Metal pipelines, spawns threads, and forks a PTY that re-attaches zmx, and
+  /// on the switch path all of that would land before the click's frame paints.
   private func reduceWakeTab(_ state: inout State, tabID: TabID) -> Effect<Action> {
     guard let pane = state.layout.pane(containingTab: tabID), let snapshot = pane.tabs[id: tabID]?.content else {
       return .none
     }
+    // Ignore-if-waking: a second wake would build a duplicate session behind
+    // the one already in flight.
+    guard !state.wakingTabs.contains(tabID) else { return .none }
+    // A live renderer needs nothing; the wake senders fire on every tab
+    // selection, so this is the common case.
+    guard contentRuntime.content(for: snapshot.id)?.renderer == nil else { return .none }
     let geometry = Self.wakeGeometry(for: snapshot)
-    if let content = contentRuntime.content(for: snapshot.id) {
-      content.startSession(at: geometry)
-      landWokenSnapshot(&state, tabID: tabID, content: content)
-      state.renderEpoch &+= 1
-      return .none
-    }
-    // Post-relaunch the runtime is empty; rebuild the content from stored
-    // state, whatever its kind.
-    let content = layoutContentFactory.make(
-      ContentRequest(
-        worktreeID: state.id,
-        tabID: tabID,
-        contentID: snapshot.id,
-        content: snapshot.state,
-        origin: .restored,
-        inheritedFrom: nil
-      )
-    )
-    guard contentRuntime.provision(content, at: geometry) else {
-      Self.logger.warning("wakeTab provision refused for \(snapshot.id.rawValue)")
-      return .none
-    }
-    landWokenSnapshot(&state, tabID: tabID, content: content)
+    let worktreeID = state.id
+    state.wakingTabs.insert(tabID)
     state.renderEpoch &+= 1
-    return .none
+    return .run { @MainActor [contentRuntime, layoutContentFactory, clock] send in
+      // A clock sleep rather than a bare await: it puts the build past the
+      // runloop iteration that commits the interaction's frame, it is the
+      // effect's cancellation point, and a test clock can hold it open long
+      // enough to assert what a second wake or a hibernate does mid-flight.
+      try await clock.sleep(for: Self.wakeDeferral)
+      if let content = contentRuntime.content(for: snapshot.id) {
+        content.startSession(at: geometry)
+      } else {
+        // Post-relaunch the runtime is empty; rebuild the content from stored
+        // state, whatever its kind.
+        let content = layoutContentFactory.make(
+          ContentRequest(
+            worktreeID: worktreeID,
+            tabID: tabID,
+            contentID: snapshot.id,
+            content: snapshot.state,
+            origin: .restored,
+            inheritedFrom: nil
+          )
+        )
+        if !contentRuntime.provision(content, at: geometry) {
+          Self.logger.warning("wakeTab provision refused for \(snapshot.id.rawValue)")
+        }
+      }
+      send(.runtime(.wakeCompleted(tab: tabID)))
+    }
+    .cancellable(id: WakeID.tab(tabID))
+  }
+
+  /// Drops a pending wake and cancels its effect; `.none` when none was in
+  /// flight, so ordinary closes and hibernations stay epoch-neutral.
+  private func cancelPendingWake(_ state: inout State, tabID: TabID) -> Effect<Action> {
+    guard state.wakingTabs.remove(tabID) != nil else { return .none }
+    state.renderEpoch &+= 1
+    return .cancel(id: WakeID.tab(tabID))
   }
 
   /// Refreshes the tab's stored snapshot from the now-live content so a wake
@@ -799,7 +861,10 @@ extension LayoutFeature {
       origin: .split,
       inheritedFrom: spec.inheritedFrom
     )
-    guard provisionContent(request, at: spec.geometry, operation: "splitPane") else { return .none }
+    guard
+      provisionContent(
+        request, at: spec.geometry, splitAxis: Self.splitAxis(for: direction), operation: "splitPane")
+    else { return .none }
     let paneID = PaneID(rawValue: uuid())
     do {
       // `inserting` clears zoom by design: the new pane must be visible.
@@ -823,6 +888,16 @@ extension LayoutFeature {
       focus(&state, paneID: paneID)
     }
     return .none
+  }
+
+  /// The split's geometry axis: left/right place panes side by side and
+  /// halve width, top/down stack them and halve height. Mirrors
+  /// `SplitTree.inserting(view:at:direction:)`'s direction-to-axis mapping.
+  private static func splitAxis(for direction: SplitTree<PaneID>.NewDirection) -> SplitDirection {
+    switch direction {
+    case .left, .right: .horizontal
+    case .top, .down: .vertical
+    }
   }
 
   /// Enters window mode for a pane: its leaf stays in the tree as a
@@ -909,13 +984,16 @@ extension LayoutFeature {
 
   private func reduceClosePane(_ state: inout State, paneID: PaneID) -> Effect<Action> {
     guard let pane = state.layout.panes[id: paneID] else { return .none }
-    // Merged: one hung kill must not queue the siblings behind it.
-    let reaping = Effect<Action>.merge(pane.tabs.map { reap($0.content.id, worktree: state.id) })
+    var released: [Effect<Action>] = []
     for tab in pane.tabs {
-      releaseTabBookkeeping(&state, tabID: tab.id)
+      released.append(releaseTabBookkeeping(&state, tabID: tab.id))
     }
     collapse(&state, paneID: paneID)
-    return reaping
+    // The close stays cheap because reap's detach defers the surface free off
+    // this turn; both run inside one reduce, so SwiftUI sees a single state
+    // transition either way. Merged: one hung kill must not queue the
+    // siblings behind it.
+    return .merge(released + pane.tabs.map { reap($0.content.id, worktree: state.id) })
   }
 
   private func reduceResizePane(_ state: inout State, node: SplitTree<PaneID>.Node, ratio: Double) -> Effect<Action> {
@@ -932,11 +1010,13 @@ extension LayoutFeature {
     return .none
   }
 
-  /// Drops a closing tab's transient per-tab state.
-  private func releaseTabBookkeeping(_ state: inout State, tabID: TabID) {
+  /// Drops a closing tab's transient per-tab state, returning the cancellation
+  /// its in-flight wake needs.
+  private func releaseTabBookkeeping(_ state: inout State, tabID: TabID) -> Effect<Action> {
     if state.editingTabID == tabID {
       state.editingTabID = nil
     }
+    return cancelPendingWake(&state, tabID: tabID)
   }
 
   /// Removes a pane's leaf and the pane, retargeting focus to the neighbor
@@ -1035,13 +1115,18 @@ extension LayoutFeature {
     switch event {
     case .killConfirmed(let contentID):
       contentRuntime.confirmKill(contentID)
-    case .titleChanged(let contentID, let title):
+    case .wakeCompleted(let tabID):
+      guard state.wakingTabs.remove(tabID) != nil else { break }
+      // The placeholder gives way to the live surface here, not at wake time.
+      state.renderEpoch &+= 1
+      guard let contentID = state.layout.pane(containingTab: tabID)?.tabs[id: tabID]?.content.id,
+        let content = contentRuntime.content(for: contentID)
+      else { break }
+      landWokenSnapshot(&state, tabID: tabID, content: content)
+    case .titleCommitted(let contentID, let title):
       guard let located = state.layout.tab(containingContent: contentID) else { break }
       // A script tab owns its title; shell reports must not overwrite it.
-      guard !located.tab.isLocked else { break }
-      // TUIs rewrite their title constantly; skip no-op writes so an unchanged
-      // title does not re-render the tab strip on every report.
-      guard located.tab.title != title else { break }
+      guard !located.tab.isLocked, located.tab.title != title else { break }
       var pane = located.pane
       pane.tabs[id: located.tab.id]?.title = title
       state.layout.panes[id: pane.id] = pane
@@ -1093,13 +1178,18 @@ extension LayoutFeature {
 
   /// Creates and provisions content; false when the runtime refuses
   /// (tombstoned or already registered), dropping the freshly made content
-  /// unprovisioned.
+  /// unprovisioned. `splitAxis`, when given, halves `geometry` along that
+  /// axis first: a split's new surface spawns near its post-layout size
+  /// instead of the anchor's full size, one PTY grid alloc/reflow/SIGWINCH
+  /// cheaper than spawning full-size and correcting after mount.
   private func provisionContent(
     _ request: ContentRequest,
     at geometry: ContentGeometry,
+    splitAxis: SplitDirection? = nil,
     operation: StaticString
   ) -> Bool {
     let content = layoutContentFactory.make(request)
+    let geometry = splitAxis.map(geometry.halved(along:)) ?? geometry
     guard contentRuntime.provision(content, at: geometry) else {
       Self.logger.warning("\(operation) provision refused for content \(request.contentID.rawValue)")
       return false

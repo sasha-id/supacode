@@ -69,6 +69,10 @@ public struct TerminalSettingsView: View {
           Text("Supacode terminal theme")
           Text("When off, honors your Ghostty config theme.")
         }
+        Toggle(isOn: $store.terminalTranslucencyEnabled) {
+          Text("Translucent background")
+          Text("Blurs the window behind the terminal. Costs GPU time on every frame.")
+        }
       }
       Section("Persistence") {
         Toggle(isOn: $store.terminateSessionsOnQuit) {

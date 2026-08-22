@@ -265,8 +265,8 @@ struct SupacodeApp: App {
         preservesZoomOnNavigation: { runtime.splitPreserveZoomOnNavigation() }
       )
       values[LayoutChangeObserver.self] = LayoutChangeObserver(
-        layoutChanged: { worktreeID in
-          terminalManager.handleLayoutChanged(for: worktreeID)
+        layoutChanged: { worktreeID, scope in
+          terminalManager.handleLayoutChanged(for: worktreeID, scope: scope)
         }
       )
       values.terminalClient = TerminalClient(

@@ -131,6 +131,54 @@ struct WorktreeContentHostTests {
     host.trackBlockingScript(kind: .archive, tabID: tabID, launchDirectory: nil)
     #expect(content.terminalChrome.isReadOnly == false)
   }
+
+  @Test(.dependencies) func aReportedTitleLandsOnTheChromeAndRearmsPersistenceOnce() {
+    let surfaceID = UUID()
+    let contentID = ContentID(rawValue: surfaceID)
+    let runtime = ContentRuntime()
+    let content = ChromeTabContent(id: contentID)
+    #expect(runtime.provision(content, at: .fallback))
+    let host = makeHost(layout: singleTabLayout(contentID: surfaceID), runtime: runtime)
+    var sentLayoutActions = 0
+    var persistenceRearms = 0
+    host.sendLayoutAction = { _ in sentLayoutActions += 1 }
+    host.onReportedTitleChanged = { persistenceRearms += 1 }
+
+    host.updateReportedTitle(for: contentID, title: "claude")
+    // An unchanged report is dropped before it can touch the chrome.
+    host.updateReportedTitle(for: contentID, title: "claude")
+
+    #expect(content.terminalChrome.reportedTitle == "claude")
+    #expect(persistenceRearms == 1)
+    // The whole point: a title storm never reaches the store.
+    #expect(sentLayoutActions == 0)
+  }
+
+  @Test func theFocusedContentReclaimsFirstResponderOnlyWhileSelected() {
+    let surfaceID = UUID()
+    let host = makeHost(layout: singleTabLayout(contentID: surfaceID))
+
+    host.isSelected = { true }
+    #expect(host.shouldClaimFocus(surfaceID))
+
+    // A deselected worktree keeps its tree mounted, so a remount inside it must
+    // not pull first responder off the worktree on screen.
+    host.isSelected = { false }
+    #expect(!host.shouldClaimFocus(surfaceID))
+  }
+
+  @Test func aWindowedPaneReclaimsFirstResponderWhileTheWorktreeIsDeselected() {
+    let surfaceID = UUID()
+    let layout = singleTabLayout(contentID: surfaceID)
+    let host = makeHost(layout: layout)
+    let paneID = layout.panes[0].id
+
+    host.isSelected = { false }
+    host.windowedPaneIDs = { [paneID] }
+
+    // The pane owns its own window's focus, whichever worktree is selected.
+    #expect(host.shouldClaimFocus(surfaceID))
+  }
 }
 
 /// Pins the render-host claim invariants the steal-proof mount depends on.

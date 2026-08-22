@@ -103,6 +103,27 @@ struct ContentGeometryTests {
     window.orderOut(nil)
   }
 
+  @Test func halvedAlongHorizontalHalvesWidthAndKeepsHeightAndScale() throws {
+    let geometry = try #require(
+      ContentGeometry.candidate(pointSize: CGSize(width: 1600, height: 1200), scale: 2))
+    let halved = geometry.halved(along: .horizontal)
+    #expect(halved.pixelSize == CGSize(width: 1600, height: 2400))
+    #expect(halved.scale == 2)
+  }
+
+  @Test func halvedAlongVerticalHalvesHeightAndKeepsWidthAndScale() throws {
+    let geometry = try #require(
+      ContentGeometry.candidate(pointSize: CGSize(width: 800, height: 600), scale: 2))
+    let halved = geometry.halved(along: .vertical)
+    #expect(halved.pixelSize == CGSize(width: 1600, height: 600))
+    #expect(halved.scale == 2)
+  }
+
+  @Test func halvedFloorsAnOddPixelExtent() throws {
+    let geometry = try #require(ContentGeometry.candidate(pointSize: CGSize(width: 401, height: 300), scale: 1))
+    #expect(geometry.halved(along: .horizontal).pixelSize == CGSize(width: 200, height: 300))
+  }
+
   @Test @MainActor func resolveSkipsADegenerateMountedAnchorForTheNextOne() {
     let window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),

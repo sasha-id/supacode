@@ -115,6 +115,55 @@ struct GhosttyRuntimeBundledOverridesTests {
     }
   }
 
+  // Opaque is the performance default: with both settings off, nothing forces
+  // background-opacity/blur, so the terminal renders at Ghostty's own opaque
+  // default and a user's own config is free to set its own opacity unopposed.
+  @Test func bundledThemeLinesEmptyWhenThemeSyncAndTranslucencyAreOff() {
+    let lines = GhosttyRuntime.bundledThemeLines(
+      themeSyncEnabled: false,
+      translucencyEnabled: false,
+      lightThemePath: "/light",
+      darkThemePath: "/dark"
+    )
+    #expect(lines.isEmpty)
+  }
+
+  @Test func bundledThemeLinesOmitThemeWhenSyncIsOff() {
+    let lines = GhosttyRuntime.bundledThemeLines(
+      themeSyncEnabled: false,
+      translucencyEnabled: true,
+      lightThemePath: "/light",
+      darkThemePath: "/dark"
+    )
+    #expect(!lines.contains { $0.hasPrefix("theme =") })
+    #expect(lines.contains("background-opacity = 0.9"))
+    #expect(lines.contains("background-blur = true"))
+  }
+
+  @Test func bundledThemeLinesOmitOpacityAndBlurWhenTranslucencyIsOff() {
+    let lines = GhosttyRuntime.bundledThemeLines(
+      themeSyncEnabled: true,
+      translucencyEnabled: false,
+      lightThemePath: "/light",
+      darkThemePath: "/dark"
+    )
+    #expect(lines.contains("theme = light:/light,dark:/dark"))
+    #expect(!lines.contains { $0.hasPrefix("background-opacity") })
+    #expect(!lines.contains { $0.hasPrefix("background-blur") })
+  }
+
+  @Test func bundledThemeLinesIncludeBothWhenEnabled() {
+    let lines = GhosttyRuntime.bundledThemeLines(
+      themeSyncEnabled: true,
+      translucencyEnabled: true,
+      lightThemePath: "/light",
+      darkThemePath: "/dark"
+    )
+    #expect(lines.contains("theme = light:/light,dark:/dark"))
+    #expect(lines.contains("background-opacity = 0.9"))
+    #expect(lines.contains("background-blur = true"))
+  }
+
   /// `TERM_PROGRAM` reports Supacode with its version (issue #440).
   @Test func terminalProgramOverridesIdentifySupacode() {
     let overrides = GhosttyRuntime.terminalProgramOverrides(version: "1.2.3")

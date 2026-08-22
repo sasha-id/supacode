@@ -69,11 +69,19 @@ final class CommandKeyObserver {
       }
     }
     // Flip immediately; consumers fade the visual change in/out themselves.
+    guard isPressed != isDown else { return }
     isPressed = isDown
   }
 
   private static func resolvedTabSelectionHints() -> [String?] {
     @Shared(.settingsFile) var settingsFile
     return AppShortcuts.tabSelectionShortcutDisplays(overrides: settingsFile.global.shortcutOverrides)
+  }
+}
+
+/// Identity equality, so the views carrying this reference stay diffable.
+extension CommandKeyObserver: Equatable {
+  nonisolated static func == (lhs: CommandKeyObserver, rhs: CommandKeyObserver) -> Bool {
+    lhs === rhs
   }
 }

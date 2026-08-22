@@ -108,6 +108,34 @@ struct GhosttySurfaceBridgeTests {
     }
   }
 
+  // A true return tells core a native child-exited UI was shown, which is
+  // what keeps it from printing "Process exited. Press any key to close the
+  // terminal." into the grid during the probe-then-close window.
+  @Test func routineChildExitClaimsCoreNotice() {
+    let bridge = GhosttySurfaceBridge()
+    var exitCode: UInt32?
+    bridge.onChildExited = { exitCode = $0 }
+
+    var action = ghostty_action_s()
+    action.tag = GHOSTTY_ACTION_SHOW_CHILD_EXITED
+    action.action.child_exited = ghostty_surface_message_childexited_s(exit_code: 0, timetime_ms: 5000)
+
+    #expect(bridge.handleAction(target: ghostty_target_s(), action: action))
+    #expect(exitCode == 0)
+    #expect(bridge.state.childExitTimeMs == 5000)
+  }
+
+  // At or below core's 250ms abnormal-exit threshold the surface stays open,
+  // so core's in-terminal diagnostics must be allowed to paint.
+  @Test func abnormalChildExitLeavesCoreDiagnosticsToPaint() {
+    let bridge = GhosttySurfaceBridge()
+    var action = ghostty_action_s()
+    action.tag = GHOSTTY_ACTION_SHOW_CHILD_EXITED
+    action.action.child_exited = ghostty_surface_message_childexited_s(exit_code: 1, timetime_ms: 250)
+
+    #expect(!bridge.handleAction(target: ghostty_target_s(), action: action))
+  }
+
   @Test func desktopNotificationEmitsCallback() {
     let bridge = GhosttySurfaceBridge()
     var received: (title: String, body: String)?
