@@ -23,6 +23,12 @@ enum LayoutPersistence {
         let live = runtime.content(for: contentID)
         if let live {
           overlaid.panes[paneIndex].tabs[tabIndex].content = live.snapshot()
+          // Reported titles never enter the layout reducer, so the saved record
+          // pulls the content's latest one here; this is their only path to disk.
+          overlaid.panes[paneIndex].tabs[tabIndex].title = TabTitle.stored(
+            for: overlaid.panes[paneIndex].tabs[tabIndex],
+            chrome: live.chrome
+          )
         }
         guard case .terminal(let state) = overlaid.panes[paneIndex].tabs[tabIndex].content.state
         else { continue }

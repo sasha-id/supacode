@@ -392,6 +392,7 @@ private struct PaneTabView: View {
     HStack(spacing: TerminalTabBarMetrics.contentSpacing) {
       PaneTabLabelView(
         tab: tab,
+        title: displayTitle(chrome: chrome),
         isSelected: isSelected,
         isDormant: isDormant,
         accessory: chrome?.accessory,
@@ -554,8 +555,14 @@ private struct PaneTabView: View {
     .contextMenu { contextMenuItems }
   }
 
+  /// Reads the content's reported title through its observable chrome, so an
+  /// agent rewriting its title invalidates this tab's label and nothing else.
+  private func displayTitle(chrome: (any TabChrome)?) -> String {
+    TabTitle.resolved(for: tab, chrome: chrome)
+  }
+
   private var displayTitle: String {
-    tab.customTitle ?? tab.title
+    TabTitle.resolved(for: tab, runtime: runtime)
   }
 
   private var contentOpacity: Double {
@@ -679,6 +686,7 @@ private struct PaneTabView: View {
 /// title.
 private struct PaneTabLabelView: View {
   let tab: TabItem
+  let title: String
   let isSelected: Bool
   let isDormant: Bool
   let accessory: AnyView?
@@ -713,7 +721,7 @@ private struct PaneTabLabelView: View {
           .accessibilityHidden(true)
       }
       PaneTabTitleLabel(
-        title: tab.customTitle ?? tab.title,
+        title: title,
         isSelected: isSelected,
         isShimmering: isShimmering
       )

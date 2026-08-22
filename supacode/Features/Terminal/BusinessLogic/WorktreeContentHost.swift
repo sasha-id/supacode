@@ -27,6 +27,10 @@ final class WorktreeContentHost {
   /// Routes a topology mutation into the worktree's `LayoutFeature`.
   @ObservationIgnored var sendLayoutAction: (LayoutFeature.Action) -> Void = { _ in }
   @ObservationIgnored var onNotificationReceived: ((UUID, String, String, Bool) -> Void)?
+  /// A content reported a new title. Nothing in TCA moved — the title lives on
+  /// the content's chrome — so this exists only to re-arm the persistence
+  /// debounce, which pulls the title back at snapshot time.
+  @ObservationIgnored var onReportedTitleChanged: (() -> Void)?
   @ObservationIgnored var onNotificationIndicatorChanged: (() -> Void)?
   @ObservationIgnored var onFocusChanged: ((UUID) -> Void)?
   @ObservationIgnored var onFocusedSurfaceColorChanged: (() -> Void)?
@@ -538,7 +542,22 @@ final class WorktreeContentHost {
   /// The tab's content-owned strip chrome, nil for non-terminal contents.
   private func terminalChrome(for tabID: TabID) -> TerminalTabChrome? {
     guard let contentID = tab(withID: tabID)?.content.id else { return nil }
-    return runtime.content(for: contentID)?.chrome as? TerminalTabChrome
+    return terminalChrome(for: contentID)
+  }
+
+  private func terminalChrome(for contentID: ContentID) -> TerminalTabChrome? {
+    runtime.content(for: contentID)?.chrome as? TerminalTabChrome
+  }
+
+  /// A live or dormant terminal reported a title. Agent TUIs rewrite it several
+  /// times a second, so it lands on the content's observable chrome — only the
+  /// one tab label re-renders — and never as a layout action. The lock is
+  /// resolved at display and snapshot time, so a script tab's title survives
+  /// its shell's reports.
+  func updateReportedTitle(for contentID: ContentID, title: String) {
+    guard let chrome = terminalChrome(for: contentID), chrome.reportedTitle != title else { return }
+    chrome.reportedTitle = title
+    onReportedTitleChanged?()
   }
 
   func emitTaskStatusIfChanged() {
@@ -690,7 +709,7 @@ final class WorktreeContentHost {
     if tabID(containing: surfaceID) != nil,
       let title = liveSurface(surfaceID)?.bridge.state.title, !title.isEmpty
     {
-      sendLayoutAction(.runtime(.titleChanged(id: ContentID(rawValue: surfaceID), title: title)))
+      updateReportedTitle(for: ContentID(rawValue: surfaceID), title: title)
     }
     emitFocusChangedIfNeeded(surfaceID)
   }
@@ -1189,7 +1208,7 @@ final class WorktreeContentHost {
   private func updateDormantTabTitle(surfaceID: UUID, title: String) {
     let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, isDormantSurface(surfaceID) else { return }
-    sendLayoutAction(.runtime(.titleChanged(id: ContentID(rawValue: surfaceID), title: trimmed)))
+    updateReportedTitle(for: ContentID(rawValue: surfaceID), title: trimmed)
   }
 
   /// Full teardown on prune or quit: watchers stop, bookkeeping clears.

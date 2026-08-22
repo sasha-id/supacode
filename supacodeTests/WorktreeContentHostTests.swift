@@ -132,6 +132,28 @@ struct WorktreeContentHostTests {
     #expect(content.terminalChrome.isReadOnly == false)
   }
 
+  @Test(.dependencies) func aReportedTitleLandsOnTheChromeAndRearmsPersistenceOnce() {
+    let surfaceID = UUID()
+    let contentID = ContentID(rawValue: surfaceID)
+    let runtime = ContentRuntime()
+    let content = ChromeTabContent(id: contentID)
+    #expect(runtime.provision(content, at: .fallback))
+    let host = makeHost(layout: singleTabLayout(contentID: surfaceID), runtime: runtime)
+    var sentLayoutActions = 0
+    var persistenceRearms = 0
+    host.sendLayoutAction = { _ in sentLayoutActions += 1 }
+    host.onReportedTitleChanged = { persistenceRearms += 1 }
+
+    host.updateReportedTitle(for: contentID, title: "claude")
+    // An unchanged report is dropped before it can touch the chrome.
+    host.updateReportedTitle(for: contentID, title: "claude")
+
+    #expect(content.terminalChrome.reportedTitle == "claude")
+    #expect(persistenceRearms == 1)
+    // The whole point: a title storm never reaches the store.
+    #expect(sentLayoutActions == 0)
+  }
+
   @Test func theFocusedContentReclaimsFirstResponderOnlyWhileSelected() {
     let surfaceID = UUID()
     let host = makeHost(layout: singleTabLayout(contentID: surfaceID))

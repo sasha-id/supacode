@@ -80,10 +80,11 @@ struct LayoutChangeScopeTests {
     #expect(TerminalsFeature.changeScope(.endTabRename) == .bookkeeping)
     #expect(TerminalsFeature.changeScope(.beginTabRename(id: TabID())) == .bookkeeping)
     #expect(
-      TerminalsFeature.changeScope(.runtime(.titleChanged(id: ContentID(), title: "zsh"))) == .bookkeeping
-    )
-    #expect(
       TerminalsFeature.changeScope(.resizePane(node: .leaf(view: PaneID()), ratio: 0.4)) == .bookkeeping
+    )
+    // A teardown title commit moves no surface; it only has to re-arm the save.
+    #expect(
+      TerminalsFeature.changeScope(.runtime(.titleCommitted(id: ContentID(), title: "zsh"))) == .bookkeeping
     )
   }
 

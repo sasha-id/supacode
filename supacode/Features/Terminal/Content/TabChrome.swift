@@ -16,6 +16,41 @@ protocol TabChrome: AnyObject {
   /// Whether the terminal refuses input (a completed blocking script's parked
   /// shell). The tab's own `isLocked` drives the visible lock marker.
   var isReadOnly: Bool { get }
+  /// The title the content last reported, nil until it reports one. Agent TUIs
+  /// rewrite it several times a second, which is why it lives here instead of
+  /// in the layout reducer.
+  var reportedTitle: String? { get }
+}
+
+extension TabChrome {
+  // Content kinds that never report a title fall back to the layout's own.
+  var reportedTitle: String? { nil }
+}
+
+/// Resolves what a tab shows, and what the layout should store for it, from the
+/// layout's own title and the content's live report.
+@MainActor
+enum TabTitle {
+  /// The title the record persists: the content's live report when it has one,
+  /// else what the layout already holds. A locked (blocking-script) tab owns
+  /// its title for its whole life, so a shell report never reaches it. The
+  /// user's override is deliberately excluded — it persists in its own field,
+  /// and folding it in here would make clearing it restore the override text.
+  static func stored(for tab: TabItem, chrome: (any TabChrome)?) -> String {
+    guard !tab.isLocked, let reported = chrome?.reportedTitle, !reported.isEmpty else {
+      return tab.title
+    }
+    return reported
+  }
+
+  /// What the tab displays: a user override wins over the reported title.
+  static func resolved(for tab: TabItem, chrome: (any TabChrome)?) -> String {
+    tab.customTitle ?? stored(for: tab, chrome: chrome)
+  }
+
+  static func resolved(for tab: TabItem, runtime: ContentRuntime) -> String {
+    resolved(for: tab, chrome: runtime.content(for: tab.content.id)?.chrome)
+  }
 }
 
 /// Terminal chrome, written by the content host and the agent-presence
@@ -27,6 +62,7 @@ final class TerminalTabChrome: TabChrome {
   var isWorking = false
   var progress: TerminalTabProgressDisplay?
   var isReadOnly = false
+  var reportedTitle: String?
 
   var accessory: AnyView? {
     guard !agents.isEmpty else { return nil }

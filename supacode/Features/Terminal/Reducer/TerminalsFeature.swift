@@ -79,13 +79,14 @@ struct TerminalsFeature {
 
   private static let logger = SupaLogger("TerminalsFeature")
 
-  // Ratio drags and title reports arrive at high frequency and can flip
-  // neither tab visibility nor anything the app-shell hooks re-derive; skip
-  // the layout-wide re-diff and the heavy hooks for them. Exhaustive so a new
+  // Ratio drags and the inline rename field arrive at high frequency, and a
+  // teardown title commit only relabels a tab; none of them flips tab
+  // visibility or anything the app-shell hooks re-derive, so skip the
+  // layout-wide re-diff and the heavy hooks for them. Exhaustive so a new
   // action has to declare itself; classify as `.structural` when unsure.
   static func changeScope(_ action: LayoutFeature.Action) -> LayoutChangeScope {
     switch action {
-    case .resizePane, .runtime(.titleChanged), .beginTabRename, .endTabRename:
+    case .resizePane, .beginTabRename, .endTabRename, .runtime(.titleCommitted):
       return .bookkeeping
     case .newTab, .splitPane, .closeTab, .closePane, .selectTab, .renameTab, .focusPane,
       .moveTab, .moveTabToSplit, .moveTabToSpanningSplit, .enterWindowMode, .exitWindowMode,
