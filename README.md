@@ -6,9 +6,35 @@ Run several coding agents side by side from one window: each task gets its own g
 its own real terminal. Sessions persist in the background, so quitting the app or dropping an SSH
 connection loses nothing.
 
-[supacode.sh](https://supacode.sh)
+> **This is a fork** of [supabitapp/supacode](https://github.com/supabitapp/supacode) — the
+> original project, by [@khoi](https://github.com/khoi) and contributors, lives upstream at
+> [supacode.sh](https://supacode.sh). All credit for the app belongs to the original authors.
+> This fork adds local build workarounds for newer Xcode toolchains and a performance
+> refactoring of the terminal and layout hot paths.
 
-<img width="3180" height="1788" alt="Supacode screenshot" src="https://github.com/user-attachments/assets/72a8dc95-020a-4dc2-9010-ba1adc9518ba" />
+## What's different in this fork
+
+### Performance refactoring
+
+The [`performance-refactoring`](https://github.com/sasha-id/supacode/tree/performance-refactoring)
+branch reworks the hot paths so the app stays responsive with many worktrees and tabs open:
+
+- Per-tab churn (terminal output, titles, activity) stays out of the root store, so a busy pane
+  no longer invalidates the whole app.
+- Switching worktrees is a visibility change instead of a view teardown and rebuild, and
+  hibernated tabs wake off the click path under an LRU policy.
+- The pane hosting chain is stable across updates and the render context is equatable, cutting
+  redundant SwiftUI and AppKit work.
+- Opaque backgrounds are the default, with window translucency as an explicit opt-in.
+- Sidebar recomputes are gated by classifying layout changes; surface teardown and chrome upkeep
+  run off the interaction path.
+- Unexpected pane closes are decided by a native zmx session probe, so routine exits blank the
+  pane and collapse the split in one beat instead of flashing an exit overlay.
+
+### Newer Xcode toolchains
+
+`main` carries local build hatches for machines where only Xcode 26.6+ is installed — see
+[below](#building-on-macos-264-tahoe).
 
 ## Features
 
@@ -78,7 +104,7 @@ you can bind an action to a hotkey or fire it from another app.
 ## Quick start
 
 ```bash
-git clone --recursive git@github.com:supabitapp/supacode.git
+git clone --recursive https://github.com/sasha-id/supacode.git
 cd supacode
 mise install
 make doctor    # check every build prerequisite and print fixes for anything missing
@@ -113,6 +139,23 @@ sudo DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer xcodebuild -r
 sudo DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer xcodebuild -downloadComponent MetalToolchain
 ```
 
+#### Without Xcode 26.3 (this fork)
+
+If you cannot install Xcode 26.3, this fork's `main` has hatches for building with Xcode 26.6:
+
+- `SUPACODE_ZIG_HAS_TBD_FIX=1` skips the Xcode 26.3 pin. Use it only when your Zig 0.15.2
+  carries the [`libSystem.tbd` backport](https://github.com/ziglang/zig/issues/31658) that can
+  link newer SDKs (Homebrew's `0.15.2_1` bottle does; the mise build does not).
+- `SUPACODE_GHOSTTY_SKIP_APP=1` skips building ghostty's own app bundle, which fails to link on
+  this toolchain; Supacode only consumes the xcframework.
+- `scripts/local/libtool` is prepended to `PATH` automatically during the ghostty build. It
+  replaces Xcode 26.6's `libtool`, which silently drops Zig-emitted objects it considers
+  misaligned from merged static archives, with an `ar`-based merge.
+
+```bash
+SUPACODE_ZIG_HAS_TBD_FIX=1 SUPACODE_GHOSTTY_SKIP_APP=1 make build-app
+```
+
 See [AGENTS.md](AGENTS.md) for the full rationale and the rest of the architecture.
 
 ## Development
@@ -131,10 +174,11 @@ make format  # swift-format only
 
 ## Contributing
 
-Contributions are reviewed personally, line by line, and a clear issue is worth more than a
-large pull request. Start by opening an issue, wait for the `ready` label, then open a focused
-pull request that links it. The full process, including the rule that a human (never an AI
-agent) is the accountable author, is in the [Contributing guide](CONTRIBUTING.md).
+Contributions to the app belong upstream at
+[supabitapp/supacode](https://github.com/supabitapp/supacode): open an issue there first, wait
+for the `ready` label, then open a focused pull request that links it. The full process,
+including the rule that a human (never an AI agent) is the accountable author, is in the
+[Contributing guide](CONTRIBUTING.md).
 
 - [Contributing guide](CONTRIBUTING.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
