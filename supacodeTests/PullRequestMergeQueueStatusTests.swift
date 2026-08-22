@@ -95,16 +95,19 @@ struct PullRequestMergeQueueStatusTests {
     #expect(PullRequestMergeQueueStatus(pullRequest: pullRequest) == nil)
   }
 
-  @Test func toolbarBadgeIsBrownWhenQueued() {
+  @Test func toolbarBadgeSeparatesQueuedFromPlainOpen() {
     let entry = GithubMergeQueueEntry(position: 1, estimatedTimeToMerge: nil, state: "QUEUED")
     let queued = makePullRequest(mergeQueueEntry: entry)
     let open = makePullRequest(mergeStateStatus: "CLEAN")
 
-    // The toolbar accessory badge tints brown to match the sidebar + popover.
-    #expect(
-      WorktreePullRequestDisplay(worktreeName: "feature", pullRequest: queued).pullRequestBadgeStyle?.color == .brown)
-    #expect(
-      WorktreePullRequestDisplay(worktreeName: "feature", pullRequest: open).pullRequestBadgeStyle?.color == .green)
+    // The toolbar accessory badge takes the same damped hues as the sidebar
+    // icon and the popover, so one queued pull request never reads two ways.
+    let queuedStyle = WorktreePullRequestDisplay(worktreeName: "feature", pullRequest: queued)
+      .pullRequestBadgeStyle
+    let openStyle = WorktreePullRequestDisplay(worktreeName: "feature", pullRequest: open)
+      .pullRequestBadgeStyle
+    #expect(queuedStyle?.color == .pullRequestQueued)
+    #expect(openStyle?.color == .pullRequestOpen)
   }
 
   @Test func sidebarIconResolvesQueued() {

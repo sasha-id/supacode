@@ -152,10 +152,10 @@ struct PullRequestChecksPopoverView: View {
             .resizable()
             .aspectRatio(contentMode: .fit)
             .frame(width: 14, height: 14)
-            .foregroundStyle(.brown)
+            .foregroundStyle(.pullRequestQueued)
             .accessibilityHidden(true)
           Text(status.summary)
-            .foregroundStyle(.brown)
+            .foregroundStyle(.pullRequestQueued)
         }
         .appFont(.subheadline)
         if let detail = status.detail {

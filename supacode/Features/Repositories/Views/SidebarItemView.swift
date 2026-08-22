@@ -268,8 +268,8 @@ enum SidebarCheckBadgeState: Equatable {
   var color: Color {
     switch self {
     case .passing: .checkSuccess
-    case .failing: .red
-    case .inProgress: .yellow
+    case .failing: .checkFailure
+    case .inProgress: .checkRunning
     }
   }
 
@@ -322,14 +322,17 @@ enum SidebarPullRequestIcon: Equatable {
     }
   }
 
+  /// `.branch` and `.draft` stay hierarchical rather than taking a damped hue:
+  /// "no pull request" and "not ready yet" are the absence of a state, and a
+  /// colour would claim they are one.
   var color: AnyShapeStyle {
     switch self {
     case .branch: AnyShapeStyle(.secondary)
-    case .open: AnyShapeStyle(.green)
+    case .open: AnyShapeStyle(.pullRequestOpen)
     case .draft: AnyShapeStyle(.tertiary)
-    case .queued: AnyShapeStyle(.brown)
-    case .merged: AnyShapeStyle(.purple)
-    case .closed: AnyShapeStyle(.red)
+    case .queued: AnyShapeStyle(.pullRequestQueued)
+    case .merged: AnyShapeStyle(.pullRequestMerged)
+    case .closed: AnyShapeStyle(.pullRequestClosed)
     }
   }
 
@@ -566,14 +569,12 @@ private struct IconContent: View, Equatable {
           .aspectRatio(contentMode: .fit)
           .fontWeight(.semibold)
           .foregroundStyle(folderColor)
-          .opacity(isEmphasized ? 1 : 0.6)
       } else {
         Image(icon.assetName)
           .renderingMode(.template)
           .resizable()
           .aspectRatio(contentMode: .fit)
           .foregroundStyle(isEmphasized ? AnyShapeStyle(.secondary) : icon.color)
-          .opacity(isEmphasized ? 1 : 0.6)
       }
     }
     .frame(width: SidebarNestLayout.leadingSlotWidth, height: 16)
@@ -597,6 +598,12 @@ private struct IconContent: View, Equatable {
           .offset(x: 2, y: 2)
       }
     }
+    // Fades the glyph and its badge together. Sitting on the glyph alone, this
+    // left the badge in the overlay at full strength over a 60% icon, so the
+    // check circle outshouted the icon it annotates on every row. One
+    // transparency layer for the composite also lets the badge's own circle
+    // cover the glyph beneath it instead of letting it bleed through.
+    .opacity(isEmphasized ? 1 : 0.75)
     .help(helpText)
     .accessibilityLabel(accessibilityLabel ?? "")
     .accessibilityHidden(accessibilityLabel == nil)
