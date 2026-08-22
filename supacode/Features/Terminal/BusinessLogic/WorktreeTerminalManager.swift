@@ -926,35 +926,33 @@ final class WorktreeTerminalManager {
   func handleUnexpectedZmxClose(_ view: GhosttySurfaceView, worktreeID: Worktree.ID) {
     let surfaceID = view.id
     Task { @MainActor [weak self] in
-      let probe = await self?.zmxClient.listSessionsWithClients()
+      // One native connect to this session's socket, never a `zmx ls` sweep:
+      // the listing subprocess round-trips every live session and blocks on
+      // the dying daemon for its kill grace period, which held the collapsed
+      // pane's empty chrome on screen for the whole wait.
+      let outcome = await self?.zmxClient.probeSession(ZmxSessionID.make(surfaceID: surfaceID))
       guard let self, let host = self.hosts[worktreeID], host.liveSurface(surfaceID) === view else { return }
       guard let tabID = host.tabID(containing: surfaceID) else { return }
-      let sessionID = ZmxSessionID.make(surfaceID: surfaceID)
-      let session = probe?.first { $0.name == sessionID }
-      guard let probe else {
-        // Failed probe: never destroy on no signal; close but spare the session.
-        self.sessionsToSpare.insert(surfaceID)
-        self.sendLayout(worktreeID, .closeTab(id: tabID))
-        return
-      }
-      _ = probe
-      guard let session else {
+      switch outcome {
+      case .dead:
         // Session already dead; the close's kill is local cleanup. The end
         // was not user-initiated, so a remote host-side session survives.
         self.sessionsToKillLocalOnly.insert(surfaceID)
         self.sendLayout(worktreeID, .closeTab(id: tabID))
-        return
-      }
-      if session.clients == 0 {
+      case .alive(otherClients: 0):
         // Reattachable: rebuild the same content at its persisted geometry.
         self.commitReportedTitle(of: ContentID(rawValue: surfaceID), worktreeID: worktreeID)
         ContentRuntime.liveValue.remove(ContentID(rawValue: surfaceID), tombstone: false)
         self.sendLayout(worktreeID, .wakeTab(id: tabID))
-        return
+      case .alive:
+        // Another client attached: close without killing.
+        self.sessionsToSpare.insert(surfaceID)
+        self.sendLayout(worktreeID, .closeTab(id: tabID))
+      case .unknown, nil:
+        // No definitive signal: never destroy; close but spare the session.
+        self.sessionsToSpare.insert(surfaceID)
+        self.sendLayout(worktreeID, .closeTab(id: tabID))
       }
-      // Another client attached (or unknown count): close without killing.
-      self.sessionsToSpare.insert(surfaceID)
-      self.sendLayout(worktreeID, .closeTab(id: tabID))
     }
   }
 
