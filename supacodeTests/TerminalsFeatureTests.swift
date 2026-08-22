@@ -258,7 +258,7 @@ struct TerminalsFeatureTests {
       $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
     #expect(harness.selectedContent.renderer == nil)
-    await harness.clock.advance()
+    await harness.clock.advance(by: LayoutFeature.wakeDeferral)
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
       $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
@@ -347,7 +347,7 @@ struct TerminalsFeatureTests {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
       $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
-    await harness.clock.advance()
+    await harness.clock.advance(by: LayoutFeature.wakeDeferral)
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
       $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
