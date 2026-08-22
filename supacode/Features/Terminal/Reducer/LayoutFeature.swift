@@ -566,19 +566,20 @@ extension LayoutFeature {
     guard var pane = state.layout.pane(containingTab: tabID), let index = pane.tabs.index(id: tabID) else {
       return .none
     }
-    let reaping = reap(pane.tabs[index].content.id, worktree: state.id)
+    let contentID = pane.tabs[index].content.id
     releaseTabBookkeeping(&state, tabID: tabID)
     pane.tabs.remove(at: index)
     guard !pane.tabs.isEmpty else {
       collapse(&state, paneID: pane.id)
-      return reaping
+      // Cheap to reap inline: the detach defers the surface free off this turn.
+      return reap(contentID, worktree: state.id)
     }
     if pane.selectedTabID == tabID {
       // Selection retargets to the previous tab, else the first.
       pane.selectedTabID = index > 0 ? pane.tabs[index - 1].id : pane.tabs.first?.id
     }
     state.layout.panes[id: pane.id] = pane
-    return reaping
+    return reap(contentID, worktree: state.id)
   }
 
   private func reduceMoveTab(
@@ -799,7 +800,10 @@ extension LayoutFeature {
       origin: .split,
       inheritedFrom: spec.inheritedFrom
     )
-    guard provisionContent(request, at: spec.geometry, operation: "splitPane") else { return .none }
+    guard
+      provisionContent(
+        request, at: spec.geometry, splitAxis: Self.splitAxis(for: direction), operation: "splitPane")
+    else { return .none }
     let paneID = PaneID(rawValue: uuid())
     do {
       // `inserting` clears zoom by design: the new pane must be visible.
@@ -823,6 +827,16 @@ extension LayoutFeature {
       focus(&state, paneID: paneID)
     }
     return .none
+  }
+
+  /// The split's geometry axis: left/right place panes side by side and
+  /// halve width, top/down stack them and halve height. Mirrors
+  /// `SplitTree.inserting(view:at:direction:)`'s direction-to-axis mapping.
+  private static func splitAxis(for direction: SplitTree<PaneID>.NewDirection) -> SplitDirection {
+    switch direction {
+    case .left, .right: .horizontal
+    case .top, .down: .vertical
+    }
   }
 
   /// Enters window mode for a pane: its leaf stays in the tree as a
@@ -909,13 +923,15 @@ extension LayoutFeature {
 
   private func reduceClosePane(_ state: inout State, paneID: PaneID) -> Effect<Action> {
     guard let pane = state.layout.panes[id: paneID] else { return .none }
-    // Merged: one hung kill must not queue the siblings behind it.
-    let reaping = Effect<Action>.merge(pane.tabs.map { reap($0.content.id, worktree: state.id) })
     for tab in pane.tabs {
       releaseTabBookkeeping(&state, tabID: tab.id)
     }
     collapse(&state, paneID: paneID)
-    return reaping
+    // The close stays cheap because reap's detach defers the surface free off
+    // this turn; both run inside one reduce, so SwiftUI sees a single state
+    // transition either way. Merged: one hung kill must not queue the
+    // siblings behind it.
+    return .merge(pane.tabs.map { reap($0.content.id, worktree: state.id) })
   }
 
   private func reduceResizePane(_ state: inout State, node: SplitTree<PaneID>.Node, ratio: Double) -> Effect<Action> {
@@ -1093,13 +1109,18 @@ extension LayoutFeature {
 
   /// Creates and provisions content; false when the runtime refuses
   /// (tombstoned or already registered), dropping the freshly made content
-  /// unprovisioned.
+  /// unprovisioned. `splitAxis`, when given, halves `geometry` along that
+  /// axis first: a split's new surface spawns near its post-layout size
+  /// instead of the anchor's full size, one PTY grid alloc/reflow/SIGWINCH
+  /// cheaper than spawning full-size and correcting after mount.
   private func provisionContent(
     _ request: ContentRequest,
     at geometry: ContentGeometry,
+    splitAxis: SplitDirection? = nil,
     operation: StaticString
   ) -> Bool {
     let content = layoutContentFactory.make(request)
+    let geometry = splitAxis.map(geometry.halved(along:)) ?? geometry
     guard contentRuntime.provision(content, at: geometry) else {
       Self.logger.warning("\(operation) provision refused for content \(request.contentID.rawValue)")
       return false
