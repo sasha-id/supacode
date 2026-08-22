@@ -5,6 +5,21 @@ import SwiftUI
 
 private nonisolated let chromeLogger = SupaLogger("WindowChrome")
 
+/// The undocumented CoreGraphics window-server calls Ghostty uses to apply
+/// background blur (`ghostty_set_window_background_blur`); bound here so the
+/// opaque path can clear a radius that setter refuses to touch at opacity 1.
+private enum CGS {
+  @_silgen_name("CGSSetWindowBackgroundBlurRadius")
+  static func setWindowBackgroundBlurRadius(
+    _ connection: UnsafeMutableRawPointer,
+    _ windowNumber: UInt,
+    _ radius: Int32
+  ) -> Int32
+
+  @_silgen_name("CGSDefaultConnectionForThread")
+  static func defaultConnectionForThread() -> UnsafeMutableRawPointer
+}
+
 struct WindowAppearanceState: Equatable {
   let opacity: Double
   let isFullScreen: Bool
@@ -68,6 +83,16 @@ enum WindowChromeApplier {
     window.isOpaque = true
     window.titlebarAppearsTransparent = !next.isFullScreen
     window.backgroundColor = tintColor
+    // Ghostty's blur setter early-returns at full opacity, so flipping from
+    // translucent to opaque would leave the compositor blur registered on the
+    // window; clear it through the same connection Ghostty set it on.
+    if window.windowNumber > 0 {
+      _ = CGS.setWindowBackgroundBlurRadius(
+        CGS.defaultConnectionForThread(),
+        UInt(window.windowNumber),
+        0
+      )
+    }
   }
 
   // The surface holes only earn their keep while the background is translucent:
