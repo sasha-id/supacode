@@ -77,8 +77,7 @@ struct SidebarItemView: View {
           subtitle: resolved.subtitle,
           accent: resolved.accent,
           customTint: store.customTint,
-          isLifecycleBusy: store.lifecycle.isBusy,
-          isTaskRunning: store.isTaskRunning
+          isLifecycleBusy: store.lifecycle.isBusy
         )
         .equatable()
         Spacer(minLength: 0)
@@ -93,6 +92,7 @@ struct SidebarItemView: View {
         isFolder: store.kind == .folder,
         isRemote: store.isRemote,
         isMissing: store.isMissing,
+        isWorking: store.isTaskRunning,
         branchName: store.branchName,
         pullRequest: store.pullRequest,
         showsPullRequestInfo: showsPullRequestInfo,
@@ -353,7 +353,6 @@ private struct TitleView: View, Equatable {
   /// User-supplied row tint. When set, paints the title; otherwise the title uses the default.
   let customTint: RepositoryColor?
   let isLifecycleBusy: Bool
-  let isTaskRunning: Bool
   // `==` ignores @Environment; SwiftUI tracks env changes separately.
   @Environment(\.backgroundProminence) private var backgroundProminence
   @Environment(\.pixelLength) private var pixelLength
@@ -364,11 +363,12 @@ private struct TitleView: View, Equatable {
       && lhs.accent == rhs.accent
       && lhs.customTint == rhs.customTint
       && lhs.isLifecycleBusy == rhs.isLifecycleBusy
-      && lhs.isTaskRunning == rhs.isTaskRunning
   }
 
   var body: some View {
-    let isBusy = isLifecycleBusy || isTaskRunning
+    // Agent / shell work shows as the leading `SidebarWorkingSpinner` now; the
+    // shimmer is left to the lifecycle transitions, which have no spinner.
+    let isBusy = isLifecycleBusy
     let isEmphasized = backgroundProminence == .increased
     let accentStyle = accent.shapeStyle(emphasized: isEmphasized)
     VStack(alignment: .leading, spacing: 0) {
@@ -439,25 +439,36 @@ private struct IconView: View {
   let isFolder: Bool
   let isRemote: Bool
   let isMissing: Bool
+  let isWorking: Bool
   let branchName: String
   let pullRequest: GithubPullRequest?
   let showsPullRequestInfo: Bool
   let lifecycle: SidebarItemFeature.State.Lifecycle
 
   var body: some View {
-    let display = WorktreePullRequestDisplay(
-      worktreeName: branchName,
-      pullRequest: showsPullRequestInfo ? pullRequest : nil,
-    )
-    IconContent(
-      isFolder: isFolder,
-      isRemote: isRemote,
-      isMissing: isMissing,
-      icon: SidebarPullRequestIcon.resolve(display.pullRequest),
-      checkBadgeState: SidebarCheckBadgeState.resolve(display.pullRequest),
-      rowState: IconRowState(lifecycle),
-    )
-    .equatable()
+    let rowState = IconRowState(lifecycle)
+    // The spinner stands in for the resting glyph only. A row mid-lifecycle or
+    // with a missing working directory has something more urgent to show, and
+    // keeps its own icon. Branching here rather than inside `IconContent` keeps
+    // the spinner out of the equatable subtree, which never let its frames tick.
+    if isWorking, rowState == .idle, !isMissing {
+      SidebarWorkingSpinner()
+        .frame(width: SidebarNestLayout.leadingSlotWidth, height: 16)
+    } else {
+      let display = WorktreePullRequestDisplay(
+        worktreeName: branchName,
+        pullRequest: showsPullRequestInfo ? pullRequest : nil,
+      )
+      IconContent(
+        isFolder: isFolder,
+        isRemote: isRemote,
+        isMissing: isMissing,
+        icon: SidebarPullRequestIcon.resolve(display.pullRequest),
+        checkBadgeState: SidebarCheckBadgeState.resolve(display.pullRequest),
+        rowState: rowState,
+      )
+      .equatable()
+    }
   }
 }
 
