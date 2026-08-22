@@ -69,6 +69,7 @@ final class CommandKeyObserver {
       }
     }
     // Flip immediately; consumers fade the visual change in/out themselves.
+    guard isPressed != isDown else { return }
     isPressed = isDown
   }
 

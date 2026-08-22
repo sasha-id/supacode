@@ -310,18 +310,38 @@ final class GhosttySurfaceView: NSView, Identifiable {
   }
 
   func closeSurface() {
-    clearNotificationObservers()
-    if let surface {
-      if let surfaceRef {
-        runtime.unregisterSurface(surfaceRef)
-        self.surfaceRef = nil
+    guard let surface = detachSurface() else { return }
+    ghostty_surface_free(surface)
+  }
+
+  /// Detaches now, frees later. `ghostty_surface_free` joins the search,
+  /// renderer, and IO threads and tears down the Metal renderer, so running it
+  /// inline stalls the interaction that closed the surface. The view is held
+  /// until the free lands: libghostty keeps unretained pointers to it and to
+  /// the bridge for the duration of its own teardown.
+  func closeSurfaceDeferringFree() {
+    guard let surface = detachSurface() else { return }
+    Task { @MainActor [self] in
+      withExtendedLifetime(self) {
+        ghostty_surface_free(surface)
       }
-      ghostty_surface_free(surface)
-      self.surface = nil
-      bridge.surface = nil
-      lastOcclusion = nil
-      lastSurfaceFocus = nil
     }
+  }
+
+  /// Drops every app-side reference to the surface and hands back the C value
+  /// still owing a free; nil when there is nothing left to free.
+  private func detachSurface() -> ghostty_surface_t? {
+    clearNotificationObservers()
+    guard let surface else { return nil }
+    if let surfaceRef {
+      runtime.unregisterSurface(surfaceRef)
+      self.surfaceRef = nil
+    }
+    self.surface = nil
+    bridge.surface = nil
+    lastOcclusion = nil
+    lastSurfaceFocus = nil
+    return surface
   }
 
   private func updateScreenObservers() {
@@ -953,8 +973,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   // The responder chain delivers flagsChanged only to the first responder, so forward it to
   // every other surface; a hovered but unfocused terminal still needs to refresh its links.
+  // Only surfaces actually on screen need that refresh, so skip anything not currently visible.
   private func localEventFlagsChanged(_ event: NSEvent) -> NSEvent? {
     guard window != nil, window?.firstResponder !== self else { return event }
+    guard !isHiddenOrHasHiddenAncestor, lastOcclusion != false else { return event }
     flagsChanged(with: event)
     return event
   }
@@ -1822,16 +1844,20 @@ final class GhosttySurfaceView: NSView, Identifiable {
   }
 
   private func keyboardLayoutId() -> String? {
-    let sources = [
-      TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-      TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-      TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
-    ]
+    if let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
+      return value as String
+    }
 
-    for source in sources.compactMap({ $0 }) {
-      guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
-        continue
-      }
+    if let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
+      return value as String
+    }
+
+    if let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
       let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
       return value as String
     }
@@ -2216,14 +2242,14 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
     synchronizeScrollView()
     synchronizeSurfaceView()
     synchronizeCoreSurface()
-    // This wrapper is the tint's subtract mask; the rebuild runs inline so
-    // the hole lands in the same frame as the surface's geometry.
-    NotificationCenter.default.post(name: .ghosttyTintMaskRegionDidChange, object: self)
+    // This wrapper is the tint's subtract mask, so its hole follows the
+    // surface's geometry.
+    WindowTintMaskRegistry.regionGeometryDidChange(self)
   }
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
-    NotificationCenter.default.post(name: .ghosttyTintMaskRegionDidChange, object: self)
+    WindowTintMaskRegistry.regionDidMoveToWindow(self)
   }
 
   func updateSurfaceSize() {
