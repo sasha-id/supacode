@@ -18,8 +18,8 @@ nonisolated struct ZmxSessionProbeTests {
     at path: String,
     serve: @escaping @Sendable (Int32) -> Void
   ) -> Int32 {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    precondition(fd >= 0)
+    let server = socket(AF_UNIX, SOCK_STREAM, 0)
+    precondition(server >= 0)
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     withUnsafeMutableBytes(of: &addr.sun_path) { sunPath in
@@ -27,18 +27,18 @@ nonisolated struct ZmxSessionProbeTests {
     }
     let bound = withUnsafePointer(to: &addr) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        bind(server, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
       }
     }
     precondition(bound == 0, "bind failed errno=\(errno)")
-    precondition(Darwin.listen(fd, 1) == 0)
+    precondition(Darwin.listen(server, 1) == 0)
     Thread.detachNewThread {
-      let client = accept(fd, nil, nil)
+      let client = accept(server, nil, nil)
       guard client >= 0 else { return }
       serve(client)
       close(client)
     }
-    return fd
+    return server
   }
 
   private static func message(tag: UInt8, payload: [UInt8]) -> [UInt8] {
@@ -64,11 +64,11 @@ nonisolated struct ZmxSessionProbeTests {
     var request = [UInt8](repeating: 0, count: ZmxSessionProbe.headerSize)
     var received = 0
     while received < request.count {
-      let n = request.withUnsafeMutableBytes { buffer in
+      let count = request.withUnsafeMutableBytes { buffer in
         read(client, buffer.baseAddress! + received, buffer.count - received)
       }
-      guard n > 0 else { return }
-      received += n
+      guard count > 0 else { return }
+      received += count
     }
   }
 
@@ -80,7 +80,7 @@ nonisolated struct ZmxSessionProbeTests {
     let path = Self.temporarySocketPath()
     defer { unlink(path) }
     // Bind then close: the file survives, nothing listens — a crashed daemon.
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let orphan = socket(AF_UNIX, SOCK_STREAM, 0)
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     withUnsafeMutableBytes(of: &addr.sun_path) { sunPath in
@@ -88,10 +88,10 @@ nonisolated struct ZmxSessionProbeTests {
     }
     _ = withUnsafePointer(to: &addr) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        bind(orphan, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
       }
     }
-    close(fd)
+    close(orphan)
 
     #expect(ZmxSessionProbe.probe(socketPath: path) == .dead)
   }

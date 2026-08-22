@@ -36,13 +36,13 @@ nonisolated enum ZmxSessionProbe {
     let pathBytes = Array(socketPath.utf8)
     guard pathBytes.count < sunPathCapacity else { return .unknown }
 
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { return .unknown }
-    defer { close(fd) }
-    let flags = fcntl(fd, F_GETFL, 0)
-    guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else { return .unknown }
+    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { return .unknown }
+    defer { close(descriptor) }
+    let flags = fcntl(descriptor, F_GETFL, 0)
+    guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else { return .unknown }
 
-    switch connect(fd, path: pathBytes, deadline: deadline) {
+    switch connect(descriptor, path: pathBytes, deadline: deadline) {
     case .dead: return .dead
     case .unknown: return .unknown
     case .connected: break
@@ -51,9 +51,9 @@ nonisolated enum ZmxSessionProbe {
     // Info request: tag 6, zero-length payload, zeroed header padding.
     var header = [UInt8](repeating: 0, count: headerSize)
     header[0] = infoTag
-    guard writeAll(fd, bytes: header, deadline: deadline) else { return .unknown }
+    guard writeAll(descriptor, bytes: header, deadline: deadline) else { return .unknown }
 
-    return readInfoReply(fd, deadline: deadline)
+    return readInfoReply(descriptor, deadline: deadline)
   }
 
   private enum ConnectResult {
@@ -62,26 +62,26 @@ nonisolated enum ZmxSessionProbe {
     case unknown
   }
 
-  private static func connect(_ fd: Int32, path: [UInt8], deadline: ContinuousClock.Instant) -> ConnectResult {
+  private static func connect(_ descriptor: Int32, path: [UInt8], deadline: ContinuousClock.Instant) -> ConnectResult {
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     withUnsafeMutableBytes(of: &addr.sun_path) { sunPath in
       sunPath.copyBytes(from: path)
     }
-    let rc = withUnsafePointer(to: &addr) { pointer in
+    let result = withUnsafePointer(to: &addr) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
       }
     }
-    if rc == 0 { return .connected }
+    if result == 0 { return .connected }
     switch errno {
     case ENOENT, ECONNREFUSED:
       return .dead
     case EINPROGRESS:
-      guard poll(fd, events: POLLOUT, deadline: deadline) else { return .unknown }
+      guard poll(descriptor, events: POLLOUT, deadline: deadline) else { return .unknown }
       var soError: Int32 = 0
       var soErrorLen = socklen_t(MemoryLayout<Int32>.size)
-      guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soErrorLen) == 0 else { return .unknown }
+      guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &soError, &soErrorLen) == 0 else { return .unknown }
       switch soError {
       case 0: return .connected
       case ENOENT, ECONNREFUSED: return .dead
@@ -92,38 +92,38 @@ nonisolated enum ZmxSessionProbe {
     }
   }
 
-  private static func writeAll(_ fd: Int32, bytes: [UInt8], deadline: ContinuousClock.Instant) -> Bool {
+  private static func writeAll(_ descriptor: Int32, bytes: [UInt8], deadline: ContinuousClock.Instant) -> Bool {
     var sent = 0
     while sent < bytes.count {
-      let n = bytes.withUnsafeBytes { buffer in
-        write(fd, buffer.baseAddress! + sent, bytes.count - sent)
+      let written = bytes.withUnsafeBytes { buffer in
+        write(descriptor, buffer.baseAddress! + sent, bytes.count - sent)
       }
-      if n > 0 {
-        sent += n
+      if written > 0 {
+        sent += written
         continue
       }
       guard errno == EAGAIN || errno == EINTR else { return false }
-      guard poll(fd, events: POLLOUT, deadline: deadline) else { return false }
+      guard poll(descriptor, events: POLLOUT, deadline: deadline) else { return false }
     }
     return true
   }
 
   /// Reads until an `Info` message arrives, skipping interleaved broadcasts
   /// (a daemon pushes `Output` to every accepted connection, `Init` or not).
-  private static func readInfoReply(_ fd: Int32, deadline: ContinuousClock.Instant) -> Outcome {
+  private static func readInfoReply(_ descriptor: Int32, deadline: ContinuousClock.Instant) -> Outcome {
     var buffer: [UInt8] = []
     var chunk = [UInt8](repeating: 0, count: 4096)
     while true {
-      let n = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
-      if n > 0 {
-        buffer.append(contentsOf: chunk[..<n])
+      let received = chunk.withUnsafeMutableBytes { read(descriptor, $0.baseAddress, $0.count) }
+      if received > 0 {
+        buffer.append(contentsOf: chunk[..<received])
         if let outcome = parseInfo(from: &buffer) { return outcome }
         continue
       }
       // EOF or reset mid-handshake is ambiguous, not proof the session died.
-      if n == 0 { return .unknown }
+      if received == 0 { return .unknown }
       guard errno == EAGAIN || errno == EINTR else { return .unknown }
-      guard poll(fd, events: POLLIN, deadline: deadline) else { return .unknown }
+      guard poll(descriptor, events: POLLIN, deadline: deadline) else { return .unknown }
     }
   }
 
@@ -154,15 +154,17 @@ nonisolated enum ZmxSessionProbe {
   }
 
   /// Waits for `events` until `deadline`; false on timeout or poll failure.
-  private static func poll(_ fd: Int32, events: Int32, deadline: ContinuousClock.Instant) -> Bool {
+  private static func poll(_ descriptor: Int32, events: Int32, deadline: ContinuousClock.Instant) -> Bool {
     while true {
       let remaining = ContinuousClock.now.duration(to: deadline)
       guard remaining > .zero else { return false }
-      let milliseconds = Int32(clamping: remaining.components.seconds * 1000 + remaining.components.attoseconds / 1_000_000_000_000_000)
-      var pollFD = pollfd(fd: fd, events: Int16(events), revents: 0)
-      let rc = Darwin.poll(&pollFD, 1, max(1, milliseconds))
-      if rc > 0 { return true }
-      if rc == 0 { return false }
+      let milliseconds = Int32(
+        clamping: remaining.components.seconds * 1000 + remaining.components.attoseconds / 1_000_000_000_000_000
+      )
+      var pollFD = pollfd(fd: descriptor, events: Int16(events), revents: 0)
+      let ready = Darwin.poll(&pollFD, 1, max(1, milliseconds))
+      if ready > 0 { return true }
+      if ready == 0 { return false }
       guard errno == EINTR else { return false }
     }
   }
