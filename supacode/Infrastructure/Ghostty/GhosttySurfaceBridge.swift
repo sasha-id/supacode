@@ -118,7 +118,20 @@ final class GhosttySurfaceBridge {
     if let handled = handleSplitAction(action) { return handled }
     if handleTitleAndPath(action) { return false }
     if handleContextSignal(action) { return false }
-    if handleCommandStatus(action) { return false }
+    if handleCommandStatus(action) {
+      // Core prints "Process exited. Press any key to close the terminal."
+      // into the grid whenever the embedder reports no native child-exited
+      // UI, and that text sits on screen for the whole probe-then-close
+      // window. Our exit flow is that UI — the close request collapses the
+      // tab — so claim the routine notice. Abnormal exits (runtime at or
+      // below core's 250ms `abnormal-command-exit-runtime` default) keep
+      // core's in-terminal diagnostics: that surface stays open, and a
+      // blank pane would hide the only explanation of what failed.
+      if action.tag == GHOSTTY_ACTION_SHOW_CHILD_EXITED {
+        return action.action.child_exited.timetime_ms > 250
+      }
+      return false
+    }
     if handleMouseAndLink(action) {
       return action.tag == GHOSTTY_ACTION_OPEN_URL
     }
