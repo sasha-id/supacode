@@ -323,7 +323,6 @@ private struct SidebarGitRepositorySection: View {
     } header: {
       EmptyView()
     }
-    .environment(\.sidebarRepoTint, section?.color)
   }
 }
 
@@ -398,7 +397,11 @@ private struct SidebarRepositoryHeaderRow: View {
     .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")
     .onHover { isHovering = $0 }
     .listRowBackground(
-      SidebarRowChrome(tint: tint, isHovering: isHovering, showsTopSeparator: showsTopSeparator)
+      SidebarRowChrome(
+        stripe: .accent(tint),
+        isHovering: isHovering,
+        showsTopSeparator: showsTopSeparator
+      )
     )
     .listRowInsets(.leading, SidebarNestLayout.rowLeadingInset)
     .listRowInsets(.trailing, SidebarNestLayout.rowTrailingInset)

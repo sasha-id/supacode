@@ -13,7 +13,8 @@ enum SidebarNestLayout {
   /// Width of a group header's disclosure chevron, narrower than the slot it
   /// sits in; the remainder is padded out after it.
   static let groupChevronWidth: CGFloat = 12
-  /// Gap between the leading accent stripe and a row's content. The stripe
+  /// Gap from the leading edge to a row's content, clearing the repo row's
+  /// accent stripe and keeping worktree titles aligned under it. The stripe
   /// lives in the row background, which `listRowInsets` doesn't touch, so this
   /// only moves the content.
   static let rowLeadingInset: CGFloat = 12
@@ -53,7 +54,6 @@ struct SidebarItemView: View {
   /// Non-nil only inside the global Pinned / Active sections.
   var highlightSubtitle: SidebarHighlightRepoTag?
   @State private var isHovering = false
-  @Environment(\.sidebarRepoTint) private var sidebarRepoTint
   @Environment(\.sidebarRowTopSeparator) private var sidebarRowTopSeparator
 
   var body: some View {
@@ -108,7 +108,7 @@ struct SidebarItemView: View {
     .listRowInsets(.vertical, SidebarNestLayout.rowVerticalInset)
     .listRowBackground(
       SidebarRowChrome(
-        tint: store.customTint ?? sidebarRepoTint,
+        stripe: .none,
         isHovering: isHovering,
         showsTopSeparator: sidebarRowTopSeparator
       )
@@ -118,14 +118,21 @@ struct SidebarItemView: View {
   }
 }
 
-/// Row chrome shared by worktree rows and repo section
-/// headers: a 3px repo-accent stripe on the leading edge plus a 7%-primary
-/// hover fill (the `color-mix(foreground 7%)` formula, system-color
-/// compliant). Rows whose repo has no custom tint get a quiet neutral stripe
-/// so every row carries one. Sits in `.listRowBackground`, beneath the native
-/// selection highlight.
+/// Row chrome shared by worktree rows and repo section headers: an optional
+/// 3px repo-accent stripe on the leading edge plus a 7%-primary hover fill
+/// (the `color-mix(foreground 7%)` formula, system-color compliant). Only a
+/// repository row draws a stripe — it marks where a repo begins, so the
+/// worktrees beneath it read as its children. Sits in `.listRowBackground`,
+/// beneath the native selection highlight.
 struct SidebarRowChrome: View {
-  let tint: RepositoryColor?
+  /// Leading accent stripe. `.accent(nil)` is a repo the user never tinted; it
+  /// still gets a quiet neutral stripe.
+  enum Stripe: Equatable {
+    case none
+    case accent(RepositoryColor?)
+  }
+
+  let stripe: Stripe
   let isHovering: Bool
   /// Hairline along the top edge, marking where a repo section begins. Drawn
   /// here rather than as its own list row so the rule costs no extra height.
@@ -134,18 +141,20 @@ struct SidebarRowChrome: View {
 
   var body: some View {
     // The outer `.frame` is load-bearing: a `ZStack` sizes to its children, so
-    // without it the non-hovering case (stripe only) would shrink to 3pt wide
-    // and center itself in the row instead of hugging the leading edge.
+    // without it a stripe-only row would shrink to 3pt wide and center itself
+    // in the row instead of hugging the leading edge.
     ZStack(alignment: .leading) {
       if isHovering {
         // Square and full-bleed so hover covers the whole row and reads as the
         // same shape as the selection fill beneath it.
         Color.primary.opacity(0.07)
       }
-      UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 1.5, topTrailing: 1.5))
-        .fill(tint?.color ?? Color.secondary.opacity(0.3))
-        .frame(width: 3)
-        .padding(.vertical, 4)
+      if case .accent(let tint) = stripe {
+        UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 1.5, topTrailing: 1.5))
+          .fill(tint?.color ?? Color.secondary.opacity(0.3))
+          .frame(width: 3)
+          .padding(.vertical, 4)
+      }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     .overlay(alignment: .top) {
@@ -761,10 +770,6 @@ extension EnvironmentValues {
   @Entry var focusNotificationAction: (WorktreeTerminalNotification) -> Void = { _ in
     notificationEnvironmentLogger.warning("focusNotificationAction called but was never set in the environment.")
   }
-
-  /// Repo-level accent for the leading row stripe, set by the repo section so
-  /// per-worktree `customTint` can still win when both are present.
-  @Entry var sidebarRepoTint: RepositoryColor?
 
   /// Set on a section whose single row opens a new repository, so the row draws
   /// the inter-repo rule that a git repo's header row draws for itself. Only
