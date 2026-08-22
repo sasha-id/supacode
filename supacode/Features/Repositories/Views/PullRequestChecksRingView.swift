@@ -54,7 +54,7 @@ struct PullRequestChecksRingView: View {
     addSegment(id: "inProgress", count: breakdown.inProgress, color: .yellow)
     addSegment(id: "skipped", count: breakdown.skipped, color: .gray)
     addSegment(id: "expected", count: breakdown.expected, color: .yellow)
-    addSegment(id: "passed", count: breakdown.passed, color: .green)
+    addSegment(id: "passed", count: breakdown.passed, color: .checkSuccess)
     return segments
   }
 

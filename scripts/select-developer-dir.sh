@@ -26,6 +26,16 @@ if [ -n "${DEVELOPER_DIR:-}" ] && is_zig_linkable "${DEVELOPER_DIR}"; then
 fi
 
 candidates=()
+# Local escape hatch (uncommitted): a zig that already carries the arm64e TBD
+# fix (ziglang/zig#31673, e.g. the Homebrew 0.15.2_1 bottle) links the 26.4+
+# SDK fine, making the Xcode pin unnecessary. Opt in per-shell:
+#   SUPACODE_ZIG_HAS_TBD_FIX=1 make build-app
+if [ -n "${SUPACODE_ZIG_HAS_TBD_FIX:-}" ]; then
+  if current="$(xcode-select -p 2>/dev/null)" && [ -n "${current}" ]; then
+    printf '%s\n' "${current}"
+    exit 0
+  fi
+fi
 # Known-good versioned Xcodes first (newest <= 26.3, underscore and hyphen
 # naming), so a machine whose default is a newer non-linkable Xcode (CI on 26.5)
 # still finds a linkable one instead of stopping at the default.

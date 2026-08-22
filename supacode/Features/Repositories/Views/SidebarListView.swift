@@ -62,6 +62,10 @@ struct SidebarListView: View {
             structure: structure
           )
         }
+        // The only rule in the sidebar separates two repositories, and
+        // `SidebarRowChrome` draws it on the row that starts one. Left to
+        // itself, `.plain` would also rule between every pair of worktrees.
+        .listRowSeparator(.hidden)
       }
       // `.sidebar` draws selection as a rounded pill inset from both edges and
       // pads every section apart, which left a dead strip under each row that
