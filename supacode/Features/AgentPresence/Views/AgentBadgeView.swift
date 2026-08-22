@@ -92,11 +92,12 @@ struct AgentBadgeView: View {
 
 /// Pulses the badge while the agent compacts context: it contracts, shivers, and
 /// settles back, then rests before the next pulse. Deliberately quieter than a
-/// continuous spinner, since compaction resolves on its own. Held still under
-/// `accessibilityReduceMotion`.
+/// continuous spinner, since compaction resolves on its own. Held still when
+/// `MotionPreference.reduceMotion` is set — note that the pulse is the only
+/// thing distinguishing this badge from `.normal`, so holding it still hides
+/// compaction everywhere except the tooltip and the accessibility label.
 private struct CompactingPulse: ViewModifier {
   let isActive: Bool
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   private enum Phase: CaseIterable {
     case rest
@@ -133,7 +134,7 @@ private struct CompactingPulse: ViewModifier {
   }
 
   func body(content: Content) -> some View {
-    if isActive, !reduceMotion {
+    if isActive, !MotionPreference.reduceMotion {
       PhaseAnimator(Phase.allCases) { phase in
         content
           .scaleEffect(phase.scale)

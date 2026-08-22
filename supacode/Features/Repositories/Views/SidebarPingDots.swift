@@ -10,7 +10,6 @@ struct SidebarPingMultiColorDot: View {
   let isEmphasized: Bool
   let size: CGFloat
   let showsSolidCenter: Bool
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   private var uniqueColors: [Color] {
     guard !isEmphasized else { return [.primary] }
@@ -29,7 +28,7 @@ struct SidebarPingMultiColorDot: View {
         size: size,
         showsSolidCenter: showsSolidCenter
       )
-    } else if reduceMotion {
+    } else if MotionPreference.reduceMotion {
       SidebarPingStaticDot(color: resolved[0], size: size, showsSolidCenter: showsSolidCenter)
     } else {
       SidebarPingCyclingDot(colors: resolved, size: size, showsSolidCenter: showsSolidCenter)
@@ -110,13 +109,12 @@ struct SidebarPingRing: View {
   let color: Color
   let size: CGFloat
   @Environment(\.pixelLength) private var pixelLength
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   var body: some View {
     let ring = Circle()
       .stroke(color, lineWidth: pixelLength)
       .frame(width: size, height: size)
-    if reduceMotion {
+    if MotionPreference.reduceMotion {
       ring.opacity(0.6)
     } else {
       ring.phaseAnimator([false, true]) { content, expanded in

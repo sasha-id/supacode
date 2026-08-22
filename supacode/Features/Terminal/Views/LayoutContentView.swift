@@ -252,8 +252,6 @@ private struct PaneSplitView: View {
   let store: StoreOf<LayoutFeature>
   let renderContext: PaneRenderContext
 
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
   /// The full-span preview direction when an in-flight span drop is anchored on
   /// one of this split's own panes; this split frames both, so it paints the
   /// highlight across the divider.
@@ -287,7 +285,10 @@ private struct PaneSplitView: View {
         PaneSpanDropPreview(direction: spanPreviewDirection).transition(.opacity)
       }
     }
-    .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: spanPreviewDirection)
+    .animation(
+      MotionPreference.reduceMotion ? nil : .easeInOut(duration: 0.15),
+      value: spanPreviewDirection
+    )
   }
 }
 
@@ -502,7 +503,6 @@ private struct PaneSplitDropZones: View {
   let dragModel: PaneTabDragModel
 
   @State private var targetedDirection: SplitTree<PaneID>.NewDirection?
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   /// The pane's shared divider, if any: the edge the full-span band sits
   /// against and the two perpendicular directions it offers.
@@ -549,7 +549,10 @@ private struct PaneSplitDropZones: View {
         PaneSplitDropPreview(direction: targetedDirection).transition(.opacity)
       }
     }
-    .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: targetedDirection)
+    .animation(
+      MotionPreference.reduceMotion ? nil : .easeInOut(duration: 0.15),
+      value: targetedDirection
+    )
   }
 
   @ViewBuilder private var spanZones: some View {
