@@ -560,12 +560,6 @@ struct AppFeature {
         state.repositories.$sidebar.withLock { sidebar in
           sidebar.focusedWorktreeID = lastFocusedWorktreeID
         }
-        // A freshly created worktree emits `selectedWorktreeChanged` before
-        // `worktreeCreated`, so this bootstrap can create the tab first; carry
-        // the same setup-script intent or the later, setup-aware call finds the
-        // tab already made and `enableSetupScriptIfNeeded` refuses to re-arm it.
-        let runSetupScriptIfNew =
-          state.repositories.sidebarItems[id: worktree.id]?.lifecycle == .pending
         // `shouldFocusTerminal` may already be armed before this delegate fires
         // (launch restore, or a sidebar selection that requested focus first),
         // so read it here and drive focus through the activation command: the
@@ -578,10 +572,11 @@ struct AppFeature {
             await terminalClient.send(.setSelectedWorktreeID(worktree.id))
           },
           .run { _ in
-            // A worktree selected for the first time (fresh install, empty
-            // migration) still needs its bootstrap tab; no-op when populated.
-            await terminalClient.send(
-              .ensureInitialTab(worktree, runSetupScriptIfNew: runSetupScriptIfNew, focusing: wantsFocus))
+            // Selection wires up the host and focuses whatever is already open.
+            // It never opens a terminal: a worktree with an empty layout shows
+            // the "Press ⌘T" hint until the user asks for one. The bootstrap
+            // tab for a brand-new worktree comes from `worktreeCreated` below.
+            await terminalClient.send(.activateWorktree(worktree, focusing: wantsFocus))
           },
           .run { _ in
             await worktreeInfoWatcher.send(.setSelectedWorktreeID(worktree.id))
@@ -592,12 +587,17 @@ struct AppFeature {
       case .repositories(.delegate(.worktreeCreated(let worktree))):
         let shouldRunSetupScript =
           state.repositories.sidebarItems[id: worktree.id]?.lifecycle == .pending
+        // Selection no longer bootstraps a tab, so this is the only creator for
+        // a brand-new worktree and has to carry the focus intent that the
+        // creation armed. A background creation leaves the flag clear, so the
+        // new tab is made without stealing focus.
+        let wantsFocus = state.repositories.sidebarItems[id: worktree.id]?.shouldFocusTerminal == true
         return .run { _ in
           await terminalClient.send(
             .ensureInitialTab(
               worktree,
               runSetupScriptIfNew: shouldRunSetupScript,
-              focusing: false
+              focusing: wantsFocus
             )
           )
         }

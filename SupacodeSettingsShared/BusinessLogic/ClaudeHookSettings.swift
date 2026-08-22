@@ -17,20 +17,21 @@ nonisolated enum ClaudeHookSettingsError: Error {
 
 // MARK: - Hook payload.
 
-// Atomic state-set: UserPromptSubmit / PreToolUse fire `busy`; PostToolUse
-// fires `idle` so the shimmer tracks active tool execution, not the whole turn
-// (the socket debounces idle to bridge between-tool gaps). AskUserQuestion /
-// ExitPlanMode / Notification overwrite to `awaitingInput`; Stop and SessionEnd
-// reset to `idle`. The pid liveness sweep is the safety net for crashed turns.
-// Only Claude has tool-level granularity; Codex and Kiro stay turn-level, so
-// their shimmer spans the whole turn.
+// Atomic state-set: UserPromptSubmit / PreToolUse / PostToolUse all fire
+// `busy`, so activity spans the whole turn the way it does for Codex and Kiro.
+// PostToolUse used to fire `idle` on the theory that the 400ms idle debounce in
+// WorktreeTerminalManager would bridge the gaps between tools. It doesn't --
+// that gap is the model thinking, seconds to tens of seconds -- so a turn read
+// as idle from its first finished tool onwards, which is most of its wall time.
+// Re-asserting `busy` on PostToolUse also clears the `awaitingInput` set by the
+// AskUserQuestion / ExitPlanMode matcher once the user has answered.
+// Notification overwrites to `awaitingInput`; Stop and SessionEnd reset to
+// `idle`. The pid liveness sweep is the safety net for crashed turns.
 private nonisolated struct ClaudeHooksPayload: Encodable {
   static let awaitingInputToolMatcher = "AskUserQuestion|ExitPlanMode"
 
   private static let busy = AgentHookSettingsCommand.compositeCommand(
     events: [.busy], forwardStdinAsNotification: false, agent: .claude)
-  private static let idle = AgentHookSettingsCommand.compositeCommand(
-    events: [.idle], forwardStdinAsNotification: false, agent: .claude)
   private static let awaitingInputAndNotify = AgentHookSettingsCommand.compositeCommand(
     events: [.awaitingInput], forwardStdinAsNotification: true, agent: .claude)
   private static let awaitingInput = AgentHookSettingsCommand.compositeCommand(
@@ -61,7 +62,7 @@ private nonisolated struct ClaudeHooksPayload: Encodable {
       ),
     ],
     "PostToolUse": [
-      .init(matcher: "", hooks: [.init(command: Self.idle, timeout: AgentHookSettingsCommand.timeoutSeconds)])
+      .init(matcher: "", hooks: [.init(command: Self.busy, timeout: AgentHookSettingsCommand.timeoutSeconds)])
     ],
     "Notification": [
       .init(

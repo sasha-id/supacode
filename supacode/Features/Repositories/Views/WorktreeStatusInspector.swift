@@ -460,7 +460,7 @@ private struct PullRequestMergeQueueRow: View {
           .resizable()
           .aspectRatio(contentMode: .fit)
           .frame(width: 14, height: 14)
-          .foregroundStyle(.brown)
+          .foregroundStyle(.pullRequestQueued)
           .accessibilityHidden(true)
         Text(status.summary)
       }

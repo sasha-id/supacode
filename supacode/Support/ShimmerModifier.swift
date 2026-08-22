@@ -3,7 +3,6 @@ import SwiftUI
 struct ShimmerModifier: ViewModifier {
   let isActive: Bool
   @Environment(\.layoutDirection) private var layoutDirection
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @State private var size: CGSize = .zero
 
   func body(content: Content) -> some View {
@@ -14,7 +13,7 @@ struct ShimmerModifier: ViewModifier {
     } action: {
       size = $0
     }
-    if isActive, !reduceMotion {
+    if isActive, !MotionPreference.reduceMotion {
       // The mask is a single translated gradient, so CoreAnimation composites the sweep on
       // the GPU instead of re-rasterizing the gradient and masked text every frame, as
       // animating the endpoints did.

@@ -4,7 +4,9 @@ import SwiftUI
 struct RepoSectionHeaderView: View {
   let name: String
   let customTitle: String?
-  let color: RepositoryColor?
+  /// Muted `(N)` worktree count next to the title; `nil` hides it (failed /
+  /// blocked repos render no rows to count).
+  var worktreeCount: Int?
   let isRemoving: Bool
   /// `[user@]host[:port]` when the repository lives on an SSH host, else nil;
   /// surfaces a `wifi` glyph beside the title, full value shown on hover.
@@ -17,21 +19,25 @@ struct RepoSectionHeaderView: View {
   }
 
   var body: some View {
-    HStack {
-      HStack(spacing: 4) {
-        Text(displayName).foregroundStyle(color?.color ?? .secondary)
-        if let hostInfo {
-          Image(systemName: "wifi")
-            .imageScale(.small)
-            .foregroundStyle(.secondary)
-            .help(hostInfo)
-            .accessibilityLabel("Remote host \(hostInfo)")
-        }
-      }
+    HStack(spacing: 4) {
       // The repository name is the sidebar's primary label, so it has to follow
-      // the text scale like the rows beneath it. As a `Section` header it draws
-      // with the list's font rather than one of its own.
-      .appFontInheriting(.subheadline, weight: .semibold)
+      // the text scale like the rows beneath it. The repo color no longer tints
+      // the title — it lives on the leading accent stripe instead.
+      Text(displayName)
+        .appFontInheriting(.subheadline, weight: .semibold)
+      if let worktreeCount {
+        Text("(\(worktreeCount))")
+          .appFontInheriting(.subheadline)
+          .foregroundStyle(.secondary)
+      }
+      if let hostInfo {
+        Image(systemName: "wifi")
+          .imageScale(.small)
+          .appFontInheriting(.subheadline)
+          .foregroundStyle(.secondary)
+          .help(hostInfo)
+          .accessibilityLabel("Remote host \(hostInfo)")
+      }
       if isRemoving {
         ProgressView()
           .controlSize(.small)

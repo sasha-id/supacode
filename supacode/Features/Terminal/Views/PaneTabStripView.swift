@@ -61,7 +61,6 @@ struct PaneTabStrip: View {
   var dragModel: PaneTabDragModel?
 
   @Environment(\.controlActiveState) private var controlActiveState
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.pixelLength) private var pixelLength
   @State private var scrollOffset: CGFloat = 0
   @State private var contentWidth: CGFloat = 0
@@ -169,7 +168,8 @@ struct PaneTabStrip: View {
     }
     .frame(height: TerminalTabBarMetrics.barHeight)
     .animation(
-      reduceMotion ? nil : .easeOut(duration: TerminalTabBarMetrics.closeAnimationDuration),
+      MotionPreference.reduceMotion
+        ? nil : .easeOut(duration: TerminalTabBarMetrics.closeAnimationDuration),
       value: pane.tabs.ids
     )
     .overlay(alignment: .trailing) {
@@ -199,11 +199,13 @@ struct PaneTabStrip: View {
       .frame(width: TerminalTabBarMetrics.overflowShadowWidth)
     }
     .animation(
-      reduceMotion ? nil : .easeInOut(duration: TerminalTabBarMetrics.fadeAnimationDuration),
+      MotionPreference.reduceMotion
+        ? nil : .easeInOut(duration: TerminalTabBarMetrics.fadeAnimationDuration),
       value: canScrollLeft
     )
     .animation(
-      reduceMotion ? nil : .easeInOut(duration: TerminalTabBarMetrics.fadeAnimationDuration),
+      MotionPreference.reduceMotion
+        ? nil : .easeInOut(duration: TerminalTabBarMetrics.fadeAnimationDuration),
       value: canScrollRight
     )
   }
@@ -363,7 +365,6 @@ private struct PaneTabView: View {
   @State private var isDropTargeted = false
   @FocusState private var isFieldFocused: Bool
   @Environment(CommandKeyObserver.self) private var commandKeyObserver
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   private var isEditing: Bool {
     store.editingTabID == tab.id
@@ -472,7 +473,8 @@ private struct PaneTabView: View {
       )
     }
     .animation(
-      reduceMotion ? nil : .easeInOut(duration: TerminalTabBarMetrics.hoverAnimationDuration),
+      MotionPreference.reduceMotion
+        ? nil : .easeInOut(duration: TerminalTabBarMetrics.hoverAnimationDuration),
       value: TabInteractionKey(isHovering: isHovering, isSelected: isSelected, isPressing: isPressing)
     )
     .padding(.bottom, isSelected ? TerminalTabBarMetrics.activeTabBottomPadding : 0)
@@ -603,7 +605,8 @@ private struct PaneTabView: View {
   }
 
   private var slotAnimation: Animation? {
-    reduceMotion ? nil : .easeInOut(duration: TerminalTabBarMetrics.fadeAnimationDuration)
+    MotionPreference.reduceMotion
+      ? nil : .easeInOut(duration: TerminalTabBarMetrics.fadeAnimationDuration)
   }
 
   /// True when the cmd-pressed hotkey hint should occupy the trailing slot.

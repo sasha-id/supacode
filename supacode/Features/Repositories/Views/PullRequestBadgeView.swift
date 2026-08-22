@@ -2,9 +2,12 @@ import SupacodeSettingsShared
 import SwiftUI
 
 enum PullRequestBadgeStyle {
-  static let mergedColor = Color.purple
-  static let openColor = Color.green
-  static let queuedColor = Color.brown
+  // The same three states the sidebar's leading icon paints, so they take the
+  // same damped hues; the pill is an outline plus text in this colour, which at
+  // full chroma made it the loudest thing in the row.
+  static let mergedColor = Color.pullRequestMerged
+  static let openColor = Color.pullRequestOpen
+  static let queuedColor = Color.pullRequestQueued
 
   static func style(
     state: PullRequestState?,

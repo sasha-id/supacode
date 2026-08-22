@@ -297,8 +297,12 @@ private struct SidebarPathGroupHeaderRow: View {
       .contentShape(.interaction, .rect)
     }
     .buttonStyle(.plain)
-    .listRowInsets(.leading, CGFloat(depth) * SidebarNestLayout.indentStep)
-    .listRowInsets(.vertical, 6)
+    .listRowInsets(
+      .leading,
+      SidebarNestLayout.rowLeadingInset + CGFloat(depth) * SidebarNestLayout.indentStep
+    )
+    .listRowInsets(.trailing, SidebarNestLayout.rowTrailingInset)
+    .listRowInsets(.vertical, SidebarNestLayout.rowVerticalInset)
     .moveDisabled(true)
     .help(isCollapsed ? "Expand \(label)" : "Collapse \(label)")
     .accessibilityLabel("\(label) group, \(isCollapsed ? "collapsed" : "expanded")")

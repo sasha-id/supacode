@@ -830,8 +830,8 @@ extension FileExplorerOutlineView.Coordinator: NSOutlineViewDelegate {
       let isLoading = childNode?.isLoading ?? false
       let hasListing = childNode?.listing != nil
       // First-time expansion shimmers the row's own label; a refresh (with a
-      // previous listing) keeps the spinner. Reduce Motion falls back to it too.
-      let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+      // previous listing) keeps the spinner. Reduced motion falls back to it too.
+      let reduceMotion = MotionPreference.reduceMotion
       let isFirstTimeLoading = isLoading && !hasListing
       let decoration = tree?.gitStatus.decoration(
         for: item.path,

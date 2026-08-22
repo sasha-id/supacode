@@ -45,6 +45,63 @@ print_fingerprint() {
   )
 }
 
+# Local escape hatch (uncommitted): Xcode 26.6's libtool silently drops every
+# archive member that is "not 8-byte aligned" (zig's main libghostty_zcu.o,
+# zlib's zutil.o, gettext's textdomain.o, ...) when merging the static
+# archives, so the xcframework's macOS slice ends up missing the ghostty C API
+# and zlib/gettext/macos-bridge symbols, and the app link fails. ar(1) has no
+# such alignment rule, so rebuild the slice from the libtool step's original
+# inputs (recorded in the zig cache manifests), re-lipo'd.
+repair_xcframework_macos_slice() {
+  local slice="${xcframework_path}/macos-arm64_x86_64/libghostty.a"
+  [ -f "${slice}" ] || return 0
+  if nm "${slice}" 2>/dev/null | grep -q " T _ghostty_surface_text"; then
+    return 0
+  fi
+  echo "note: xcframework macOS slice lacks the ghostty C API (libtool dropped unaligned members); rebuilding it with ar" >&2
+  local cache="${ghostty_local_cache_dir}"
+  local work
+  work="$(mktemp -d)"
+  local arch
+  for arch in arm64 x86_64; do
+    # Find the libtool run-step manifest (it lists a dozen archives) whose
+    # main ghostty archive targets macOS on this arch.
+    local manifest="" m main_lib
+    for m in "${cache}"/h/*.txt; do
+      [ "$(strings "${m}" | grep -c '\.a$')" -gt 5 ] || continue
+      main_lib="${cache}/$(strings "${m}" | grep '/libghostty\.a$' | awk '{print $NF}')"
+      [ -f "${main_lib}" ] || continue
+      [ "$(lipo -info "${main_lib}" 2>/dev/null | awk '{print $NF}')" = "${arch}" ] || continue
+      mkdir -p "${work}/probe"
+      (cd "${work}/probe" && ar -x "${main_lib}" base64.o && chmod u+rw base64.o)
+      if [ "$(vtool -show-build "${work}/probe/base64.o" 2>/dev/null | awk '/platform/{print $2; exit}')" = "MACOS" ]; then
+        manifest="${m}"
+      fi
+      rm -rf "${work}/probe"
+      [ -n "${manifest}" ] && break
+    done
+    if [ -z "${manifest}" ]; then
+      echo "error: no macOS ${arch} libtool manifest found in the zig cache" >&2
+      exit 1
+    fi
+    local i=0 rel objs=()
+    mkdir -p "${work}/${arch}"
+    while IFS= read -r rel; do
+      i=$((i + 1))
+      local d="${work}/${arch}/${i}"
+      mkdir -p "${d}"
+      (cd "${d}" && ar -x "${cache}/${rel}")
+      chmod -R u+rw "${d}"
+      rm -f "${d}/__.SYMDEF"
+      objs+=("${d}"/*)
+    done < <(strings "${manifest}" | grep '\.a$' | awk '{print $NF}')
+    ar rcs "${work}/${arch}.a" "${objs[@]}"
+    ranlib "${work}/${arch}.a"
+  done
+  lipo -create "${work}/arm64.a" "${work}/x86_64.a" -output "${slice}"
+  rm -rf "${work}"
+}
+
 prepare_xcframework() {
   local modulemap
   find "${xcframework_path}" -path '*/Headers/module.modulemap' -print0 | while IFS= read -r -d '' modulemap; do
@@ -192,5 +249,6 @@ fi
 cd "${ghostty_dir}"
 mise exec -- zig build -Doptimize=ReleaseFast -Demit-xcframework=true -Demit-macos-app="${ghostty_emit_macos_app}" -Dsentry=false --prefix "${ghostty_build_root}" --cache-dir "${ghostty_local_cache_dir}" --global-cache-dir "${ghostty_global_cache_dir}"
 rsync -a --delete "${ghostty_dir}/macos/GhosttyKit.xcframework/" "${xcframework_path}/"
+repair_xcframework_macos_slice
 prepare_xcframework
 printf '%s\n' "${fingerprint}" > "${ghostty_fingerprint_path}"

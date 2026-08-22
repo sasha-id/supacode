@@ -13,6 +13,18 @@ enum SidebarNestLayout {
   /// Width of a group header's disclosure chevron, narrower than the slot it
   /// sits in; the remainder is padded out after it.
   static let groupChevronWidth: CGFloat = 12
+  /// Gap from the leading edge to a row's content, clearing the repo row's
+  /// accent stripe and keeping worktree titles aligned under it. The stripe
+  /// lives in the row background, which `listRowInsets` doesn't touch, so this
+  /// only moves the content.
+  static let rowLeadingInset: CGFloat = 12
+  /// Matching gap on the trailing edge, before badges and section controls.
+  static let rowTrailingInset: CGFloat = 12
+  /// Vertical breathing room on a worktree row.
+  static let rowVerticalInset: CGFloat = 10
+  /// Repo header rows run a little taller than the worktrees under them, which
+  /// is what separates the two tiers now that neither draws a native header.
+  static let headerVerticalInset: CGFloat = 12
 }
 
 /// Repo identity carried alongside a sidebar row so the highlight sections
@@ -41,6 +53,8 @@ struct SidebarItemView: View {
   var nestDepth: Int = 0
   /// Non-nil only inside the global Pinned / Active sections.
   var highlightSubtitle: SidebarHighlightRepoTag?
+  @State private var isHovering = false
+  @Environment(\.sidebarRowTopSeparator) private var sidebarRowTopSeparator
 
   var body: some View {
     let resolved = ResolvedRowDisplay(
@@ -63,8 +77,7 @@ struct SidebarItemView: View {
           subtitle: resolved.subtitle,
           accent: resolved.accent,
           customTint: store.customTint,
-          isLifecycleBusy: store.lifecycle.isBusy,
-          isTaskRunning: store.isTaskRunning
+          isLifecycleBusy: store.lifecycle.isBusy
         )
         .equatable()
         Spacer(minLength: 0)
@@ -79,6 +92,7 @@ struct SidebarItemView: View {
         isFolder: store.kind == .folder,
         isRemote: store.isRemote,
         isMissing: store.isMissing,
+        isWorking: store.isTaskRunning,
         branchName: store.branchName,
         pullRequest: store.pullRequest,
         showsPullRequestInfo: showsPullRequestInfo,
@@ -86,9 +100,70 @@ struct SidebarItemView: View {
       )
     }
     .labelStyle(.verticallyCentered)
-    .listRowInsets(.leading, CGFloat(nestDepth) * SidebarNestLayout.indentStep)
-    .listRowInsets(.trailing, 4)
-    .listRowInsets(.vertical, 6)
+    .listRowInsets(
+      .leading,
+      SidebarNestLayout.rowLeadingInset + CGFloat(nestDepth) * SidebarNestLayout.indentStep
+    )
+    .listRowInsets(.trailing, SidebarNestLayout.rowTrailingInset)
+    .listRowInsets(.vertical, SidebarNestLayout.rowVerticalInset)
+    .listRowBackground(
+      SidebarRowChrome(
+        stripe: .none,
+        isHovering: isHovering,
+        showsTopSeparator: sidebarRowTopSeparator
+      )
+    )
+    .pointerStyle(.link)
+    .onHover { isHovering = $0 }
+  }
+}
+
+/// Row chrome shared by worktree rows and repo section headers: an optional
+/// 3px repo-accent stripe on the leading edge plus a 7%-primary hover fill
+/// (the `color-mix(foreground 7%)` formula, system-color compliant). Only a
+/// repository row draws a stripe — it marks where a repo begins, so the
+/// worktrees beneath it read as its children. Sits in `.listRowBackground`,
+/// beneath the native selection highlight.
+struct SidebarRowChrome: View {
+  /// Leading accent stripe. `.accent(nil)` is a repo the user never tinted; it
+  /// still gets a quiet neutral stripe.
+  enum Stripe: Equatable {
+    case none
+    case accent(RepositoryColor?)
+  }
+
+  let stripe: Stripe
+  let isHovering: Bool
+  /// Hairline along the top edge, marking where a repo section begins. Drawn
+  /// here rather than as its own list row so the rule costs no extra height.
+  var showsTopSeparator: Bool = false
+  @Environment(\.pixelLength) private var pixelLength
+
+  var body: some View {
+    // The outer `.frame` is load-bearing: a `ZStack` sizes to its children, so
+    // without it a stripe-only row would shrink to 3pt wide and center itself
+    // in the row instead of hugging the leading edge.
+    ZStack(alignment: .leading) {
+      if isHovering {
+        // Square and full-bleed so hover covers the whole row and reads as the
+        // same shape as the selection fill beneath it.
+        Color.primary.opacity(0.07)
+      }
+      if case .accent(let tint) = stripe {
+        UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 1.5, topTrailing: 1.5))
+          .fill(tint?.color ?? Color.secondary.opacity(0.3))
+          .frame(width: 3)
+          .padding(.vertical, 4)
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    .overlay(alignment: .top) {
+      if showsTopSeparator {
+        Rectangle()
+          .fill(Color(nsColor: .separatorColor))
+          .frame(height: pixelLength)
+      }
+    }
   }
 }
 
@@ -97,6 +172,9 @@ struct ResolvedRowDisplay: Equatable {
     case none
     /// Standard per-repo subtitle. Rendered in the row's accent color.
     case plain(String)
+    /// Main worktree: a neutral outline pill reading "Default"
+    /// instead of accent-colored text — the repo accent lives on the stripe.
+    case mainMarker
     /// Highlight-section subtitle: `repo · host · trail`. `repo` paints with
     /// `repoColor`, `trail` with the row's accent; `hostInfo` (when set) inserts
     /// `· host` plus a `wifi` glyph. `trail == nil` collapses to just the repo.
@@ -166,6 +244,8 @@ struct ResolvedRowDisplay: Equatable {
 
     if hideSubtitle || shouldHideOnMatch {
       self.subtitle = .none
+    } else if isMainWorktree {
+      self.subtitle = .mainMarker
     } else {
       self.subtitle = .plain(effectiveWorktreeName)
     }
@@ -187,9 +267,9 @@ enum SidebarCheckBadgeState: Equatable {
 
   var color: Color {
     switch self {
-    case .passing: .green
-    case .failing: .red
-    case .inProgress: .yellow
+    case .passing: .checkSuccess
+    case .failing: .checkFailure
+    case .inProgress: .checkRunning
     }
   }
 
@@ -242,14 +322,17 @@ enum SidebarPullRequestIcon: Equatable {
     }
   }
 
+  /// `.branch` and `.draft` stay hierarchical rather than taking a damped hue:
+  /// "no pull request" and "not ready yet" are the absence of a state, and a
+  /// colour would claim they are one.
   var color: AnyShapeStyle {
     switch self {
     case .branch: AnyShapeStyle(.secondary)
-    case .open: AnyShapeStyle(.green)
+    case .open: AnyShapeStyle(.pullRequestOpen)
     case .draft: AnyShapeStyle(.tertiary)
-    case .queued: AnyShapeStyle(.brown)
-    case .merged: AnyShapeStyle(.purple)
-    case .closed: AnyShapeStyle(.red)
+    case .queued: AnyShapeStyle(.pullRequestQueued)
+    case .merged: AnyShapeStyle(.pullRequestMerged)
+    case .closed: AnyShapeStyle(.pullRequestClosed)
     }
   }
 
@@ -273,9 +356,9 @@ private struct TitleView: View, Equatable {
   /// User-supplied row tint. When set, paints the title; otherwise the title uses the default.
   let customTint: RepositoryColor?
   let isLifecycleBusy: Bool
-  let isTaskRunning: Bool
   // `==` ignores @Environment; SwiftUI tracks env changes separately.
   @Environment(\.backgroundProminence) private var backgroundProminence
+  @Environment(\.pixelLength) private var pixelLength
 
   static func == (lhs: Self, rhs: Self) -> Bool {
     lhs.name == rhs.name
@@ -283,11 +366,12 @@ private struct TitleView: View, Equatable {
       && lhs.accent == rhs.accent
       && lhs.customTint == rhs.customTint
       && lhs.isLifecycleBusy == rhs.isLifecycleBusy
-      && lhs.isTaskRunning == rhs.isTaskRunning
   }
 
   var body: some View {
-    let isBusy = isLifecycleBusy || isTaskRunning
+    // Agent / shell work shows as the leading `SidebarWorkingSpinner` now; the
+    // shimmer is left to the lifecycle transitions, which have no spinner.
+    let isBusy = isLifecycleBusy
     let isEmphasized = backgroundProminence == .increased
     let accentStyle = accent.shapeStyle(emphasized: isEmphasized)
     VStack(alignment: .leading, spacing: 0) {
@@ -307,6 +391,16 @@ private struct TitleView: View, Equatable {
           .appFont(.footnote)
           .foregroundStyle(accentStyle)
           .lineLimit(1)
+      case .mainMarker:
+        Text("Default")
+          .appFont(.caption2)
+          .foregroundStyle(.secondary)
+          .padding(.horizontal, 5)
+          .padding(.vertical, 1)
+          .overlay {
+            Capsule()
+              .strokeBorder(Color(nsColor: .separatorColor), lineWidth: pixelLength)
+          }
       case .highlight(let repo, let repoColor, let trail, let hostInfo):
         let repoStyle: AnyShapeStyle =
           isEmphasized
@@ -348,25 +442,36 @@ private struct IconView: View {
   let isFolder: Bool
   let isRemote: Bool
   let isMissing: Bool
+  let isWorking: Bool
   let branchName: String
   let pullRequest: ForgePullRequest?
   let showsPullRequestInfo: Bool
   let lifecycle: SidebarItemFeature.State.Lifecycle
 
   var body: some View {
-    let display = WorktreePullRequestDisplay(
-      worktreeName: branchName,
-      pullRequest: showsPullRequestInfo ? pullRequest : nil,
-    )
-    IconContent(
-      isFolder: isFolder,
-      isRemote: isRemote,
-      isMissing: isMissing,
-      icon: SidebarPullRequestIcon.resolve(display.pullRequest),
-      checkBadgeState: SidebarCheckBadgeState.resolve(display.pullRequest),
-      rowState: IconRowState(lifecycle),
-    )
-    .equatable()
+    let rowState = IconRowState(lifecycle)
+    // The spinner stands in for the resting glyph only. A row mid-lifecycle or
+    // with a missing working directory has something more urgent to show, and
+    // keeps its own icon. Branching here rather than inside `IconContent` keeps
+    // the spinner out of the equatable subtree, which never let its frames tick.
+    if isWorking, rowState == .idle, !isMissing {
+      SidebarWorkingSpinner()
+        .frame(width: SidebarNestLayout.leadingSlotWidth, height: 16)
+    } else {
+      let display = WorktreePullRequestDisplay(
+        worktreeName: branchName,
+        pullRequest: showsPullRequestInfo ? pullRequest : nil,
+      )
+      IconContent(
+        isFolder: isFolder,
+        isRemote: isRemote,
+        isMissing: isMissing,
+        icon: SidebarPullRequestIcon.resolve(display.pullRequest),
+        checkBadgeState: SidebarCheckBadgeState.resolve(display.pullRequest),
+        rowState: rowState,
+      )
+      .equatable()
+    }
   }
 }
 
@@ -464,14 +569,12 @@ private struct IconContent: View, Equatable {
           .aspectRatio(contentMode: .fit)
           .fontWeight(.semibold)
           .foregroundStyle(folderColor)
-          .opacity(isEmphasized ? 1 : 0.6)
       } else {
         Image(icon.assetName)
           .renderingMode(.template)
           .resizable()
           .aspectRatio(contentMode: .fit)
           .foregroundStyle(isEmphasized ? AnyShapeStyle(.secondary) : icon.color)
-          .opacity(isEmphasized ? 1 : 0.6)
       }
     }
     .frame(width: SidebarNestLayout.leadingSlotWidth, height: 16)
@@ -495,6 +598,12 @@ private struct IconContent: View, Equatable {
           .offset(x: 2, y: 2)
       }
     }
+    // Fades the glyph and its badge together. Sitting on the glyph alone, this
+    // left the badge in the overlay at full strength over a 60% icon, so the
+    // check circle outshouted the icon it annotates on every row. One
+    // transparency layer for the composite also lets the badge's own circle
+    // cover the glyph beneath it instead of letting it bleed through.
+    .opacity(isEmphasized ? 1 : 0.75)
     .help(helpText)
     .accessibilityLabel(accessibilityLabel ?? "")
     .accessibilityHidden(accessibilityLabel == nil)
@@ -679,4 +788,10 @@ extension EnvironmentValues {
   @Entry var focusNotificationAction: (WorktreeTerminalNotification) -> Void = { _ in
     notificationEnvironmentLogger.warning("focusNotificationAction called but was never set in the environment.")
   }
+
+  /// Set on a section whose single row opens a new repository, so the row draws
+  /// the inter-repo rule that a git repo's header row draws for itself. Only
+  /// ever set on one-row sections — on a multi-row section every row would
+  /// draw it.
+  @Entry var sidebarRowTopSeparator: Bool = false
 }

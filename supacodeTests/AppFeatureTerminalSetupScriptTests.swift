@@ -382,10 +382,43 @@ struct AppFeatureTerminalSetupScriptTests {
     )
   }
 
-  @Test(.dependencies) func selectedWorktreeChangedCarriesSetupScriptFlagForPendingWorktree() async {
-    // A freshly created worktree emits `selectedWorktreeChanged` before
-    // `worktreeCreated`, so this bootstrap must carry the setup-script intent
-    // or the later, setup-aware call finds the tab already made.
+  @Test(.dependencies) func worktreeCreatedCarriesTerminalFocusWhenArmed() async {
+    // Selection stopped bootstrapping tabs, so this is the only creator for a
+    // brand-new worktree and has to focus the tab the creation asked for.
+    let worktree = makeWorktree()
+    var repositoriesState = makeRepositoriesState(
+      worktree: worktree,
+      pendingSetupScript: true,
+      selected: true
+    )
+    repositoriesState.sidebarItems[id: worktree.id]?.shouldFocusTerminal = true
+    let sent = LockIsolated<[TerminalClient.Command]>([])
+    let store = TestStore(
+      initialState: AppFeature.State(
+        repositories: repositoriesState,
+        settings: SettingsFeature.State()
+      )
+    ) {
+      AppFeature()
+    } withDependencies: {
+      $0.terminalClient.send = { command in
+        sent.withValue { $0.append(command) }
+      }
+    }
+
+    await store.send(.repositories(.delegate(.worktreeCreated(worktree))))
+    await store.finish()
+    #expect(
+      sent.value == [
+        .ensureInitialTab(worktree, runSetupScriptIfNew: true, focusing: true)
+      ]
+    )
+  }
+
+  @Test(.dependencies) func selectingAWorktreeActivatesItWithoutOpeningATab() async {
+    // Selection is not a request for a terminal: an empty worktree keeps its
+    // "Press ⌘T" hint instead of being handed a tab behind the click. Pending
+    // here too, so the setup-script bootstrap cannot sneak a tab in either.
     let worktree = makeWorktree()
     let repositoriesState = makeRepositoriesState(
       worktree: worktree,
@@ -411,40 +444,9 @@ struct AppFeatureTerminalSetupScriptTests {
 
     await store.send(.repositories(.delegate(.selectedWorktreeChanged(worktree))))
     await store.finish()
-    #expect(
-      sent.value.contains(.ensureInitialTab(worktree, runSetupScriptIfNew: true, focusing: false))
-    )
-  }
-
-  @Test(.dependencies) func selectedWorktreeChangedOmitsSetupScriptFlagForIdleWorktree() async {
-    let worktree = makeWorktree()
-    let repositoriesState = makeRepositoriesState(
-      worktree: worktree,
-      pendingSetupScript: false,
-      selected: true
-    )
-    let sent = LockIsolated<[TerminalClient.Command]>([])
-    let storage = SettingsTestStorage()
-    let store = TestStore(
-      initialState: AppFeature.State(
-        repositories: repositoriesState,
-        settings: SettingsFeature.State()
-      )
-    ) {
-      AppFeature()
-    } withDependencies: {
-      $0.terminalClient.send = { command in sent.withValue { $0.append(command) } }
-      $0.worktreeInfoWatcher.send = { _ in }
-      $0.settingsFileStorage = storage.storage
-      $0.settingsFileURL = URL(fileURLWithPath: "/tmp/supacode-settings-\(UUID().uuidString).json")
-    }
-    store.exhaustivity = .off
-
-    await store.send(.repositories(.delegate(.selectedWorktreeChanged(worktree))))
-    await store.finish()
-    #expect(
-      sent.value.contains(.ensureInitialTab(worktree, runSetupScriptIfNew: false, focusing: false))
-    )
+    #expect(sent.value.contains(.activateWorktree(worktree, focusing: false)))
+    #expect(!sent.value.contains { if case .ensureInitialTab = $0 { return true } else { return false } })
+    #expect(!sent.value.contains { if case .createTab = $0 { return true } else { return false } })
   }
 
   private func makeWorktree() -> Worktree {
@@ -487,7 +489,7 @@ struct AppFeatureTerminalSetupScriptTests {
     await store.send(.repositories(.delegate(.selectedWorktreeChanged(worktree))))
     await store.finish()
     // The activation command carries the focus intent so the host claims focus.
-    #expect(sent.value.contains(.ensureInitialTab(worktree, runSetupScriptIfNew: false, focusing: true)))
+    #expect(sent.value.contains(.activateWorktree(worktree, focusing: true)))
   }
 
   private func makeRepositoriesState(

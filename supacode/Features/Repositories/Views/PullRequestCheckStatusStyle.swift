@@ -9,19 +9,19 @@ struct PullRequestCheckStatusStyle {
     switch state {
     case .success:
       self.symbol = "checkmark.circle.fill"
-      self.color = .green
+      self.color = .checkSuccess
       self.label = "Success"
     case .failure:
       self.symbol = "xmark.circle.fill"
-      self.color = .red
+      self.color = .checkFailure
       self.label = "Failed"
     case .inProgress:
       self.symbol = "arrow.triangle.2.circlepath.circle.fill"
-      self.color = .yellow
+      self.color = .checkRunning
       self.label = "In progress"
     case .expected:
       self.symbol = "clock.circle.fill"
-      self.color = .yellow
+      self.color = .checkRunning
       self.label = "Expected"
     case .skipped:
       self.symbol = "minus.circle.fill"

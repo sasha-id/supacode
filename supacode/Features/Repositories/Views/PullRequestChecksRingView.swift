@@ -50,11 +50,11 @@ struct PullRequestChecksRingView: View {
       )
       start = end
     }
-    addSegment(id: "failed", count: breakdown.failed, color: .red)
-    addSegment(id: "inProgress", count: breakdown.inProgress, color: .yellow)
+    addSegment(id: "failed", count: breakdown.failed, color: .checkFailure)
+    addSegment(id: "inProgress", count: breakdown.inProgress, color: .checkRunning)
     addSegment(id: "skipped", count: breakdown.skipped, color: .gray)
-    addSegment(id: "expected", count: breakdown.expected, color: .yellow)
-    addSegment(id: "passed", count: breakdown.passed, color: .green)
+    addSegment(id: "expected", count: breakdown.expected, color: .checkRunning)
+    addSegment(id: "passed", count: breakdown.passed, color: .checkSuccess)
     return segments
   }
 

@@ -67,6 +67,10 @@ struct TerminalClient {
     /// command; the manager picks placement (tab in the zoomed/top-right pane, or a split).
     case openFileWithScript(Worktree, input: String)
     case ensureInitialTab(Worktree, runSetupScriptIfNew: Bool, focusing: Bool)
+    /// Wires up a selected worktree's host and layout without opening anything.
+    /// Selection is not a request for a terminal: a worktree with no tabs stays
+    /// empty until the user asks for one with ⌘T.
+    case activateWorktree(Worktree, focusing: Bool)
     case stopRunScript(Worktree, focusing: Bool = true)
     case stopScript(Worktree, definitionID: UUID, focusing: Bool = true)
     case runBlockingScript(Worktree, kind: BlockingScriptKind, script: String, focusing: Bool = true)

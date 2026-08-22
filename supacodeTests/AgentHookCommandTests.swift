@@ -46,15 +46,18 @@ struct AgentHookCommandTests {
 
   // MARK: - Claude canonical hook map.
 
-  @Test func claudePostToolUseFiresIdleNotBusy() throws {
-    // PostToolUse releases the shimmer when a tool finishes, so `busy` tracks
-    // active tool execution rather than the whole turn.
+  @Test func claudePostToolUseFiresBusyNotIdle() throws {
+    // A finished tool call is not a finished turn: the model goes straight back
+    // to thinking, and that gap is most of a turn's wall time. Firing `idle`
+    // here parked the row on idle for all of it. Re-asserting `busy` also
+    // clears the `awaitingInput` that the AskUserQuestion / ExitPlanMode
+    // matcher set, once the user has answered.
     let groups = try ClaudeHookSettings.hooksByEvent()
     let postToolUse = try #require(groups["PostToolUse"])
     let commands = Self.commandStrings(in: postToolUse)
     #expect(!commands.isEmpty)
-    #expect(commands.allSatisfy { $0.contains("event=idle") })
-    #expect(commands.allSatisfy { !$0.contains("event=busy") })
+    #expect(commands.allSatisfy { $0.contains("event=busy") })
+    #expect(commands.allSatisfy { !$0.contains("event=idle") })
   }
 
   @Test func claudePreToolUseOrdersAwaitingAfterBusy() throws {
