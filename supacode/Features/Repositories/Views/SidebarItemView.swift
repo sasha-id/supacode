@@ -267,7 +267,7 @@ enum SidebarCheckBadgeState: Equatable {
 
   var color: Color {
     switch self {
-    case .passing: .green
+    case .passing: .checkSuccess
     case .failing: .red
     case .inProgress: .yellow
     }
