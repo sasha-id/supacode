@@ -127,6 +127,16 @@ struct SupacodeApp: App {
   @State private var store: StoreOf<AppFeature>
 
   @MainActor init() {
+    // Run headless under test. Set here rather than in the delegate's
+    // `applicationDidFinishLaunching`, which is already too late: the scene has
+    // been built by then. This keeps the test hosts off the Dock and out of the
+    // app switcher; the suppressed launch behavior on the main window scene is
+    // what keeps their windows off screen.
+    if ProcessInfo.processInfo.isRunningUnitTests,
+      !NSApplication.shared.setActivationPolicy(.prohibited)
+    {
+      SupaLogger("App").error("setActivationPolicy(.prohibited) refused; test hosts stay in the Dock.")
+    }
     NSWindow.allowsAutomaticWindowTabbing = false
     UserDefaults.standard.set(200, forKey: "NSInitialToolTipDelay")
     // Relocate config out of `~/.supacode` into `~/.config/supacode` and move
@@ -630,6 +640,13 @@ struct SupacodeApp: App {
       .openSettingsOnSelection(store: store)
       .openDeeplinkReferenceOnRequest(store: store)
     }
+    // Every test bundle sets `TEST_HOST` to this app, so a test run launches it
+    // once per bundle — several at once under parallel testing — and each launch
+    // threw this window in front of whatever the user was doing and took focus
+    // with it. Suppressing the launch presentation is what keeps them off
+    // screen; the `.prohibited` policy set in `init()` only stops the Dock icon
+    // and the app switcher, not a window SwiftUI has been told to present.
+    .defaultLaunchBehavior(ProcessInfo.processInfo.isRunningUnitTests ? .suppressed : .presented)
     .handlesExternalEvents(matching: [])
     .environment(ghosttyShortcuts)
     .environment(commandKeyObserver)

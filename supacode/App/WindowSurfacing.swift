@@ -3,6 +3,19 @@ import SupacodeSettingsShared
 
 private let visibilityLogger = SupaLogger("AppVisibility")
 
+extension ProcessInfo {
+  /// Whether this process was launched by `xctest` as a unit-test host.
+  ///
+  /// Every test bundle sets `TEST_HOST` to the app itself, so a test run
+  /// launches the real app — once per bundle, several at once under parallel
+  /// testing. `XCTestConfigurationFilePath` is injected by the test runner and
+  /// by nothing else, which makes it the only signal available this early,
+  /// before the first window is built.
+  var isRunningUnitTests: Bool {
+    environment["XCTestConfigurationFilePath"] != nil
+  }
+}
+
 extension NSApplication {
   /// Applies the Dock/menu-bar visibility mode: `.menuBar` runs as an accessory
   /// (no Dock icon), every other mode as a regular app. Returns false when
@@ -10,6 +23,11 @@ extension NSApplication {
   @MainActor
   @discardableResult
   func applyActivationPolicy(for visibility: AppVisibility) -> Bool {
+    // A test run pins the app `.prohibited` at launch. Neither the saved
+    // visibility nor a settings change made mid-test may drag it back on
+    // screen. Reported as applied rather than refused: there is nothing to do
+    // here, and a `false` would read to the caller as a failure to surface.
+    guard !ProcessInfo.processInfo.isRunningUnitTests else { return true }
     let policy: NSApplication.ActivationPolicy = visibility.hidesDockIcon ? .accessory : .regular
     guard activationPolicy() != policy else { return true }
     if setActivationPolicy(policy) { return true }
