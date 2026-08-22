@@ -98,6 +98,9 @@ struct LayoutChangeScopeTests {
     #expect(TerminalsFeature.changeScope(.focusPane(.pane(paneID))) == .structural)
     #expect(TerminalsFeature.changeScope(.hibernateTab(id: tabID)) == .structural)
     #expect(TerminalsFeature.changeScope(.wakeTab(id: tabID)) == .structural)
+    // The surface only exists once the deferred wake lands, so the hooks have
+    // to re-run then, not at the click.
+    #expect(TerminalsFeature.changeScope(.runtime(.wakeCompleted(tab: tabID))) == .structural)
     #expect(TerminalsFeature.changeScope(.enterWindowMode(paneID: paneID)) == .structural)
     #expect(TerminalsFeature.changeScope(.equalizePanes) == .structural)
   }

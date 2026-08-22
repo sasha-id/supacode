@@ -400,18 +400,7 @@ final class WorktreeTerminalManager {
     case .selectRelativeTab(let worktree, let forward):
       selectRelativeTab(forward: forward, in: worktree)
     case .focusSurface(let worktree, let tabID, let surfaceID, let input):
-      let host = host(for: worktree)
-      // Surface-first: the tab ID is a hint; the surface's actual owner wins.
-      guard let owningTab = host.tabID(containing: surfaceID) ?? presentTab(tabID, in: worktree.id) else {
-        terminalLogger.warning("focusSurface: surface \(surfaceID) not found in worktree \(worktree.id).")
-        break
-      }
-      sendLayout(worktree.id, .wakeTab(id: owningTab))
-      sendLayout(worktree.id, .selectTab(id: owningTab))
-      host.liveSurface(surfaceID)?.requestFocus()
-      if let input, !input.isEmpty {
-        host.focusAndInsertText(input + "\r")
-      }
+      focusSurface(in: worktree, tabID: tabID, surfaceID: surfaceID, input: input)
     case .splitSurface(
       let worktree, let tabID, let surfaceID, let direction, let input, let id, let focusing
     ):
@@ -490,6 +479,27 @@ final class WorktreeTerminalManager {
     let target = focusedPane.tabs[targetIndex]
     sendLayout(worktree.id, .wakeTab(id: target.id))
     sendLayout(worktree.id, .selectTab(id: target.id))
+  }
+
+  private func focusSurface(in worktree: Worktree, tabID: TabID, surfaceID: UUID, input: String?) {
+    let host = host(for: worktree)
+    // Surface-first: the tab ID is a hint; the surface's actual owner wins.
+    guard let owningTab = host.tabID(containing: surfaceID) ?? presentTab(tabID, in: worktree.id) else {
+      terminalLogger.warning("focusSurface: surface \(surfaceID) not found in worktree \(worktree.id).")
+      return
+    }
+    sendLayout(worktree.id, .wakeTab(id: owningTab))
+    sendLayout(worktree.id, .selectTab(id: owningTab))
+    if let surface = host.liveSurface(surfaceID) {
+      surface.requestFocus()
+    } else {
+      // A wake provisions off the reducer turn; latch the claim so it lands
+      // when the surface appears.
+      host.focusSelectedTab()
+    }
+    if let input, !input.isEmpty {
+      host.focusAndInsertText(input + "\r")
+    }
   }
 
   /// The tab ID when it exists in the worktree's layout, else nil.

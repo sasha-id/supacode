@@ -409,6 +409,12 @@ struct PaneStripView: View {
                     .allowsHitTesting(false)
                 }
               }
+          } else if let tabID = pane.selectedTab?.id, store.wakingTabs.contains(tabID) {
+            // A wake builds its surface off the interaction turn. Hold the
+            // window's terminal background over the pane until it lands: the
+            // error state would flash, and the fresh surface's zmx re-attach
+            // clears and replays into the same empty background anyway.
+            Color.clear
           } else {
             EmptyTerminalPaneView(message: "This terminal is unavailable.")
           }

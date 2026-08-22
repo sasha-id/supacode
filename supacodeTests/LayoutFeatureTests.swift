@@ -77,11 +77,17 @@ struct LayoutFeatureTests {
     let store: TestStoreOf<LayoutFeature>
     let runtime: ContentRuntime
     let recorder: ContentRecorder
+    let clock: TestClock<Duration>
     let paneID: PaneID
     let tabID: TabID
     let contentID: ContentID
 
     var mock: MockTabContent? { recorder.contents[contentID] }
+
+    /// Releases the deferred wake provisioning.
+    func settleWake() async {
+      await clock.advance(by: LayoutFeature.wakeDeferral)
+    }
   }
 
   // MARK: - Helpers.
@@ -118,6 +124,7 @@ struct LayoutFeatureTests {
     let store: TestStoreOf<LayoutFeature>
     let runtime: ContentRuntime
     let recorder: ContentRecorder
+    let clock: TestClock<Duration>
   }
 
   private func makeStore(
@@ -127,12 +134,14 @@ struct LayoutFeatureTests {
   ) -> StoreBundle {
     let runtime = ContentRuntime()
     let recorder = ContentRecorder()
+    let clock = TestClock()
     let store = TestStore(
       initialState: LayoutFeature.State(id: WorktreeID("/tmp/layout-feature"), layout: layout)
     ) {
       LayoutFeature()
     } withDependencies: {
       $0.uuid = .incrementing
+      $0.continuousClock = clock
       $0.contentRuntime = runtime
       $0[SplitZoomPolicy.self] = SplitZoomPolicy(preservesZoomOnNavigation: { preserveZoom })
       $0.layoutContentFactory = LayoutContentFactory(
@@ -142,7 +151,7 @@ struct LayoutFeatureTests {
       // installs a real (if inert) killer so close paths stay exercisable.
       $0[ContentSessionKiller.self] = killer ?? ContentSessionKiller(kill: { _, _ in })
     }
-    return StoreBundle(store: store, runtime: runtime, recorder: recorder)
+    return StoreBundle(store: store, runtime: runtime, recorder: recorder, clock: clock)
   }
 
   /// Builds a store whose layout holds one pane with one tab, created through
@@ -173,6 +182,7 @@ struct LayoutFeatureTests {
       store: bundle.store,
       runtime: bundle.runtime,
       recorder: bundle.recorder,
+      clock: bundle.clock,
       paneID: paneID,
       tabID: tabID,
       contentID: contentID
@@ -1318,12 +1328,68 @@ struct LayoutFeatureTests {
         ContentSnapshot(id: harness.contentID, state: .terminal(marker))
       $0.renderEpoch = 1
     }
+    // The click's turn only marks the tab waking; the surface is built by the
+    // effect that follows, so no Metal or zmx work lands inside reduce.
     await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
       $0.renderEpoch = 2
+    }
+    #expect(mock.renderer == nil)
+    // Still nothing a fraction into the deferral: the build has to clear the
+    // runloop turn that commits the placeholder, not merely leave the reducer.
+    await harness.clock.advance(by: LayoutFeature.wakeDeferral / 2)
+    #expect(mock.renderer == nil)
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
+      $0.wakingTabs = []
+      $0.renderEpoch = 3
     }
     let restored = try #require(ContentGeometry.restored(grid))
     #expect(mock.startGeometries == [.fallback, restored])
     #expect(harness.store.state.layout.isConsistent)
+  }
+
+  @Test func secondWakeWhileProvisioningIsIgnored() async throws {
+    let harness = await makeHarness()
+    let mock = try #require(harness.mock)
+    await harness.store.send(.hibernateTab(id: harness.tabID)) {
+      $0.renderEpoch = 1
+    }
+    await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
+      $0.renderEpoch = 2
+    }
+    // A second click while the first wake is in flight must not spawn a
+    // duplicate session behind it.
+    await harness.store.send(.wakeTab(id: harness.tabID))
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
+      $0.wakingTabs = []
+      $0.renderEpoch = 3
+    }
+    #expect(mock.startGeometries.count == 2)
+  }
+
+  @Test func hibernatingAWakingTabCancelsTheProvisioning() async throws {
+    let harness = await makeHarness()
+    let mock = try #require(harness.mock)
+    await harness.store.send(.hibernateTab(id: harness.tabID)) {
+      $0.renderEpoch = 1
+    }
+    await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
+      $0.renderEpoch = 2
+    }
+    // Hibernating before the wake lands cancels it; no `wakeCompleted` follows
+    // and the tab stays dormant.
+    await harness.store.send(.hibernateTab(id: harness.tabID)) {
+      $0.wakingTabs = []
+      $0.renderEpoch = 4
+    }
+    await harness.settleWake()
+    await harness.store.finish()
+    #expect(mock.renderer == nil)
+    #expect(mock.startGeometries.count == 1)
   }
 
   @Test func wakeTabWithoutRuntimeContentProvisionsViaFactory() async throws {
@@ -1342,7 +1408,13 @@ struct LayoutFeatureTests {
     // Simulate a relaunch: the runtime lost the entry, no tombstone.
     harness.runtime.remove(harness.contentID, tombstone: false)
     await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
       $0.renderEpoch = 2
+    }
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
+      $0.wakingTabs = []
+      $0.renderEpoch = 3
     }
     let revived = try #require(harness.recorder.contents[harness.contentID])
     #expect(revived !== original)
@@ -1377,7 +1449,13 @@ struct LayoutFeatureTests {
       $0.renderEpoch = 1
     }
     await harness.store.send(.wakeTab(id: tabID)) {
+      $0.wakingTabs = [tabID]
       $0.renderEpoch = 2
+    }
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: tabID))) {
+      $0.wakingTabs = []
+      $0.renderEpoch = 3
     }
     #expect(mock.startGeometries == [custom, .fallback])
     #expect(harness.store.state.layout.isConsistent)

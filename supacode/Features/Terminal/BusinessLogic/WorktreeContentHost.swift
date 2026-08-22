@@ -63,6 +63,11 @@ final class WorktreeContentHost {
   /// surface is live and its window is key; it targets whatever pane is focused
   /// then, so it follows the user, and is cleared on worktree deselection.
   @ObservationIgnored private var pendingFocusClaim = false
+  /// Text a focus request carried while its surface was still being
+  /// provisioned, bound to the content it was aimed at, so a deferred wake
+  /// never eats input. The claim that resolves delivers it only when it lands
+  /// on that same content and drops it otherwise.
+  @ObservationIgnored private var pendingFocusText: (surfaceID: UUID, text: String)?
   @ObservationIgnored private(set) var isWorktreeSelected = false
   private var lastWindowIsKey: Bool?
   private var lastWindowIsVisible: Bool?
@@ -697,7 +702,10 @@ final class WorktreeContentHost {
     isWorktreeSelected = selected
     // Leaving the worktree cancels an unresolved focus claim; re-selecting
     // re-arms it through `focusSelectedTab`.
-    if !selected { pendingFocusClaim = false }
+    if !selected {
+      pendingFocusClaim = false
+      pendingFocusText = nil
+    }
     reassertSurfaceActivity()
   }
 
@@ -735,15 +743,28 @@ final class WorktreeContentHost {
       pendingFocusClaim = true
       return
     }
-    claimFocus(surface)
+    claimFocus(surface, contentID: contentID)
   }
 
   /// Makes the focused surface first responder and reconciles every surface's
   /// focus flag, so only the focused pane shows a cursor.
-  private func claimFocus(_ surface: GhosttySurfaceView) {
+  private func claimFocus(_ surface: GhosttySurfaceView, contentID: UUID) {
     pendingFocusClaim = false
     if surface.window?.firstResponder !== surface {
       surface.requestFocus()
+    }
+    if let pending = pendingFocusText {
+      pendingFocusText = nil
+      if pending.surfaceID == contentID {
+        surface.sendText(pending.text)
+      } else {
+        // The claim landed on a terminal the text was not aimed at — the user
+        // moved on while the wake provisioned. Typing it here would run it in
+        // the wrong shell, so it dies with the claim.
+        Self.logger.warning(
+          "focusAndInsertText: dropped \(pending.text.count) latched characters; focus resolved on another surface"
+        )
+      }
     }
     // The host is created after the window-activity observer fires, so it can
     // miss the initial key event and leave `lastWindowIsKey` nil; sync from the
@@ -767,13 +788,26 @@ final class WorktreeContentHost {
       let surface = liveSurface(contentID),
       surface.window?.isKeyWindow == true
     else { return false }
-    claimFocus(surface)
+    claimFocus(surface, contentID: contentID)
     return true
   }
 
   func focusAndInsertText(_ text: String) {
-    guard let contentID = focusedContentID, let surface = liveSurface(contentID) else {
-      Self.logger.warning("focusAndInsertText: no focused surface")
+    guard let contentID = focusedContentID else {
+      Self.logger.warning("focusAndInsertText: no focused content")
+      return
+    }
+    guard let surface = liveSurface(contentID) else {
+      // A wake provisions off the reducer turn, so the target surface may not
+      // exist yet; latch the text against that content instead of dropping it.
+      // Same target appends, so type-ahead during a wake arrives whole.
+      Self.logger.info("focusAndInsertText: no live surface yet; latching \(text.count) characters")
+      if pendingFocusText?.surfaceID == contentID {
+        pendingFocusText?.text.append(text)
+      } else {
+        pendingFocusText = (surfaceID: contentID, text: text)
+      }
+      focusSelectedTab()
       return
     }
     Self.logger.info("focusAndInsertText: inserting \(text.count) characters")
@@ -802,7 +836,12 @@ final class WorktreeContentHost {
     }
     sendLayoutAction(.wakeTab(id: tabID))
     sendLayoutAction(.selectTab(id: tabID))
-    guard let surface = liveSurface(surfaceID) else { return false }
+    guard let surface = liveSurface(surfaceID) else {
+      // The wake is still provisioning; latch the claim so it lands when the
+      // surface appears instead of reporting a failure the user can see.
+      focusSelectedTab()
+      return true
+    }
     surface.requestFocus()
     return true
   }
@@ -1130,6 +1169,9 @@ final class WorktreeContentHost {
     lastCustomNotificationAt.removeValue(forKey: surfaceID)
     pendingExplicitSurfaceCloseIDs.remove(surfaceID)
     bypassCloseConfirmationSurfaceIDs.remove(surfaceID)
+    if pendingFocusText?.surfaceID == surfaceID {
+      pendingFocusText = nil
+    }
   }
 
   /// A content hibernated: keep its counter and dedupe state, cancel nothing
