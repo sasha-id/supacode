@@ -19,6 +19,7 @@ struct ContentView: View {
   @Bindable var repositoriesStore: StoreOf<RepositoriesFeature>
   let terminalManager: WorktreeTerminalManager
   @Environment(\.scenePhase) private var scenePhase
+  @Environment(\.colorScheme) private var colorScheme
   @Environment(GhosttyShortcutManager.self) private var ghosttyShortcuts
   @State private var leftSidebarVisibility: NavigationSplitViewVisibility = .all
 
@@ -34,9 +35,16 @@ struct ContentView: View {
     #endif
     return NavigationSplitView(columnVisibility: $leftSidebarVisibility) {
       SidebarView(store: repositoriesStore, terminalManager: terminalManager)
-        .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 400)
         .safeAreaInset(edge: .bottom, spacing: 0) {
           SidebarBottomCardView(store: store)
+        }
+        // Applied outside the safe-area inset so the bottom card sits on the
+        // same ground as the rows. Only in dark appearance: light appearance
+        // keeps the translucent sidebar material, which its dark row text
+        // needs to stay legible.
+        .background {
+          if colorScheme == .dark { Color.sidebarInk }
         }
     } detail: {
       WorktreeDetailView(store: store, terminalManager: terminalManager)

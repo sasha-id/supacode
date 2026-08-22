@@ -70,9 +70,9 @@ struct SidebarListView: View {
       // `.sidebar` draws selection as a rounded pill inset from both edges and
       // pads every section apart, which left a dead strip under each row that
       // the hover fill couldn't reach. `.plain` gives full-bleed square rows;
-      // the repo separators are ours (`SidebarRowChrome`), and the sidebar's
-      // translucency comes from the split-view column, not the list, so the
-      // hidden scroll background keeps it showing through.
+      // the repo separators are ours (`SidebarRowChrome`), and the column's
+      // own ground is painted behind the list, so the hidden scroll background
+      // lets it through.
       .listStyle(.plain)
       .scrollContentBackground(.hidden)
       .focused($isSidebarFocused)
@@ -718,4 +718,12 @@ private struct SidebarRightArrowMonitor: NSViewRepresentable {
       monitor = nil
     }
   }
+}
+
+extension ShapeStyle where Self == Color {
+  /// The sidebar column's ground in dark appearance: a flat ink instead of the
+  /// translucent system sidebar material, so the column reads as one surface
+  /// rather than picking up whatever is behind the window. Light appearance
+  /// keeps the material — see `ContentView`.
+  static var sidebarInk: Color { Color(red: 0x29 / 255, green: 0x29 / 255, blue: 0x38 / 255) }
 }
