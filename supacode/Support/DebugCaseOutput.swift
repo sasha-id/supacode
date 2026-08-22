@@ -1,7 +1,6 @@
 import ComposableArchitecture
 import CustomDump
 import Foundation
-import Sentry
 import SupacodeSettingsShared
 
 extension Reducer where State: Equatable {
@@ -11,15 +10,26 @@ extension Reducer where State: Equatable {
   }
 }
 
+#if DEBUG
+  private enum LogActions {
+    static let isEnabled = ProcessInfo.processInfo.environment["SUPACODE_LOG_ACTIONS"] != nil
+  }
+#endif
+
 struct LogActionsReducer<Base: Reducer>: Reducer where Base.State: Equatable {
   let base: Base
 
-  private let logger = SupaLogger("TCA")
+  #if DEBUG
+    private let logger = SupaLogger("TCA")
+  #endif
 
   func reduce(into state: inout Base.State, action: Base.Action) -> Effect<Base.Action> {
-    let actionLabel = debugCaseOutput(action)
-    logger.debug("Action: \(actionLabel)")
     #if DEBUG
+      guard LogActions.isEnabled else {
+        return base.reduce(into: &state, action: action)
+      }
+      let actionLabel = debugCaseOutput(action)
+      logger.debug("Action: \(actionLabel)")
       let previousState = state
       let effects = base.reduce(into: &state, action: action)
       if previousState != state, let diff = CustomDump.diff(previousState, state) {
@@ -27,10 +37,6 @@ struct LogActionsReducer<Base: Reducer>: Reducer where Base.State: Equatable {
       }
       return effects
     #else
-      SentrySDK.logger.info("Action: \(actionLabel)")
-      let breadcrumb = Breadcrumb(level: .debug, category: "action")
-      breadcrumb.message = actionLabel
-      SentrySDK.addBreadcrumb(breadcrumb)
       return base.reduce(into: &state, action: action)
     #endif
   }

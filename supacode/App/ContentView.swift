@@ -10,10 +10,6 @@ import SupacodeSettingsShared
 import SwiftUI
 import UniformTypeIdentifiers
 
-#if DEBUG
-  private nonisolated let contentRenderLogger = SupaLogger("DetailRender")
-#endif
-
 struct ContentView: View {
   @Bindable var store: StoreOf<AppFeature>
   @Bindable var repositoriesStore: StoreOf<RepositoriesFeature>
@@ -30,9 +26,6 @@ struct ContentView: View {
   }
 
   var body: some View {
-    #if DEBUG
-      let _ = contentRenderLogger.info("ContentView.body re-rendered")
-    #endif
     return NavigationSplitView(columnVisibility: $leftSidebarVisibility) {
       SidebarView(store: repositoriesStore, terminalManager: terminalManager)
         .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 400)
@@ -185,9 +178,6 @@ private struct CommandPaletteOverlayHost: View {
   let ghosttyShortcuts: GhosttyShortcutManager
 
   var body: some View {
-    #if DEBUG
-      let _ = contentRenderLogger.info("CommandPaletteOverlayHost.body re-rendered")
-    #endif
     let paletteStore = store.scope(state: \.commandPalette, action: \.commandPalette)
     return CommandPalettePanelHost(
       store: paletteStore,
@@ -212,9 +202,6 @@ private struct WindowTitleHost: View {
   let terminalManager: WorktreeTerminalManager
 
   var body: some View {
-    #if DEBUG
-      let _ = contentRenderLogger.info("WindowTitleHost.body re-rendered")
-    #endif
     return Color.clear
       .navigationTitle(
         WindowTitle.compute(

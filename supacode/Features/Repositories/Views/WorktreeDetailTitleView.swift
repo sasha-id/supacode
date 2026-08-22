@@ -3,10 +3,6 @@ import Kingfisher
 import SupacodeSettingsShared
 import SwiftUI
 
-#if DEBUG
-  private nonisolated let titleRenderLogger = SupaLogger("DetailRender")
-#endif
-
 enum WorktreeToolbarTitleContent: Hashable, Sendable {
   case git(GitPayload)
   case folder(name: String, tint: RepositoryColor?, hostInfo: String?)
@@ -102,11 +98,7 @@ struct WorktreeToolbarTitleView: View {
   let content: WorktreeToolbarTitleContent
 
   var body: some View {
-    #if DEBUG
-      let _ = Self._printChanges()
-      titleRenderLogger.info("WorktreeToolbarTitleView.body re-rendered")
-    #endif
-    return HStack(spacing: 8) {
+    HStack(spacing: 8) {
       Group {
         switch content {
         case .folder:

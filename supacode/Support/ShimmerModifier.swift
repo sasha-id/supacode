@@ -6,20 +6,24 @@ struct ShimmerModifier: ViewModifier {
   @State private var size: CGSize = .zero
 
   func body(content: Content) -> some View {
-    // Measure continuously, even while inactive, so a size change before the shimmer
-    // reactivates cannot leave the mask sized to stale dimensions.
-    let measured = content.onGeometryChange(for: CGSize.self) {
-      $0.size
-    } action: {
-      size = $0
-    }
     if isActive, !MotionPreference.reduceMotion {
-      // The mask is a single translated gradient, so CoreAnimation composites the sweep on
-      // the GPU instead of re-rasterizing the gradient and masked text every frame, as
-      // animating the endpoints did.
-      measured.mask(ShimmerMask(size: size, layoutDirection: layoutDirection))
+      // Measured only here, so an inactive or reduced-motion shimmer costs nothing
+      // beyond the plain content. `ShimmerMask` renders fully visible until the
+      // first geometry read lands, so re-activating never clips to a stale size.
+      content
+        .onGeometryChange(for: CGSize.self) {
+          $0.size
+        } action: {
+          size = $0
+        }
+        // The mask is a single translated gradient, so CoreAnimation composites the sweep on
+        // the GPU instead of re-rasterizing the gradient and masked text every frame, as
+        // animating the endpoints did.
+        .mask(ShimmerMask(size: size, layoutDirection: layoutDirection))
     } else {
-      measured
+      // Reset so a resize while inactive can't mask the next activation to a
+      // stale size — activation starts from the fully-visible fallback.
+      content.onAppear { size = .zero }
     }
   }
 }

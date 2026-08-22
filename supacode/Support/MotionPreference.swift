@@ -1,18 +1,43 @@
-import Foundation
+import AppKit
+import Observation
 
-/// Build-time stand-in for the system Reduce Motion preference.
+/// Live mirror of the system Reduce Motion preference
+/// (`NSWorkspace.shared.accessibilityDisplayShouldReduceMotion`), kept as a
+/// single `@Observable` instance so a SwiftUI body that reads
+/// `MotionPreference.reduceMotion` re-renders when the setting changes.
 ///
-/// Every guarded animation in the app reads this instead of
-/// `@Environment(\.accessibilityReduceMotion)` or
-/// `NSWorkspace.accessibilityDisplayShouldReduceMotion`, so motion is governed
-/// by one switch in the source rather than by System Settings. Set it to `true`
-/// to render every guarded animation in its held-still form.
-///
-/// Several of those held-still forms carry less information than the moving
-/// ones — a compacting agent badge is indistinguishable from an idle one, a
-/// busy tab from a quiet one, and a multi-script group shows one colour instead
-/// of cycling all of them — which is the reason this is a deliberate switch and
-/// not a setting a user can trip without noticing.
-enum MotionPreference {
-  static let reduceMotion = false
+/// Several of the held-still forms consumers fall back to carry less
+/// information than the moving ones — a compacting agent badge is
+/// indistinguishable from an idle one, a busy tab from a quiet one, and a
+/// multi-script group shows one colour instead of cycling all of them.
+@MainActor
+@Observable
+final class MotionPreference {
+  static let shared = MotionPreference()
+
+  static var reduceMotion: Bool { shared.reduceMotionValue }
+
+  private(set) var reduceMotionValue: Bool
+  @ObservationIgnored private var observer: NSObjectProtocol?
+
+  private init() {
+    reduceMotionValue = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    observer = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in self?.refresh() }
+    }
+  }
+
+  isolated deinit {
+    if let observer {
+      NSWorkspace.shared.notificationCenter.removeObserver(observer)
+    }
+  }
+
+  private func refresh() {
+    reduceMotionValue = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+  }
 }

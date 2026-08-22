@@ -6,10 +6,6 @@ import SupacodeSettingsFeature
 import SupacodeSettingsShared
 import SwiftUI
 
-#if DEBUG
-  private nonisolated let detailRenderLogger = SupaLogger("DetailRender")
-#endif
-
 struct WorktreeDetailView: View {
   @Bindable var store: StoreOf<AppFeature>
   let terminalManager: WorktreeTerminalManager
@@ -18,11 +14,7 @@ struct WorktreeDetailView: View {
   private var agentBadgesEnabled: Bool { settingsFile.global.agentPresenceBadgesEnabled }
 
   var body: some View {
-    #if DEBUG
-      let _ = Self._printChanges()
-      detailRenderLogger.info("WorktreeDetailView.body re-rendered")
-    #endif
-    return detailBody(state: store.state)
+    detailBody(state: store.state)
   }
 
   private func detailBody(state: AppFeature.State) -> some View {
