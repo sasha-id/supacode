@@ -1602,7 +1602,11 @@ final class WorktreeTerminalManager {
   /// (freshest tree + agent records), mutated into the in-memory `@Shared` dict
   /// on main, then merged into `layouts.json` off main.
   func markLayoutDirty(worktreeID: Worktree.ID) {
-    layoutDirtyTasks[worktreeID]?.cancel()
+    // Max-latency coalesce, not a trailing debounce: the pending flush already
+    // covers this mutation (the snapshot is captured at fire time), while
+    // cancel-and-re-arm would let a title storm postpone persistence — splits
+    // and closes included — for as long as the storm lasts.
+    guard layoutDirtyTasks[worktreeID] == nil else { return }
     layoutDirtyTasks[worktreeID] = Task { [weak self, layoutDebounceSleep] in
       try? await layoutDebounceSleep(Self.layoutDebounceDuration)
       guard !Task.isCancelled else { return }
