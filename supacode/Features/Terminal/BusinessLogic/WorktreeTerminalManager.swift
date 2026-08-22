@@ -1377,6 +1377,19 @@ final class WorktreeTerminalManager {
     // The wake runs even when not focusing: splitting a dormant pane would
     // otherwise land in a frozen layout.
     sendLayout(worktree.id, .wakeTab(id: selectedTab))
+    // The wake above is deferred, so a hibernated anchor still has no renderer
+    // here; its frozen grid is the real geometry, not the window fallback.
+    let geometry: ContentGeometry
+    if ContentRuntime.liveValue.renderer(for: anchorContent) != nil {
+      geometry = ContentRuntime.liveValue.spawnGeometry(near: anchorContent)
+    } else if case .terminal(let anchorState)? = anchorPane.tabs[id: selectedTab]?.content.state,
+      let grid = anchorState.frozenGrid,
+      let restored = ContentGeometry.restored(grid)
+    {
+      geometry = restored
+    } else {
+      geometry = ContentRuntime.liveValue.spawnGeometry(near: anchorContent)
+    }
     let resolvedInput = BlockingScriptRunner.makeCommandInput(script: input ?? "")
     let launch: LaunchOverride? = resolvedInput.map { LaunchOverride(initialInput: $0) }
     let spec = NewTabSpec(
@@ -1384,7 +1397,7 @@ final class WorktreeTerminalManager {
       contentID: id.map(ContentID.init(rawValue:)),
       title: "\(worktree.name) \(nextTabIndex(in: layout, prefix: worktree.name))",
       content: .terminal(TerminalContentState(workingDirectory: nil, launch: launch)),
-      geometry: ContentRuntime.liveValue.spawnGeometry(near: anchorContent),
+      geometry: geometry,
       select: focusing,
       inheritedFrom: anchorContent
     )
