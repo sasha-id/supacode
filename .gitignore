@@ -72,3 +72,6 @@ fastlane/test_output
 *.profraw
 .env
 .DS_Store
+
+# Local Supacode project settings
+supacode.json
