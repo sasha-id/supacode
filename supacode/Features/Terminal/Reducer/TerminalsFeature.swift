@@ -33,8 +33,11 @@ struct TerminalsFeature {
 
   /// How many most-recently-selected worktrees keep their visible tabs live no
   /// matter how long they stay deselected. Switching inside that set costs no
-  /// wake at all, which is the interaction the clock alone traded away.
-  static let liveWorktreeLimit = 3
+  /// wake at all, which is the interaction the clock alone traded away. Matches
+  /// `WorktreeTerminalStackView.mountLimit`: a tree that is still mounted but
+  /// whose surface was freed is the case that shows a blank pane on the way
+  /// back, so the two bounds move together.
+  static let liveWorktreeLimit = 8
 
   /// Per-tab cancellation key for the hibernation grace timer.
   nonisolated enum HibernationTimerID: Hashable, Sendable {

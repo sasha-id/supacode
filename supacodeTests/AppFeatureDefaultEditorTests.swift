@@ -39,6 +39,12 @@ struct AppFeatureDefaultEditorTests {
         sidebar.focusedWorktreeID = worktree.id
       }
     }
+    // Selection reaches the terminal reducer on this turn, not through the
+    // client hop, so a hibernated pane starts waking without losing a frame.
+    await store.receive(\.terminals.selectedWorktreeChanged) {
+      $0.terminals.selectedWorktreeID = worktree.id
+      $0.terminals.recentWorktreeIDs = [worktree.id]
+    }
     await store.receive(\.worktreeSettingsLoaded) {
       $0.loadedRepoScripts = LoadedRepositoryScripts(
         scripts: [],
@@ -115,6 +121,12 @@ struct AppFeatureDefaultEditorTests {
       $0.repositories.$sidebar.withLock { sidebar in
         sidebar.focusedWorktreeID = worktree.id
       }
+    }
+    // Selection reaches the terminal reducer on this turn, not through the
+    // client hop, so a hibernated pane starts waking without losing a frame.
+    await store.receive(\.terminals.selectedWorktreeChanged) {
+      $0.terminals.selectedWorktreeID = worktree.id
+      $0.terminals.recentWorktreeIDs = [worktree.id]
     }
     await store.receive(\.worktreeSettingsLoaded) {
       $0.loadedRepoScripts = LoadedRepositoryScripts(
@@ -389,6 +401,12 @@ struct AppFeatureDefaultEditorTests {
       $0.repositories.$sidebar.withLock { sidebar in
         sidebar.focusedWorktreeID = worktree.id
       }
+    }
+    // Selection reaches the terminal reducer on this turn, not through the
+    // client hop, so a hibernated pane starts waking without losing a frame.
+    await store.receive(\.terminals.selectedWorktreeChanged) {
+      $0.terminals.selectedWorktreeID = worktree.id
+      $0.terminals.recentWorktreeIDs = [worktree.id]
     }
     await store.receive(\.worktreeSettingsLoaded) {
       $0.loadedRepoScripts = LoadedRepositoryScripts(

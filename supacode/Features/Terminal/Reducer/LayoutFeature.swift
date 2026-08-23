@@ -121,11 +121,15 @@ struct LayoutFeature {
     /// The tab whose strip shows the inline rename field; owned here so the
     /// menu command reaches it and it survives structural rebuilds.
     var editingTabID: TabID?
-    /// Tabs whose surface is being built off the interaction turn. Their panes
-    /// render the wake placeholder instead of the unavailable state, and a
-    /// second wake for the same tab is ignored while one is in flight. Never
+    /// Tabs whose surface is being built off the interaction turn; a second
+    /// wake for the same tab is ignored while one is in flight. Never
     /// persisted.
     var wakingTabs: Set<TabID> = []
+    /// Tabs whose wake landed without producing a renderer. ONLY these render
+    /// the unavailable state: a pane with no renderer is otherwise mid-wake,
+    /// and the selection that starts the wake reaches this reducer a turn or
+    /// two after the view already showed the new worktree. Never persisted.
+    var wakeFailedTabs: Set<TabID> = []
     /// Panes shown in their own windows; the tree keeps their leaves as
     /// placeholders. Never persisted: a relaunch re-attaches them inline.
     var windowedPaneIDs: Set<PaneID> = []
@@ -776,6 +780,9 @@ extension LayoutFeature {
     let geometry = Self.wakeGeometry(for: snapshot)
     let worktreeID = state.id
     state.wakingTabs.insert(tabID)
+    // A retry clears the previous verdict; the pane holds the background again
+    // until this attempt reports back.
+    state.wakeFailedTabs.remove(tabID)
     state.renderEpoch &+= 1
     return .run { @MainActor [contentRuntime, layoutContentFactory, clock] send in
       // A clock sleep rather than a bare await: it puts the build past the
@@ -1016,6 +1023,7 @@ extension LayoutFeature {
     if state.editingTabID == tabID {
       state.editingTabID = nil
     }
+    state.wakeFailedTabs.remove(tabID)
     return cancelPendingWake(&state, tabID: tabID)
   }
 
@@ -1119,9 +1127,14 @@ extension LayoutFeature {
       guard state.wakingTabs.remove(tabID) != nil else { break }
       // The placeholder gives way to the live surface here, not at wake time.
       state.renderEpoch &+= 1
-      guard let contentID = state.layout.pane(containingTab: tabID)?.tabs[id: tabID]?.content.id,
-        let content = contentRuntime.content(for: contentID)
-      else { break }
+      let contentID = state.layout.pane(containingTab: tabID)?.tabs[id: tabID]?.content.id
+      let content = contentID.flatMap { contentRuntime.content(for: $0) }
+      // A wake that produced no renderer is the one state worth naming to the
+      // user; everything else holds the background and waits.
+      guard let content, content.renderer != nil else {
+        state.wakeFailedTabs.insert(tabID)
+        break
+      }
       landWokenSnapshot(&state, tabID: tabID, content: content)
     case .titleCommitted(let contentID, let title):
       guard let located = state.layout.tab(containingContent: contentID) else { break }

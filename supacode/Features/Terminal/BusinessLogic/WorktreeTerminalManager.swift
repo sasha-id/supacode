@@ -610,9 +610,9 @@ final class WorktreeTerminalManager {
       // to nobody; `WorktreeTerminalStackView` moves first responder over once
       // the incoming tree is on screen.
       hosts[id ?? WorktreeID("")]?.setWorktreeSelected(true)
-      // Deselecting arms grace timers, selecting wakes the visible tabs; the
-      // reducer owns both through the selection action.
-      sendTerminals(.selectedWorktreeChanged(id))
+      // The hibernation side of the switch — grace timers on the way out,
+      // wakes on the way in — is dispatched by `AppFeature` on the click's own
+      // turn, ahead of this command, so the wake is not a frame behind.
       // A sidebar click never hands AppKit focus to the terminal, so no focus
       // event fires; refresh here or the window keeps the previous tint.
       refreshFocusedSurfaceBackground()
