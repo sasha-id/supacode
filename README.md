@@ -16,8 +16,8 @@ connection loses nothing.
 
 ### Performance refactoring
 
-The [`performance-refactoring`](https://github.com/sasha-id/supacode/tree/performance-refactoring)
-branch reworks the hot paths so the app stays responsive with many worktrees and tabs open:
+`main` includes a performance refactoring of the hot paths so the app stays responsive with
+many worktrees and tabs open:
 
 - Per-tab churn (terminal output, titles, activity) stays out of the root store, so a busy pane
   no longer invalidates the whole app.
