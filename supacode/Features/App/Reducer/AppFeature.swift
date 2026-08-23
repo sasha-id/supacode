@@ -540,6 +540,7 @@ struct AppFeature {
             }
           }
           return .merge(
+            Self.terminalSelectionEffect(current: state.terminals.selectedWorktreeID, next: nil),
             .run { _ in
               await terminalClient.send(.setSelectedWorktreeID(nil))
             },
@@ -569,6 +570,7 @@ struct AppFeature {
         // by the detail view on appear.
         let wantsFocus = state.repositories.sidebarItems[id: worktree.id]?.shouldFocusTerminal == true
         return .merge(
+          Self.terminalSelectionEffect(current: state.terminals.selectedWorktreeID, next: worktreeID),
           .run { _ in
             await terminalClient.send(.setSelectedWorktreeID(worktree.id))
           },
@@ -2213,6 +2215,22 @@ struct AppFeature {
   /// read, and a held arrow key would otherwise read a file per row it crosses.
   /// `.worktreeSettingsLoaded` drops a result whose row is no longer selected, so a
   /// superseded read is harmless as well as cancelled.
+  /// Puts the hibernation side of a worktree switch on the click's own turn.
+  ///
+  /// The terminal client hop is a task away, and by the time it lands the strip
+  /// and the pane already render the incoming worktree — so waking through it
+  /// spends frames on a pane whose content has no renderer yet. `Effect.send`
+  /// reaches the child reducer inside this same `send`, which starts the
+  /// surface build first. The equality check mirrors the manager's own dedupe
+  /// of a repeat selection.
+  private static func terminalSelectionEffect(
+    current: Worktree.ID?,
+    next: Worktree.ID?
+  ) -> Effect<Action> {
+    guard current != next else { return .none }
+    return .send(.terminals(.selectedWorktreeChanged(next)))
+  }
+
   static func loadWorktreeSettingsEffect(
     key: RepositorySettingsKey,
     worktreeID: Worktree.ID

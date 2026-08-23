@@ -397,8 +397,8 @@ struct PaneStripView: View {
       Group {
         if let contentID = pane.selectedTab?.content.id {
           // The epoch read keeps this branch re-evaluating on hibernate/wake;
-          // a visible content without a renderer (failed wake, vanished
-          // worktree) gets an explicit placeholder, never a silent blank.
+          // a content whose wake reported back without a renderer gets an
+          // explicit placeholder, never a silent blank.
           let epoch = store.renderEpoch
           if runtime.renderer(for: contentID) != nil {
             ContentHostView(contentID: contentID, runtime: runtime, epoch: epoch)
@@ -409,14 +409,15 @@ struct PaneStripView: View {
                     .allowsHitTesting(false)
                 }
               }
-          } else if let tabID = pane.selectedTab?.id, store.wakingTabs.contains(tabID) {
-            // A wake builds its surface off the interaction turn. Hold the
-            // window's terminal background over the pane until it lands: the
-            // error state would flash, and the fresh surface's zmx re-attach
-            // clears and replays into the same empty background anyway.
-            Color.clear
-          } else {
+          } else if let tabID = pane.selectedTab?.id, store.wakeFailedTabs.contains(tabID) {
             EmptyTerminalPaneView(message: "This terminal is unavailable.")
+          } else {
+            // No renderer and no verdict yet: the wake is either in flight or
+            // still a turn away from this reducer. Hold the window's terminal
+            // background over the pane — the error state would flash, and the
+            // fresh surface's zmx re-attach clears and replays into the same
+            // empty background anyway.
+            Color.clear
           }
         } else {
           Color.clear

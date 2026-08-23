@@ -20,6 +20,9 @@ struct LayoutFeatureTests {
     var snapshotState: TerminalContentState?
     /// Drives the busy-gated close confirmation in tests.
     var isBusy = false
+    /// Makes `startSession` land without a renderer, the way a surface that
+    /// cannot be built does.
+    var failsToStart = false
     private let initialState: TerminalContentState
     private(set) var startGeometries: [ContentGeometry] = []
     /// Every invocation, including no-op re-starts the guard swallows.
@@ -39,6 +42,7 @@ struct LayoutFeatureTests {
       // Mirror the protocol contract: a second call while live is a no-op.
       guard view == nil else { return }
       startGeometries.append(geometry)
+      guard !failsToStart else { return }
       view = NSView()
     }
 
@@ -1425,6 +1429,59 @@ struct LayoutFeatureTests {
     #expect(revived.startGeometries == [restored])
     #expect(harness.runtime.content(for: harness.contentID) === revived)
     #expect(harness.store.state.layout.isConsistent)
+  }
+
+  @Test func wakeThatProducesNoRendererMarksTheTabUnavailable() async throws {
+    let harness = await makeHarness()
+    let mock = try #require(harness.mock)
+    await harness.store.send(.hibernateTab(id: harness.tabID)) {
+      $0.renderEpoch = 1
+    }
+    mock.failsToStart = true
+    // A wake in flight is not a failure: the pane holds the background until
+    // the attempt reports back.
+    await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
+      $0.renderEpoch = 2
+    }
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
+      $0.wakingTabs = []
+      $0.wakeFailedTabs = [harness.tabID]
+      $0.renderEpoch = 3
+    }
+    #expect(mock.renderer == nil)
+  }
+
+  @Test func retryingAFailedWakeClearsTheUnavailableVerdict() async throws {
+    let harness = await makeHarness()
+    let mock = try #require(harness.mock)
+    await harness.store.send(.hibernateTab(id: harness.tabID)) {
+      $0.renderEpoch = 1
+    }
+    mock.failsToStart = true
+    await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
+      $0.renderEpoch = 2
+    }
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
+      $0.wakingTabs = []
+      $0.wakeFailedTabs = [harness.tabID]
+      $0.renderEpoch = 3
+    }
+    mock.failsToStart = false
+    await harness.store.send(.wakeTab(id: harness.tabID)) {
+      $0.wakingTabs = [harness.tabID]
+      $0.wakeFailedTabs = []
+      $0.renderEpoch = 4
+    }
+    await harness.settleWake()
+    await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
+      $0.wakingTabs = []
+      $0.renderEpoch = 5
+    }
+    #expect(mock.renderer != nil)
   }
 
   @Test func wakeTabWithoutAFrozenGridFallsBack() async throws {

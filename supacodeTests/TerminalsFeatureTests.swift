@@ -288,21 +288,21 @@ struct TerminalsFeatureTests {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
       $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
-    // Scrub past the recency window before the wake's deferral elapses; the
-    // first two hops keep the worktree retained, the third drops its cover.
-    let others = ["/tmp/other-1", "/tmp/other-2", "/tmp/other-3"].map { Worktree.ID($0) }
-    await harness.store.send(.selectedWorktreeChanged(others[0])) {
-      $0.selectedWorktreeID = others[0]
-      $0.recentWorktreeIDs = [others[0], harness.worktreeID]
-      $0.wakeRequestedTabs = []
-    }
-    await harness.store.send(.selectedWorktreeChanged(others[1])) {
-      $0.selectedWorktreeID = others[1]
-      $0.recentWorktreeIDs = [others[1], others[0], harness.worktreeID]
-    }
-    await harness.store.send(.selectedWorktreeChanged(others[2])) {
-      $0.selectedWorktreeID = others[2]
-      $0.recentWorktreeIDs = [others[2], others[1], others[0]]
+    // Scrub past the recency window before the wake's deferral elapses; every
+    // hop but the last keeps the worktree retained, the last drops its cover.
+    let limit = TerminalsFeature.liveWorktreeLimit
+    let others = (1...limit).map { Worktree.ID("/tmp/other-\($0)") }
+    var recents = [harness.worktreeID]
+    for (index, other) in others.enumerated() {
+      recents.insert(other, at: 0)
+      recents.removeLast(max(0, recents.count - limit))
+      let expected = recents
+      await harness.store.send(.selectedWorktreeChanged(other)) {
+        $0.selectedWorktreeID = other
+        $0.recentWorktreeIDs = expected
+        // Only the first deselection releases the wake request.
+        if index == 0 { $0.wakeRequestedTabs = [] }
+      }
     }
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
