@@ -4,7 +4,6 @@ import Foundation
 import OrderedCollections
 import SupacodeSettingsFeature
 import SupacodeSettingsShared
-import SwiftUI
 
 private nonisolated let appLogger = SupaLogger("App")
 private nonisolated let deeplinkLogger = SupaLogger("Deeplink")
@@ -87,6 +86,12 @@ struct AppFeature {
 
   @ObservableState
   struct State: Equatable {
+    /// Foreground state, mirrored from the app delegate's activation callbacks.
+    /// Gates the periodic refresh tick. Starts `true` so discovery runs during
+    /// the launch window before the first `applicationDidBecomeActive` lands —
+    /// fail-open, matching the watcher manager's own `isActive` default. A
+    /// background launch that never activates therefore keeps polling.
+    var isApplicationActive = true
     var agentPresence = AgentPresenceFeature.State()
     var repositories: RepositoriesFeature.State
     var settings: SettingsFeature.State
@@ -287,7 +292,9 @@ struct AppFeature {
     case applicationDidBecomeActive
     case applicationDidResignActive
     case appLaunched
-    case scenePhaseChanged(ScenePhase)
+    /// Backstop discovery tick from the launch-owned poll, skipped while the
+    /// app is backgrounded.
+    case periodicRefreshTick
     case repositories(RepositoriesFeature.Action)
     case refreshWorktreesRequested
     case settings(SettingsFeature.Action)
@@ -380,16 +387,57 @@ struct AppFeature {
       switch action {
       case .applicationDidBecomeActive:
         captureAppLifecycleEvent(.activatedDebounced, state: &state)
+        state.isApplicationActive = true
         return .merge(
           refreshInstalledOpenActionsEffect(current: state.installedOpenActions),
           // A `supacode.json` can be edited out of band while the app is away, and
           // the roster refresh may be minutes off, so pick that up on activate too.
-          .send(.repositories(.resolveOpenActions))
+          .send(.repositories(.resolveOpenActions)),
+          // Catch up on worktrees a sibling session created / removed (a raw
+          // `git worktree add`) while the app was away.
+          .send(.repositories(.refreshWorktrees)),
+          // Freshen the files inspector after external edits made while
+          // the app was inactive (Finder, editors).
+          .send(.repositories(.fileExplorer(.applicationBecameActive))),
+          // Re-probe agent integrations on activation so the sidebar
+          // card reflects external installs (e.g. `claude install`)
+          // for users who keep the app open across days.
+          .send(.settings(.refreshAgentIntegrationStates)),
+          // Resume background git polling only while foreground-active so an
+          // idle / backgrounded app stays quiet.
+          .run { _ in await worktreeInfoWatcher.send(.setActive(true)) }
         )
 
       case .applicationDidResignActive:
         captureAppLifecycleEvent(.deactivatedDebounced, state: &state)
-        return .none
+        state.isApplicationActive = false
+        // Snapshot on the way out so a force-quit / crash doesn't drop
+        // running-agent state before `applicationWillTerminate` fires.
+        // Coalesce so rapid Cmd+Tab churn writes once per 1s burst.
+        let agentsBySurface = state.agentPresence.agentsBySurface()
+        return .merge(
+          .run { _ in await worktreeInfoWatcher.send(.setActive(false)) },
+          .run { [clock] _ in
+            try await clock.sleep(for: .seconds(1))
+            await MainActor.run {
+              terminalClient.saveLayoutsWithAgents(agentsBySurface)
+            }
+          }
+          .cancellable(id: CancelID.backgroundPersist, cancelInFlight: true)
+        )
+
+      case .periodicRefreshTick:
+        // Skipped while the app is in the background so an idle app stays
+        // quiet; activation runs the same refresh immediately, so nothing is
+        // deferred longer than the trip back to the foreground.
+        guard state.isApplicationActive else { return .none }
+        // Worktree discovery stays ungated so externally created / removed
+        // worktrees still sync; the setting gates status polling (line counts,
+        // branch, PR, remote SSH) in the watcher.
+        return .merge(
+          .send(.repositories(.refreshWorktrees)),
+          .send(.refreshInstalledOpenActions)
+        )
 
       case .appLaunched:
         // A chord restored from disk fires no settingsChanged delta, so register it once here.
@@ -410,6 +458,18 @@ struct AppFeature {
               NSApplication.shared.dockTile.badgeLabel = nil
             }
           },
+          // Discovery backstop for worktrees created outside the app. Owned by
+          // the launch effect rather than started / cancelled on activation:
+          // an app-lifetime task can't be left stopped by a missed lifecycle
+          // edge, and `.periodicRefreshTick` skips itself while backgrounded.
+          .run { [clock] send in
+            while !Task.isCancelled {
+              try? await clock.sleep(for: .seconds(30))
+              guard !Task.isCancelled else { return }
+              await send(.periodicRefreshTick)
+            }
+          }
+          .cancellable(id: CancelID.periodicRefresh, cancelInFlight: true),
           .run { send in
             for await event in await terminalClient.events() {
               await send(.terminalEvent(event))
@@ -470,62 +530,6 @@ struct AppFeature {
             await worktreeInfoWatcher.send(.refresh)
           }
         )
-
-      case .scenePhaseChanged(let phase):
-        switch phase {
-        case .active:
-          return .merge(
-            .send(.repositories(.refreshWorktrees)),
-            // Freshen the files inspector after external edits made while
-            // the app was inactive (Finder, editors).
-            .send(.repositories(.fileExplorer(.applicationBecameActive))),
-            // Re-probe agent integrations on activation so the sidebar
-            // card reflects external installs (e.g. `claude install`)
-            // for users who keep the app open across days.
-            .send(.settings(.refreshAgentIntegrationStates)),
-            // Resume background git polling only while foreground-active so an
-            // idle / backgrounded app stays quiet.
-            .run { _ in await worktreeInfoWatcher.send(.setActive(true)) },
-            .run { send in
-              while !Task.isCancelled {
-                try? await ContinuousClock().sleep(for: .seconds(30))
-                guard !Task.isCancelled else { return }
-                // Worktree discovery stays ungated so externally created /
-                // removed worktrees still sync; the setting gates status
-                // polling (line counts, branch, PR, remote SSH) in the watcher.
-                await send(.repositories(.refreshWorktrees))
-                await send(.refreshInstalledOpenActions)
-              }
-            }
-            .cancellable(id: CancelID.periodicRefresh, cancelInFlight: true)
-          )
-        case .background:
-          // Snapshot on the way out so a force-quit / crash doesn't drop
-          // running-agent state before `applicationWillTerminate` fires.
-          // Coalesce so rapid Cmd+Tab churn writes once per 1s burst.
-          let agentsBySurface = state.agentPresence.agentsBySurface()
-          return .merge(
-            .cancel(id: CancelID.periodicRefresh),
-            .run { _ in await worktreeInfoWatcher.send(.setActive(false)) },
-            .run { [clock] _ in
-              try await clock.sleep(for: .seconds(1))
-              await MainActor.run {
-                terminalClient.saveLayoutsWithAgents(agentsBySurface)
-              }
-            }
-            .cancellable(id: CancelID.backgroundPersist, cancelInFlight: true)
-          )
-        case .inactive:
-          return .merge(
-            .cancel(id: CancelID.periodicRefresh),
-            .run { _ in await worktreeInfoWatcher.send(.setActive(false)) }
-          )
-        @unknown default:
-          return .merge(
-            .cancel(id: CancelID.periodicRefresh),
-            .run { _ in await worktreeInfoWatcher.send(.setActive(false)) }
-          )
-        }
 
       case .repositories(.delegate(.selectedWorktreeChanged(let worktree))):
         let lastFocusedWorktreeID = worktree?.id
