@@ -342,12 +342,18 @@ private struct SidebarGitRepositorySection: View {
 
 /// Repo section header: title + muted count on the leading
 /// side; trailing `⋯` / `+` (revealed on hover when collapsed, always visible
-/// when expanded) and the expand/collapse chevron. Tapping the row toggles
-/// expansion through the same `repositoryExpansionChanged` action the native
-/// `Section(isExpanded:)` disclosure used to drive. A row-scale `Button`
-/// can't wrap the nested `⋯` / `+` controls, so the toggle rides
-/// `onTapGesture` while the chevron stays a real `Button` for keyboard and
-/// VoiceOver.
+/// when expanded) and the expand/collapse chevron, which is the toggle and
+/// drives the same `repositoryExpansionChanged` action the native
+/// `Section(isExpanded:)` disclosure used to.
+///
+/// The rest of the row deliberately carries no gesture. This row is the only
+/// element the outer `.onMove` owns, and `NSOutlineView` starts a row drag from
+/// its own `mouseDown`: any SwiftUI hit target laid over the row claims that
+/// event first and the drag never begins, which is exactly how repository
+/// reordering broke when the toggle rode a row-wide `onTapGesture`. Verified
+/// against `.contentShape` + `onTapGesture`, `simultaneousGesture`, a row-scale
+/// `Button`, and `.draggable` — all of them kill the drag. `onHover` and `help`
+/// are tracking areas rather than gestures, so they are safe.
 private struct SidebarRepositoryHeaderRow: View {
   let name: String
   let customTitle: String?
@@ -391,24 +397,21 @@ private struct SidebarRepositoryHeaderRow: View {
       )
       .opacity(showsActions ? 1 : 0)
       .allowsHitTesting(showsActions)
-      // A visual affordance only: the whole row is the tap target and carries
-      // the button trait, so exposing the chevron separately would announce the
-      // same action twice.
-      Image(systemName: "chevron.right")
-        .imageScale(.small)
-        .fontWeight(.semibold)
-        .foregroundStyle(.secondary)
-        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-        .frame(width: 16, height: 16)
-        .accessibilityHidden(true)
+      Button(action: toggleExpansion) {
+        Image(systemName: "chevron.right")
+          .imageScale(.small)
+          .fontWeight(.semibold)
+          .foregroundStyle(.secondary)
+          .rotationEffect(.degrees(isExpanded ? 90 : 0))
+          .frame(width: 16, height: 16)
+          .contentShape(.rect)
+      }
+      .buttonStyle(.plain)
+      .pointerStyle(.link)
+      .help(isExpanded ? "Collapse \(name)" : "Expand \(name)")
+      .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")
     }
     .animation(.easeInOut(duration: 0.15), value: isExpanded)
-    .contentShape(Rectangle())
-    .onTapGesture(perform: toggleExpansion)
-    .pointerStyle(.link)
-    .help(isExpanded ? "Collapse \(name)" : "Expand \(name)")
-    .accessibilityAddTraits(.isButton)
-    .accessibilityLabel(isExpanded ? "Collapse \(name)" : "Expand \(name)")
     .onHover { isHovering = $0 }
     .listRowBackground(
       SidebarRowChrome(
