@@ -76,24 +76,101 @@ struct AppFeatureCommandPaletteTests {
     #expect(watcherCommands.value == [.refresh])
   }
 
-  @Test(.dependencies) func scenePhaseChangesToggleWatcherActiveState() async {
+  @Test(.dependencies) func appActivationTogglesWatcherActiveState() async {
     let watcherCommands = LockIsolated<[WorktreeInfoWatcherClient.Command]>([])
     let store = TestStore(initialState: AppFeature.State()) {
       AppFeature()
     } withDependencies: {
+      $0.continuousClock = ImmediateClock()
+      $0.date = DateGenerator { Date(timeIntervalSince1970: 1_000) }
+      $0.analyticsClient.capture = { _, _ in }
+      // Deactivation snapshots the terminal layouts on the way out.
+      $0[TerminalClient.self].saveLayoutsWithAgents = { _ in }
       $0.worktreeInfoWatcher.send = { command in
         watcherCommands.withValue { $0.append(command) }
       }
     }
     store.exhaustivity = .off
 
-    // `.inactive` cancels the periodic-refresh loop `.active` starts.
-    await store.send(.scenePhaseChanged(.active))
-    await store.send(.scenePhaseChanged(.inactive))
+    await store.send(.applicationDidBecomeActive)
+    await store.send(.applicationDidResignActive)
     await store.finish()
 
     #expect(watcherCommands.value.contains(.setActive(true)))
     #expect(watcherCommands.value.contains(.setActive(false)))
+  }
+
+  /// Activation is the catch-up path for worktrees a sibling session created
+  /// while the app was away.
+  @Test(.dependencies) func activationRefreshesWorktrees() async {
+    let store = TestStore(initialState: AppFeature.State()) {
+      AppFeature()
+    } withDependencies: {
+      $0.continuousClock = ImmediateClock()
+      $0.date = DateGenerator { Date(timeIntervalSince1970: 1_000) }
+      $0.analyticsClient.capture = { _, _ in }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.applicationDidBecomeActive)
+    // The whole catch-up fan-out, so a dropped member of the merge fails here
+    // rather than silently going missing the way the scenePhase branch did.
+    await store.receive(\.repositories.resolveOpenActions)
+    await store.receive(\.repositories.refreshWorktrees)
+    await store.receive(\.repositories.fileExplorer.applicationBecameActive)
+    await store.receive(\.settings.refreshAgentIntegrationStates)
+    await store.finish()
+  }
+
+  /// Resigning snapshots the terminal layouts so a force-quit can't drop
+  /// running-agent state.
+  @Test(.dependencies) func deactivationPersistsLayouts() async {
+    let saved = LockIsolated(false)
+    let store = TestStore(initialState: AppFeature.State()) {
+      AppFeature()
+    } withDependencies: {
+      $0.continuousClock = ImmediateClock()
+      $0.date = DateGenerator { Date(timeIntervalSince1970: 1_000) }
+      $0.analyticsClient.capture = { _, _ in }
+      $0[TerminalClient.self].saveLayoutsWithAgents = { _ in saved.setValue(true) }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.applicationDidResignActive) {
+      $0.isApplicationActive = false
+    }
+    await store.finish()
+    #expect(saved.value)
+  }
+
+  /// The backstop tick discovers worktrees while the app stays foreground-active,
+  /// and goes quiet once it resigns.
+  @Test(.dependencies) func periodicTickRefreshesOnlyWhileActive() async {
+    let store = TestStore(initialState: AppFeature.State()) {
+      AppFeature()
+    } withDependencies: {
+      $0.continuousClock = ImmediateClock()
+      $0.date = DateGenerator { Date(timeIntervalSince1970: 1_000) }
+      $0.analyticsClient.capture = { _, _ in }
+      // Deactivation snapshots the terminal layouts on the way out.
+      $0[TerminalClient.self].saveLayoutsWithAgents = { _ in }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.periodicRefreshTick)
+    await store.receive(\.repositories.refreshWorktrees)
+    await store.receive(\.refreshInstalledOpenActions)
+
+    await store.send(.applicationDidResignActive) {
+      $0.isApplicationActive = false
+    }
+    await store.skipReceivedActions(strict: false)
+
+    // Exhaustive from here: a tick that still refreshed would surface as an
+    // unreceived action.
+    store.exhaustivity = .on
+    await store.send(.periodicRefreshTick)
+    await store.finish()
   }
 
   @Test(.dependencies) func repositoryRefreshDoesNotForceWorktreeInfoRefresh() async {

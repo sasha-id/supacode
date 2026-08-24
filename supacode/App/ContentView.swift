@@ -14,7 +14,6 @@ struct ContentView: View {
   @Bindable var store: StoreOf<AppFeature>
   @Bindable var repositoriesStore: StoreOf<RepositoriesFeature>
   let terminalManager: WorktreeTerminalManager
-  @Environment(\.scenePhase) private var scenePhase
   @Environment(\.colorScheme) private var colorScheme
   @Environment(GhosttyShortcutManager.self) private var ghosttyShortcuts
   @State private var leftSidebarVisibility: NavigationSplitViewVisibility = .all
@@ -44,9 +43,6 @@ struct ContentView: View {
     }
     .navigationSplitViewStyle(.automatic)
     .disabled(!repositoriesStore.isInitialLoadComplete)
-    .onChange(of: scenePhase) { _, newValue in
-      store.send(.scenePhaseChanged(newValue))
-    }
     .fileImporter(
       isPresented: $repositoriesStore.isOpenPanelPresented.sending(\.setOpenPanelPresented),
       allowedContentTypes: [.folder],

@@ -314,6 +314,9 @@ struct AppFeatureDefaultEditorTests {
       // Activation also kicks the debounced editor-availability sweep.
       $0.continuousClock = ImmediateClock()
     }
+    // Activation fans out beyond the open-action resolution this test asserts
+    // on (worktree discovery, file explorer, agent-integration probes).
+    store.exhaustivity = .off
 
     await store.send(.applicationDidBecomeActive) {
       $0.appLifecycleEventDebouncer.lastActivatedAt = Date(timeIntervalSince1970: 1_000)

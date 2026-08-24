@@ -24,27 +24,25 @@ struct AppFeatureLifecycleTelemetryTests {
       $0.analyticsClient.capture = { event, _ in
         events.withValue { $0.append(event) }
       }
+      // Deactivation snapshots the terminal layouts on the way out.
+      $0[TerminalClient.self].saveLayoutsWithAgents = { _ in }
     }
+    // Activation / deactivation fan out to refresh work this suite doesn't assert on.
+    store.exhaustivity = .off
 
-    // Activation also re-reads every repository's open action, so an edit made
-    // while the app was away lands. The roster is empty here, so it resolves
-    // nothing.
     await store.send(.applicationDidBecomeActive) {
       $0.appLifecycleEventDebouncer.lastActivatedAt = base
     }
-    await store.receive(\.repositories.resolveOpenActions)
     expectNoDifference(events.value, ["app_activated_debounced"])
 
     currentDate.setValue(base.addingTimeInterval(899))
     await store.send(.applicationDidBecomeActive)
-    await store.receive(\.repositories.resolveOpenActions)
     expectNoDifference(events.value, ["app_activated_debounced"])
 
     currentDate.setValue(base.addingTimeInterval(900))
     await store.send(.applicationDidBecomeActive) {
       $0.appLifecycleEventDebouncer.lastActivatedAt = base.addingTimeInterval(900)
     }
-    await store.receive(\.repositories.resolveOpenActions)
     expectNoDifference(events.value, ["app_activated_debounced", "app_activated_debounced"])
 
     await store.finish()
@@ -64,7 +62,11 @@ struct AppFeatureLifecycleTelemetryTests {
       $0.analyticsClient.capture = { event, _ in
         events.withValue { $0.append(event) }
       }
+      // Deactivation snapshots the terminal layouts on the way out.
+      $0[TerminalClient.self].saveLayoutsWithAgents = { _ in }
     }
+    // Activation / deactivation fan out to refresh work this suite doesn't assert on.
+    store.exhaustivity = .off
 
     await store.send(.applicationDidResignActive) {
       $0.appLifecycleEventDebouncer.lastDeactivatedAt = base
@@ -98,12 +100,15 @@ struct AppFeatureLifecycleTelemetryTests {
       $0.analyticsClient.capture = { event, _ in
         events.withValue { $0.append(event) }
       }
+      // Deactivation snapshots the terminal layouts on the way out.
+      $0[TerminalClient.self].saveLayoutsWithAgents = { _ in }
     }
+    // Activation / deactivation fan out to refresh work this suite doesn't assert on.
+    store.exhaustivity = .off
 
     await store.send(.applicationDidBecomeActive) {
       $0.appLifecycleEventDebouncer.lastActivatedAt = base
     }
-    await store.receive(\.repositories.resolveOpenActions)
 
     currentDate.setValue(base.addingTimeInterval(1))
     await store.send(.applicationDidResignActive) {
