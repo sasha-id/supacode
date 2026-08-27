@@ -1,0 +1,552 @@
+diff --git a/pkg/macos/iosurface/iosurface.zig b/pkg/macos/iosurface/iosurface.zig
+index 37f8712ba..bafc12fd9 100644
+--- a/pkg/macos/iosurface/iosurface.zig
++++ b/pkg/macos/iosurface/iosurface.zig
+@@ -98,6 +98,13 @@ pub const IOSurface = opaque {
+         );
+     }
+ 
++    /// Returns true if any process (e.g. the window server) is
++    /// currently using this surface, in which case writing to it
++    /// may cause visual artifacts.
++    pub inline fn isInUse(self: *IOSurface) bool {
++        return c.IOSurfaceIsInUse(@ptrCast(self)) != 0;
++    }
++
+     pub inline fn getAllocSize(self: *IOSurface) usize {
+         return c.IOSurfaceGetAllocSize(@ptrCast(self));
+     }
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 6c7432d21..0fa00ad50 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -33,13 +33,24 @@ pub const custom_shader_target: shadertoy.Target = .msl;
+ // The fragCoord for Metal shaders is +Y = down.
+ pub const custom_shader_y_is_down = true;
+ 
+-/// Triple buffering.
+-pub const swap_chain_count = 3;
++/// Quadruple buffering.
++///
++/// Three is one too few to keep off the surface the compositor is displaying.
++/// At the moment a surface is revealed, one frame is in flight and one is still
++/// held by the window server, so the only remaining frame is the one on screen
++/// and the swap chain has no choice but to draw into it. The fourth frame is
++/// the alternative that lets it decline.
++pub const swap_chain_count = 4;
+ 
+ const log = std.log.scoped(.metal);
+ 
+ layer: IOSurfaceLayer,
+ 
++/// The surface most recently handed to the compositor, as a raw address,
++/// or 0 if we haven't presented yet. Written on whichever thread runs the
++/// command buffer completion handler, read on the render thread.
++last_presented_surface: std.atomic.Value(usize) = .{ .raw = 0 },
++
+ /// MTLDevice
+ device: objc.Object,
+ /// MTLCommandQueue
+@@ -251,6 +262,12 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
+ 
+ /// Present the provided target.
+ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
++    // Record the surface we're handing to the compositor before we hand it
++    // over, so the swap chain can keep off it. `IOSurfaceIsInUse` alone is
++    // not enough: it's a sample, not a lock, so between the swap chain's
++    // check and the GPU's write the window server can latch the surface.
++    self.last_presented_surface.store(@intFromPtr(target.surface), .release);
++
+     if (sync) {
+         self.layer.setSurfaceSync(target.surface);
+     } else {
+@@ -263,6 +280,19 @@ pub inline fn presentLastTarget(self: *Metal) !void {
+     _ = self;
+ }
+ 
++/// Returns true if the target is still in use by an external process,
++/// i.e. the window server is still displaying its surface.
++pub inline fn isTargetInUse(self: *const Metal, target: *const Target) bool {
++    _ = self;
++    return target.surface.isInUse();
++}
++
++/// Returns true if the target's surface is the one most recently handed to
++/// the compositor, i.e. the surface that is on screen or about to be.
++pub inline fn isTargetPresented(self: *const Metal, target: *const Target) bool {
++    return self.last_presented_surface.load(.acquire) == @intFromPtr(target.surface);
++}
++
+ /// Returns the options to use when constructing buffers.
+ pub inline fn bufferOptions(self: Metal) bufferpkg.Options {
+     return .{
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 508721379..e507cb047 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -19,6 +19,13 @@ const log = std.log.scoped(.renderer_thread);
+ const DRAW_INTERVAL = 8; // 120 FPS
+ const CURSOR_BLINK_INTERVAL = 600;
+ 
++/// How long to wait before retrying a draw the renderer declined. This has
++/// to outlast a display refresh: the renderer declines when the compositor
++/// still holds every target it could draw into, and only a refresh frees
++/// one. Retrying any sooner just spends the retry budget before the
++/// compositor has had a chance to let go.
++const RETRY_INTERVAL = 8;
++
+ /// Whether calls to `drawFrame` must be done from the app thread.
+ ///
+ /// If this is `true` then we send a `redraw_surface` message to the apprt
+@@ -67,6 +74,13 @@ draw_active: bool = false,
+ draw_now: xev.Async,
+ draw_now_c: xev.Completion = .{},
+ 
++/// The timer used to retry a draw the renderer declined. Unlike `draw_now`
++/// this deliberately waits, so that a run of declines spans real display
++/// refreshes instead of collapsing into a single millisecond.
++retry_h: xev.Timer,
++retry_c: xev.Completion = .{},
++retry_pending: bool = false,
++
+ /// The timer used for cursor blinking
+ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+@@ -154,6 +168,10 @@ pub fn init(
+     var draw_now = try xev.Async.init();
+     errdefer draw_now.deinit();
+ 
++    // Retry timer, see comments.
++    var retry_h = try xev.Timer.init();
++    errdefer retry_h.deinit();
++
+     // Setup a timer for blinking the cursor
+     var cursor_timer = try xev.Timer.init();
+     errdefer cursor_timer.deinit();
+@@ -171,6 +189,7 @@ pub fn init(
+         .render_h = render_h,
+         .draw_h = draw_h,
+         .draw_now = draw_now,
++        .retry_h = retry_h,
+         .cursor_h = cursor_timer,
+         .surface = surface,
+         .renderer = renderer_impl,
+@@ -188,6 +207,7 @@ pub fn deinit(self: *Thread) void {
+     self.render_h.deinit();
+     self.draw_h.deinit();
+     self.draw_now.deinit();
++    self.retry_h.deinit();
+     self.cursor_h.deinit();
+     self.loop.deinit();
+ 
+@@ -333,6 +353,23 @@ fn syncDrawTimer(self: *Thread) void {
+     );
+ }
+ 
++/// Ask for a draw the renderer declined to be tried again shortly. Only the
++/// renderer calls this, and only from a draw it was free to decline, which is
++/// always a draw we issued from this loop -- so touching the timer here is on
++/// the loop thread.
++pub fn scheduleRetryDraw(self: *Thread) void {
++    if (self.retry_pending) return;
++    self.retry_pending = true;
++    self.retry_h.run(
++        &self.loop,
++        &self.retry_c,
++        RETRY_INTERVAL,
++        Thread,
++        self,
++        retryCallback,
++    );
++}
++
+ /// Drain the mailbox.
+ fn drainMailbox(self: *Thread) !void {
+     // There's probably a more elegant way to do this...
+@@ -593,6 +630,36 @@ fn drawCallback(
+     return .disarm;
+ }
+ 
++fn retryCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
++    const t: *Thread = self_ orelse {
++        // This shouldn't happen so we log it.
++        log.warn("retry callback fired without data set", .{});
++        return .disarm;
++    };
++    t.retry_pending = false;
++
++    _ = r catch |err| switch (err) {
++        // Canceled means we're shutting down, so there's nothing to redraw.
++        error.Canceled => return .disarm,
++        else => {
++            log.warn("error in retry timer callback err={}", .{err});
++            return .disarm;
++        },
++    };
++
++    // Go back through the normal draw path so this inherits its gates: if
++    // we've been occluded again there's nothing to draw, and if a display
++    // link started in the meantime it owns the pacing from here.
++    t.drawFrame(false);
++
++    return .disarm;
++}
++
+ fn renderCallback(
+     self_: ?*Thread,
+     _: *xev.Loop,
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 0f4a294bc..7bbc75126 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -199,6 +199,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         /// don't support a display link.
+         display_link: ?DisplayLink = null,
+ 
++        /// Our render thread, so that a draw we declined can ask to be
++        /// retried when there is no display link ticking to retry it for us.
++        /// Set on loop enter, when the thread pointer is stable.
++        thread: ?*renderer.Thread = null,
++
+         /// Health of the most recently completed frame.
+         health: std.atomic.Value(Health) = .{ .raw = .healthy },
+ 
+@@ -262,6 +267,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             /// the renderer is deinited after that.
+             defunct: bool = false,
+ 
++            /// When we began the current run of declined draws, or null if
++            /// the last pick succeeded. We bound the run by elapsed time
++            /// rather than by a count of attempts: what we are waiting for
++            /// is display refreshes, and draws reach us from more than one
++            /// trigger, so a count gets spent by whatever happens to fire
++            /// rather than by the waiting we actually want to do.
++            declined_since: ?std.time.Instant = null,
++
++            /// How long we will hold out for a target that isn't the one on
++            /// screen. Long enough to cover the compositor releasing a
++            /// surface it just latched, short enough that a surface which
++            /// never frees up costs a stale frame, not a frozen pane.
++            const max_decline_ns = 40 * std.time.ns_per_ms;
++
+             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
+                 var result: SwapChain = .{ .frames = undefined };
+ 
+@@ -286,19 +305,115 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             /// Get the next frame state to draw to. This will wait on the
+             /// semaphore to ensure that the frame is available. This must
+             /// always be paired with a call to releaseFrame.
+-            pub fn nextFrame(self: *SwapChain) error{Defunct}!*FrameState {
++            ///
++            /// Returns null if the only target we could have drawn into is
++            /// the one currently on screen, so that we can wait for a better
++            /// one. The semaphore is posted back before returning, so the
++            /// caller owes nothing but a redraw.
++            pub fn nextFrame(
++                self: *SwapChain,
++                api: *const GraphicsAPI,
++            ) error{Defunct}!?*FrameState {
+                 if (self.defunct) return error.Defunct;
+ 
+                 self.frame_sema.wait();
+                 errdefer self.frame_sema.post();
+-                self.frame_index = (self.frame_index + 1) % buf_count;
+-                return &self.frames[self.frame_index];
++
++                // The semaphore only tracks GPU completion, but a target's
++                // backing storage may still be read by the window server
++                // after the GPU is done with it: it stays on screen until a
++                // newer surface displaces it, which happens later, on the
++                // main thread. Rendering into it in the meantime tears the
++                // displayed frame. So we prefer, in round-robin order, a
++                // frame whose target is not externally in use, and only fall
++                // back to plain round-robin if every available frame is held.
++                // The in-use test is a sample, not a lock: the compositor can
++                // latch a surface between our check and the GPU's write, and
++                // a revealed layer keeps displaying whatever it last held.
++                // So we also refuse the surface we most recently presented,
++                // which is a fact we own rather than a value we poll.
++                //
++                // Preference order, round-robin from the last index:
++                //   1. not in use and not the presented surface
++                //   2. not in use (what the in-use test alone would pick)
++                //   3. anything not in flight
++                var fallback: ?usize = null;
++                var unheld: ?usize = null;
++                var free: ?usize = null;
++                for (1..buf_count + 1) |offset| {
++                    const i = (@as(usize, self.frame_index) + offset) % buf_count;
++                    const frame = &self.frames[i];
++                    if (frame.in_flight.load(.acquire)) continue;
++                    if (fallback == null) fallback = i;
++                    if (targetInUse(api, &frame.target)) continue;
++                    if (unheld == null) unheld = i;
++                    if (!targetPresented(api, &frame.target)) {
++                        free = i;
++                        break;
++                    }
++                }
++
++                // The semaphore guarantees at least one frame is not in flight.
++                const chosen: usize = free orelse unheld orelse fallback.?;
++
++                // The case the preference order alone cannot cover: the only
++                // target we can have is the one we handed the compositor. A
++                // preference has nothing left to prefer, so drawing here is
++                // what tears the displayed frame.
++                //
++                // Rather than draw, we decline the frame and ask to be called
++                // again, which turns "avoid the presented surface" from a
++                // preference into a rule. Declining is only safe while
++                // something is going to call us back, so we bound it: once
++                // we have held out for `max_decline_ns` we draw into it
++                // anyway, because a pane frozen on stale content is a worse
++                // defect than a torn frame, and the caller may have no vsync
++                // to retry on.
++                if (free == null) if (unheld) |u| {
++                    if (u == chosen and targetPresented(api, &self.frames[u].target)) {
++                        const now = std.time.Instant.now() catch unreachable;
++                        const waited = if (self.declined_since) |since|
++                            now.since(since)
++                        else
++                            0;
++                        if (waited < max_decline_ns) {
++                            if (self.declined_since == null) self.declined_since = now;
++                            self.frame_sema.post();
++                            return null;
++                        }
++                    }
++                };
++
++                self.declined_since = null;
++                self.frame_index = @intCast(chosen);
++                const frame = &self.frames[chosen];
++                frame.in_flight.store(true, .monotonic);
++                return frame;
+             }
+ 
+             /// This should be called when the frame has completed drawing.
+-            pub fn releaseFrame(self: *SwapChain) void {
++            pub fn releaseFrame(self: *SwapChain, frame: *FrameState) void {
++                frame.in_flight.store(false, .release);
+                 self.frame_sema.post();
+             }
++
++            /// True if the target's backing storage is still in use by an
++            /// external process, e.g. still being displayed.
++            fn targetInUse(api: *const GraphicsAPI, target: *const Target) bool {
++                if (comptime @hasDecl(GraphicsAPI, "isTargetInUse")) {
++                    return api.isTargetInUse(target);
++                }
++                return false;
++            }
++
++            /// True if the target's backing storage is the one we most
++            /// recently presented, i.e. what the compositor is displaying.
++            fn targetPresented(api: *const GraphicsAPI, target: *const Target) bool {
++                if (comptime @hasDecl(GraphicsAPI, "isTargetPresented")) {
++                    return api.isTargetPresented(target);
++                }
++                return false;
++            }
+         };
+ 
+         /// State we need duplicated for every frame. Any state that could be
+@@ -324,6 +439,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             /// See property of same name on Renderer for explanation.
+             target_config_modified: usize = 0,
+ 
++            /// True while this frame is owned by a draw, i.e. between
++            /// `nextFrame` and `releaseFrame`. Set on the thread calling
++            /// `drawFrame`, cleared on the graphics API's completion thread.
++            in_flight: std.atomic.Value(bool) = .{ .raw = false },
++
+             /// Buffer with the vertex data for our background image.
+             ///
+             /// TODO: Make this an optional and only create it
+@@ -900,6 +1020,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 self.api.loopEnter();
+             }
+ 
++            self.thread = thr;
++
+             // If we don't support a display link we have no work to do.
+             if (comptime DisplayLink == void) return;
+ 
+@@ -922,6 +1044,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 self.api.loopExit();
+             }
+ 
++            self.thread = null;
++
+             // If we don't support a display link we have no work to do.
+             if (comptime DisplayLink == void) return;
+ 
+@@ -1474,11 +1598,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+ 
+             // Conditions under which we need to draw the frame, otherwise we
+             // don't need to since the previous frame should be identical.
++            //
++            // A synchronous draw is deliberately not one of those conditions.
++            // The only one we get is CoreAnimation asking the layer to display,
++            // which is exactly what happens on reveal — and on reveal nothing
++            // about the content has changed, so the right answer is to show the
++            // frame we already have rather than rewrite the surface the
++            // compositor is scanning out. Anything that genuinely needs a new
++            // frame sets `size_changed`, `cells_rebuilt` or `hasAnimations`.
+             const needs_redraw =
+                 size_changed or
+                 self.cells_rebuilt or
+-                self.hasAnimations() or
+-                sync;
++                self.hasAnimations();
+ 
+             if (!needs_redraw) {
+                 // We still need to present the last target again, because the
+@@ -1489,9 +1620,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             }
+             self.cells_rebuilt = false;
+ 
+-            // Wait for a frame to be available.
+-            const frame = try self.swap_chain.nextFrame();
+-            errdefer self.swap_chain.releaseFrame();
++            // Wait for a frame to be available. This can decline to give us
++            // one when the only target left is the one the compositor is
++            // showing; drawing into that is what tears the displayed frame.
++            // Synchronous draws decline too — the surface on the glass is no
++            // safer to overwrite because the caller is waiting on us.
++            //
++            // A declined draw has to come back, or the pane sits on stale
++            // content. Restoring `cells_rebuilt` is what makes the next call
++            // draw rather than re-present. What makes that next call happen
++            // differs by caller:
++            //
++            //   - async: the display link, when one is running; when it isn't
++            //     we ask the thread for a retry, on a timer rather than
++            //     immediately, since what we are waiting for is a display
++            //     refresh and retrying inside the same millisecond only burns
++            //     the budget.
++            //
++            //   - sync: nothing, deliberately. We reach `nextFrame` at all
++            //     only because a draw is already pending — either a retry is
++            //     in flight or the render callback that set `cells_rebuilt` is
++            //     about to run. Arming the timer from here would be wrong as
++            //     well as unnecessary: this path runs on the main thread and
++            //     the timer belongs to the render loop.
++            //
++            // CoreAnimation still asked the layer to display, so a declined
++            // sync draw answers with the contents we already have rather than
++            // leaving the layer blank.
++            const frame = try self.swap_chain.nextFrame(&self.api) orelse {
++                self.cells_rebuilt = true;
++                if (sync) {
++                    try self.api.presentLastTarget();
++                } else if (!self.hasVsync()) {
++                    if (self.thread) |thr| thr.scheduleRetryDraw();
++                }
++                return;
++            };
++            errdefer self.swap_chain.releaseFrame(frame);
+             // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
+ 
+             // If we need to reinitialize our shaders, do so.
+@@ -1723,6 +1888,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         // Callback from the graphics API when a frame is completed.
+         pub fn frameCompleted(
+             self: *Self,
++            target: *Target,
+             health: Health,
+         ) void {
+             // If our health value hasn't changed, then we do nothing. We don't
+@@ -1738,7 +1904,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             }
+ 
+             // Always release our semaphore
+-            self.swap_chain.releaseFrame();
++            const frame: *FrameState = @fieldParentPtr("target", target);
++            self.swap_chain.releaseFrame(frame);
+         }
+ 
+         /// Call this any time the background image path changes.
+diff --git a/src/renderer/metal/Frame.zig b/src/renderer/metal/Frame.zig
+index 388b4f9ed..dd899f4b3 100644
+--- a/src/renderer/metal/Frame.zig
++++ b/src/renderer/metal/Frame.zig
+@@ -87,7 +87,7 @@ fn bufferCompleted(
+         };
+     }
+ 
+-    block.renderer.frameCompleted(health);
++    block.renderer.frameCompleted(block.target, health);
+ }
+ 
+ /// Add a render pass to this frame with the provided attachments.
+diff --git a/src/renderer/metal/IOSurfaceLayer.zig b/src/renderer/metal/IOSurfaceLayer.zig
+index 34fbfbed5..f19647b52 100644
+--- a/src/renderer/metal/IOSurfaceLayer.zig
++++ b/src/renderer/metal/IOSurfaceLayer.zig
+@@ -35,6 +35,7 @@ pub fn init() !IOSurfaceLayer {
+ 
+     layer.setInstanceVariable("display_cb", .{ .value = null });
+     layer.setInstanceVariable("display_ctx", .{ .value = null });
++    layer.setInstanceVariable("latest_surface", .{ .value = null });
+ 
+     return .{ .layer = layer };
+ }
+@@ -52,6 +53,11 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+     //
+     // We release in the callback after setting the contents.
+     surface.retain();
++
++    // Record this surface as the most recently presented one so that the
++    // callback can discard applies that have been superseded while queued.
++    self.layer.setInstanceVariable("latest_surface", objc.Object.fromId(surface));
++
+     // NOTE: Since `self.layer` is passed as an `objc.c.id`, it's
+     //       automatically retained when the block is copied, so we
+     //       don't need to retain it ourselves like with the surface.
+@@ -81,6 +87,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+ ///
+ /// Does not ensure this happens on the main thread.
+ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
++    self.layer.setInstanceVariable("latest_surface", objc.Object.fromId(surface));
+     self.layer.setProperty("contents", surface);
+ }
+ 
+@@ -98,6 +105,12 @@ fn setSurfaceCallback(
+     // See explanation of why we retain and release in `setSurface`.
+     defer surface.release();
+ 
++    // If a newer surface has been presented since this block was queued,
++    // discard this one: applying it would put stale contents on screen, and
++    // the swap chain may already have cycled back to redraw into it.
++    const latest = layer.getInstanceVariable("latest_surface");
++    if (@intFromPtr(latest.value) != @intFromPtr(surface)) return;
++
+     // We check to see if the surface is the appropriate size for
+     // the layer, if it's not then we discard it. This is because
+     // asynchronously drawn frames can sometimes finish just after
+@@ -147,6 +160,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
+ 
+     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
+     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
++    if (!subclass.addIvar("latest_surface")) return error.ObjCFailed;
+ 
+     subclass.replaceMethod("display", struct {
+         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
+diff --git a/src/renderer/opengl/Frame.zig b/src/renderer/opengl/Frame.zig
+index 289413b0a..aa89fc3ae 100644
+--- a/src/renderer/opengl/Frame.zig
++++ b/src/renderer/opengl/Frame.zig
+@@ -67,5 +67,5 @@ pub fn complete(self: *const Self, sync: bool) void {
+     }
+ 
+     // Report the health to the renderer.
+-    self.renderer.frameCompleted(health);
++    self.renderer.frameCompleted(self.target, health);
+ }
