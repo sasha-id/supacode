@@ -55,7 +55,14 @@ print_fingerprint() {
 repair_xcframework_macos_slice() {
   local slice="${xcframework_path}/macos-arm64_x86_64/libghostty.a"
   [ -f "${slice}" ] || return 0
-  if nm "${slice}" 2>/dev/null | grep -q " T _ghostty_surface_text"; then
+  # NOTE: `grep -c`, not `grep -q`. `grep -q` exits on the first match and
+  # closes the pipe, so `nm` dies with SIGPIPE while still streaming its ~65k
+  # lines; under `set -o pipefail` that makes a *successful* match report
+  # failure, and this repair then runs on every build — silently rebuilding
+  # the slice from whatever stale manifest the cache scan happens to find.
+  local have_c_api
+  have_c_api="$(nm "${slice}" 2>/dev/null | grep -c " T _ghostty_surface_text" || true)"
+  if [ "${have_c_api}" -gt 0 ]; then
     return 0
   fi
   echo "note: xcframework macOS slice lacks the ghostty C API (libtool dropped unaligned members); rebuilding it with ar" >&2
@@ -100,6 +107,28 @@ repair_xcframework_macos_slice() {
   done
   lipo -create "${work}/arm64.a" "${work}/x86_64.a" -output "${slice}"
   rm -rf "${work}"
+}
+
+# Fail loudly if the installed slice isn't the one this build just produced.
+# `repair_xcframework_macos_slice` rebuilds the slice from zig cache manifests,
+# and those can belong to an *earlier* build — which links and exports the full
+# C API, so nothing else notices, and the app silently ships stale renderer
+# code. Compare against zig's own output; sizes match iff the install is current.
+assert_installed_slice_current() {
+  local built="${ghostty_dir}/macos/GhosttyKit.xcframework/macos-arm64_x86_64/libghostty.a"
+  local slice="${xcframework_path}/macos-arm64_x86_64/libghostty.a"
+  [ -f "${built}" ] && [ -f "${slice}" ] || return 0
+  local built_size slice_size
+  built_size="$(stat -f '%z' "${built}")"
+  slice_size="$(stat -f '%z' "${slice}")"
+  if [ "${built_size}" != "${slice_size}" ]; then
+    echo "error: installed xcframework slice does not match this build's output" >&2
+    echo "       built:     ${built_size} bytes  ${built}" >&2
+    echo "       installed: ${slice_size} bytes  ${slice}" >&2
+    echo "       The slice was rebuilt from a stale zig cache manifest. Remove" >&2
+    echo "       .build/ghostty/.zig-cache and .build/ghostty/fingerprint, then retry." >&2
+    exit 1
+  fi
 }
 
 prepare_xcframework() {
@@ -251,4 +280,5 @@ mise exec -- zig build -Doptimize=ReleaseFast -Demit-xcframework=true -Demit-mac
 rsync -a --delete "${ghostty_dir}/macos/GhosttyKit.xcframework/" "${xcframework_path}/"
 repair_xcframework_macos_slice
 prepare_xcframework
+assert_installed_slice_current
 printf '%s\n' "${fingerprint}" > "${ghostty_fingerprint_path}"
