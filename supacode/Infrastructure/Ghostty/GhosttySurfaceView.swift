@@ -838,7 +838,9 @@ final class GhosttySurfaceView: NSView, Identifiable {
   }
 
   override func mouseExited(with event: NSEvent) {
-    if NSEvent.pressedMouseButtons != 0 {
+    // A drag that leaves the view keeps its mouse position; an auxiliary button
+    // latched down by a remapper must not, or the terminal never clears hover.
+    if NSEvent.isDraggingButtonPressed {
       return
     }
     guard let surface else { return }

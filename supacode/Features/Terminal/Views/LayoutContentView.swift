@@ -527,8 +527,10 @@ private final class HoverFocusSensorView: NSView {
     // Live window/button/responder reads mirror the surface's own FFM guards:
     // skip background windows, skip mid-drag retargeting, and require a conforming
     // responder so hover never steals focus from the sidebar or file explorer.
+    // The drag check is primary/secondary only: a latched auxiliary button would
+    // otherwise disable hover-focus for the whole login session.
     guard let window, window.isKeyWindow,
-      NSEvent.pressedMouseButtons == 0,
+      !NSEvent.isDraggingButtonPressed,
       window.firstResponder is any HoverFocusEligibleResponder
     else { return }
     onHoverFocus()
