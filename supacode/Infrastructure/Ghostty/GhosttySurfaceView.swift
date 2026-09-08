@@ -2187,6 +2187,7 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
   private var isLiveScrolling = false
   private var lastSentRow: Int?
   private var scrollbar: ScrollbarState?
+  private var scrollerTrackingArea: NSTrackingArea?
 
   init(surfaceView: GhosttySurfaceView) {
     self.surfaceView = surfaceView
@@ -2385,19 +2386,19 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
   }
 
   override func updateTrackingAreas() {
-    trackingAreas.forEach { removeTrackingArea($0) }
     super.updateTrackingAreas()
-    guard let scroller = scrollView.verticalScroller else { return }
-    addTrackingArea(
-      NSTrackingArea(
-        rect: convert(scroller.bounds, from: scroller),
-        options: [
-          .mouseMoved,
-          .activeInKeyWindow,
-        ],
-        owner: self,
-        userInfo: nil
-      ))
+    guard scrollView.hasVerticalScroller, let scroller = scrollView.verticalScroller else {
+      if let scrollerTrackingArea { removeTrackingArea(scrollerTrackingArea) }
+      scrollerTrackingArea = nil
+      return
+    }
+    let rect = convert(scroller.bounds, from: scroller)
+    guard scrollerTrackingArea?.rect != rect else { return }
+    if let scrollerTrackingArea { removeTrackingArea(scrollerTrackingArea) }
+    let area = NSTrackingArea(
+      rect: rect, options: [.mouseMoved, .activeInKeyWindow], owner: self, userInfo: nil)
+    scrollerTrackingArea = area
+    addTrackingArea(area)
   }
 
   static func reportedSurfaceSize(

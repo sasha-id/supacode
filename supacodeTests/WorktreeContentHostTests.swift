@@ -167,6 +167,54 @@ struct WorktreeContentHostTests {
     #expect(!host.shouldClaimFocus(surfaceID))
   }
 
+  @Test func dormantContentKeepsHiddenReportsWithoutPublishingUntilWorktreeReveal() {
+    let id = ContentID()
+    let runtime = ContentRuntime()
+    let content = ChromeTabContent(id: id)
+    _ = runtime.provision(content, at: .fallback)
+    let host = makeHost(layout: singleTabLayout(contentID: id.rawValue), runtime: runtime)
+    host.setWorktreeSelected(true)
+    host.updateReportedTitle(for: id, title: "Visible")
+    host.setWorktreeSelected(false)
+    host.updateReportedTitle(for: id, title: "Hidden")
+    #expect(content.terminalChrome.presentedTitle == "Visible")
+    #expect(content.terminalChrome.reportedTitle == "Hidden")
+    host.setWorktreeSelected(true)
+    #expect(content.terminalChrome.presentedTitle == "Hidden")
+  }
+
+  @Test func hiddenFloatingPanePausesTitlesForDetachedInactiveTabsToo() {
+    let firstID = ContentID()
+    let secondID = ContentID()
+    let runtime = ContentRuntime()
+    let first = ChromeTabContent(id: firstID)
+    let second = ChromeTabContent(id: secondID)
+    _ = runtime.provision(first, at: .fallback)
+    _ = runtime.provision(second, at: .fallback)
+    var layout = singleTabLayout(contentID: firstID.rawValue)
+    layout.panes[0].tabs.append(singleTabLayout(contentID: secondID.rawValue).panes[0].tabs[0])
+    let paneID = layout.panes[0].id
+    let host = makeHost(layout: layout, runtime: runtime)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 200, height: 200),
+      styleMask: .borderless, backing: .buffered, defer: true)
+    defer { window.orderOut(nil) }
+    host.windowedPaneIDs = { [paneID] }
+    host.paneWindow = { _ in window }
+    first.terminalChrome.reportedTitle = "First"
+    second.terminalChrome.reportedTitle = "Second"
+    host.applySurfaceActivity()
+    first.terminalChrome.reportedTitle = "Hidden first"
+    second.terminalChrome.reportedTitle = "Hidden second"
+    #expect(first.terminalChrome.presentedTitle == "First")
+    #expect(second.terminalChrome.presentedTitle == "Second")
+    // An unknown window fails open during a window-mode transition.
+    host.paneWindow = { _ in nil }
+    host.applySurfaceActivity()
+    #expect(first.terminalChrome.presentedTitle == "Hidden first")
+    #expect(second.terminalChrome.presentedTitle == "Hidden second")
+  }
+
   @Test func aWindowedPaneReclaimsFirstResponderWhileTheWorktreeIsDeselected() {
     let surfaceID = UUID()
     let layout = singleTabLayout(contentID: surfaceID)

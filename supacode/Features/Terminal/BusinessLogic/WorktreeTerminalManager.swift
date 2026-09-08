@@ -765,6 +765,9 @@ final class WorktreeTerminalManager {
     host.notificationsEnabled = notificationsEnabled
     host.layout = { [weak self] in self?.layoutState(for: worktree.id)?.layout }
     host.windowedPaneIDs = { [weak self] in self?.layoutState(for: worktree.id)?.windowedPaneIDs ?? [] }
+    host.paneWindow = { [weak self] paneID in
+      self?.paneWindows.window(worktreeID: worktree.id, paneID: paneID)
+    }
     host.sendLayoutAction = { [weak self] action in self?.sendLayout(worktree.id, action) }
     host.setWorktreeSelected(selectedWorktreeID == worktree.id)
     host.hibernationAgentsBySurface = { [weak self] in self?.currentAgentsBySurface?() ?? [:] }

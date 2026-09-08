@@ -587,4 +587,32 @@ struct GhosttySurfaceViewTests {
     #expect(surfaceView.trackingAreas.first === original)
     #expect(original?.options.contains(.inVisibleRect) == true)
   }
+
+  @Test func unchangedScrollerGeometryRetainsItsTrackingArea() throws {
+    let surfaceView = GhosttySurfaceView(
+      id: UUID(), runtime: GhosttyRuntime(), workingDirectory: nil,
+      initialGeometry: .fallback, context: GHOSTTY_SURFACE_CONTEXT_TAB
+    )
+    defer { surfaceView.closeSurface() }
+    let wrapper = surfaceView.hostedView()
+    let scrollView = try #require(wrapper.subviews.first as? NSScrollView)
+    scrollView.hasVerticalScroller = true
+    wrapper.updateTrackingAreas()
+    let original = try #require(wrapper.trackingAreas.first)
+
+    wrapper.updateTrackingAreas()
+
+    #expect(wrapper.trackingAreas.count == 1)
+    #expect(wrapper.trackingAreas.first === original)
+
+    let scroller = try #require(scrollView.verticalScroller)
+    scroller.frame.size.height += 20
+    wrapper.updateTrackingAreas()
+    #expect(wrapper.trackingAreas.first !== original)
+    #expect(wrapper.trackingAreas.first?.rect == wrapper.convert(scroller.bounds, from: scroller))
+
+    scrollView.hasVerticalScroller = false
+    wrapper.updateTrackingAreas()
+    #expect(wrapper.trackingAreas.isEmpty)
+  }
 }

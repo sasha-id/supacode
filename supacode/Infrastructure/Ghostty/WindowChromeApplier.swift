@@ -522,6 +522,7 @@ protocol WindowTintMaskRegion: NSView {}
 @MainActor
 enum WindowTintMaskRegistry {
   private static let liveRegions = NSHashTable<NSView>.weakObjects()
+  private static let lastWindowRects = NSMapTable<NSView, NSValue>.weakToStrongObjects()
 
   // Attach registers, detach unregisters, and either way the mask has to be
   // re-cut. The window a detaching region is leaving is no longer readable
@@ -529,6 +530,7 @@ enum WindowTintMaskRegistry {
   // itself whether the change is its own.
   static func regionDidMoveToWindow(_ region: some WindowTintMaskRegion) {
     let view: NSView = region
+    lastWindowRects.removeObject(forKey: view)
     if view.window == nil {
       liveRegions.remove(view)
     } else {
@@ -540,6 +542,10 @@ enum WindowTintMaskRegistry {
   // A registered region moved or resized within its window.
   static func regionGeometryDidChange(_ region: some WindowTintMaskRegion) {
     let view: NSView = region
+    guard view.window != nil else { return }
+    let rect = view.convert(view.bounds, to: nil)
+    guard lastWindowRects.object(forKey: view)?.rectValue != rect else { return }
+    lastWindowRects.setObject(NSValue(rect: rect), forKey: view)
     Self.postRegionDidChange(view)
   }
 

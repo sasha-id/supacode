@@ -20,11 +20,14 @@ protocol TabChrome: AnyObject {
   /// rewrite it several times a second, which is why it lives here instead of
   /// in the layout reducer.
   var reportedTitle: String? { get }
+  /// A bounded-rate presentation of the report; persistence uses the raw title.
+  var presentedTitle: String? { get }
 }
 
 extension TabChrome {
   // Content kinds that never report a title fall back to the layout's own.
   var reportedTitle: String? { nil }
+  var presentedTitle: String? { reportedTitle }
 }
 
 /// Resolves what a tab shows, and what the layout should store for it, from the
@@ -45,7 +48,11 @@ enum TabTitle {
 
   /// What the tab displays: a user override wins over the reported title.
   static func resolved(for tab: TabItem, chrome: (any TabChrome)?) -> String {
-    tab.customTitle ?? stored(for: tab, chrome: chrome)
+    if let customTitle = tab.customTitle { return customTitle }
+    guard !tab.isLocked, let title = chrome?.presentedTitle, !title.isEmpty else {
+      return tab.title
+    }
+    return title
   }
 
   static func resolved(for tab: TabItem, runtime: ContentRuntime) -> String {
@@ -62,7 +69,61 @@ final class TerminalTabChrome: TabChrome {
   var isWorking = false
   var progress: TerminalTabProgressDisplay?
   var isReadOnly = false
-  var reportedTitle: String?
+  @ObservationIgnored var reportedTitle: String? {
+    didSet {
+      guard reportedTitle != oldValue, titlePresentationActive else { return }
+      publishTitleIfReady()
+    }
+  }
+  private(set) var presentedTitle: String?
+  @ObservationIgnored private let clock: any Clock<Duration>
+  @ObservationIgnored private var titlePublicationTask: Task<Void, Never>?
+  @ObservationIgnored private var titlePresentationActive = true
+  @ObservationIgnored private var titleSelected = false
+
+  init(clock: any Clock<Duration> = ContinuousClock()) {
+    self.clock = clock
+  }
+
+  isolated deinit {
+    titlePublicationTask?.cancel()
+  }
+
+  /// Hidden strips retain reports without waking their mounted SwiftUI trees.
+  /// Revealing a strip or selecting a tab immediately catches up to its title.
+  func setTitlePresentation(active: Bool, selected: Bool) {
+    let shouldFlush = active && (!titlePresentationActive || (selected && !titleSelected))
+    titlePresentationActive = active
+    titleSelected = selected
+    if !active {
+      titlePublicationTask?.cancel()
+      titlePublicationTask = nil
+    } else if shouldFlush, presentedTitle != reportedTitle {
+      presentedTitle = reportedTitle
+      publishTitleIfReady()
+    }
+  }
+
+  private func publishTitleIfReady() {
+    guard titlePublicationTask == nil else { return }
+    presentedTitle = reportedTitle
+    let clock = clock
+    titlePublicationTask = Task { [weak self] in
+      while !Task.isCancelled {
+        do {
+          try await clock.sleep(for: .milliseconds(250))
+        } catch {
+          return
+        }
+        guard let self, !Task.isCancelled else { return }
+        guard self.presentedTitle != self.reportedTitle else {
+          self.titlePublicationTask = nil
+          return
+        }
+        self.presentedTitle = self.reportedTitle
+      }
+    }
+  }
 
   var accessory: AnyView? {
     guard !agents.isEmpty else { return nil }

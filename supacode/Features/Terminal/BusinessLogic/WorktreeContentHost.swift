@@ -24,6 +24,7 @@ final class WorktreeContentHost {
   /// Panes rendering in their own windows; their surfaces' activity keys off
   /// those windows, not the main one.
   @ObservationIgnored var windowedPaneIDs: () -> Set<PaneID> = { [] }
+  @ObservationIgnored var paneWindow: (PaneID) -> NSWindow? = { _ in nil }
   /// Routes a topology mutation into the worktree's `LayoutFeature`.
   @ObservationIgnored var sendLayoutAction: (LayoutFeature.Action) -> Void = { _ in }
   @ObservationIgnored var onNotificationReceived: ((UUID, String, String, Bool) -> Void)?
@@ -641,27 +642,31 @@ final class WorktreeContentHost {
     let windowedPanes = windowedPaneIDs()
     var focusTarget: GhosttySurfaceView?
     for pane in layout.panes {
+      let floatingWindow = paneWindow(pane.id)
       for tab in pane.tabs {
-        guard let surface = liveSurface(tab.content.id.rawValue) else { continue }
+        let surface = liveSurface(tab.content.id.rawValue)
         let isSelectedTab = pane.selectedTabID == tab.id
-        let isVisible: Bool
+        let stripIsVisible: Bool
         let isKeyed: Bool
         if windowedPanes.contains(pane.id) {
           // A windowed pane floats over any worktree; its own window drives
-          // visibility and key state, not the main-window observer. A surface
-          // not yet mounted fails open; the occlusion notification corrects
-          // the first-display transient.
-          let windowShowsContent = surface.window.map {
+          // visibility, including titles of detached inactive tabs. An unknown
+          // pane window fails open until its first occlusion notification.
+          let windowShowsContent = floatingWindow.map {
             $0.isVisible && $0.occlusionState.contains(.visible)
           }
-          isVisible = isSelectedTab && windowShowsContent != false
-          isKeyed = surface.window?.isKeyWindow == true
+          stripIsVisible = windowShowsContent != false
+          isKeyed = surface?.window?.isKeyWindow == true
         } else {
-          isVisible =
-            selected && visiblePanes.contains(pane.id) && isSelectedTab
+          stripIsVisible =
+            selected && visiblePanes.contains(pane.id)
             && lastWindowIsVisible != false
           isKeyed = lastWindowIsKey == true
         }
+        (runtime.content(for: tab.content.id)?.chrome as? TerminalTabChrome)?
+          .setTitlePresentation(active: stripIsVisible, selected: isSelectedTab)
+        guard let surface else { continue }
+        let isVisible = stripIsVisible && isSelectedTab
         let isFocused = isVisible && isKeyed && focusedContentID == tab.content.id.rawValue
         surface.setOcclusion(isVisible)
         surface.focusDidChange(isFocused)

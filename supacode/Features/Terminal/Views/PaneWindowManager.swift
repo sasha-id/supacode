@@ -221,6 +221,10 @@ final class PaneWindowManager {
     window.makeKeyAndOrderFront(nil)
   }
 
+  func window(worktreeID: Worktree.ID, paneID: PaneID) -> NSWindow? {
+    controllers[Key(worktreeID: worktreeID, paneID: paneID)]?.window
+  }
+
   private func reassertAllHosts() {
     for worktreeID in Set(controllers.keys.map(\.worktreeID)) {
       terminalManager?.hostIfExists(for: worktreeID)?.reassertSurfaceActivity()

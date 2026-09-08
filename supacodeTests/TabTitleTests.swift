@@ -1,3 +1,6 @@
+import Clocks
+import ConcurrencyExtras
+import Observation
 import Testing
 
 @testable import supacode
@@ -63,5 +66,90 @@ struct TabTitleTests {
     _ = runtime.provision(content, at: .fallback)
     content.terminalChrome.reportedTitle = "claude"
     #expect(TabTitle.resolved(for: tab(contentID: contentID), runtime: runtime) == "claude")
+  }
+
+  @Test func rapidReportsKeepTheLatestRawTitleWithoutRepublishingEveryIntermediateValue() {
+    let chrome = TerminalTabChrome()
+    chrome.reportedTitle = "First"
+    #expect(TabTitle.resolved(for: tab(), chrome: chrome) == "First")
+
+    chrome.reportedTitle = "Intermediate"
+    chrome.reportedTitle = "Latest"
+
+    #expect(TabTitle.stored(for: tab(), chrome: chrome) == "Latest")
+    #expect(TabTitle.resolved(for: tab(), chrome: chrome) == "First")
+  }
+
+  @Test func sustainedReportsPublishTheLatestValueAtEachBoundedInterval() async throws {
+    let clock = TestClock()
+    let chrome = TerminalTabChrome(clock: clock)
+    chrome.reportedTitle = "First"
+    await Task.megaYield()
+    chrome.reportedTitle = "Second"
+    await clock.advance(by: .milliseconds(249))
+    #expect(chrome.presentedTitle == "First")
+    chrome.reportedTitle = "Third"
+    await clock.advance(by: .milliseconds(1))
+    #expect(chrome.presentedTitle == "Third")
+    chrome.reportedTitle = "Fourth"
+    await Task.megaYield()
+    await clock.advance(by: .milliseconds(250))
+    #expect(chrome.presentedTitle == "Fourth")
+    await clock.advance(by: .milliseconds(250))
+    try await clock.checkSuspension()
+  }
+
+  @Test func hiddenTitlesStayRawUntilRevealAndSelectionFlushesOnlyOnce() async throws {
+    let clock = TestClock()
+    let chrome = TerminalTabChrome(clock: clock)
+    chrome.reportedTitle = "First"
+    chrome.setTitlePresentation(active: false, selected: false)
+    chrome.reportedTitle = "Hidden"
+    try await clock.checkSuspension()
+    #expect(chrome.presentedTitle == "First")
+    #expect(chrome.reportedTitle == "Hidden")
+    chrome.setTitlePresentation(active: true, selected: false)
+    #expect(chrome.presentedTitle == "Hidden")
+    chrome.reportedTitle = "Selected"
+    chrome.setTitlePresentation(active: true, selected: true)
+    #expect(chrome.presentedTitle == "Selected")
+    chrome.reportedTitle = "Pending"
+    chrome.setTitlePresentation(active: true, selected: true)
+    #expect(chrome.presentedTitle == "Selected")
+    chrome.setTitlePresentation(active: false, selected: false)
+    try await clock.checkSuspension()
+  }
+
+  @Test func pendingPublicationDoesNotRetainClosedChrome() async throws {
+    let clock = TestClock()
+    var chrome: TerminalTabChrome? = TerminalTabChrome(clock: clock)
+    weak var weakChrome = chrome
+    chrome?.reportedTitle = "First"
+    await Task.megaYield()
+    chrome = nil
+    #expect(weakChrome == nil)
+    try await clock.checkSuspension()
+  }
+
+  @Test func rawReportsDoNotInvalidateTheObservedLabelAndEmptyTitlesEventuallyClearIt() async throws {
+    let clock = TestClock()
+    let chrome = TerminalTabChrome(clock: clock)
+    chrome.reportedTitle = "First"
+    await Task.megaYield()
+    let changes = LockIsolated(0)
+    withObservationTracking {
+      _ = TabTitle.resolved(for: tab(), chrome: chrome)
+    } onChange: {
+      changes.withValue { $0 += 1 }
+    }
+    chrome.reportedTitle = "Intermediate"
+    chrome.reportedTitle = ""
+    #expect(changes.value == 0)
+    #expect(TabTitle.stored(for: tab(), chrome: chrome) == "Terminal 1")
+    await clock.advance(by: .milliseconds(250))
+    #expect(changes.value == 1)
+    #expect(TabTitle.resolved(for: tab(), chrome: chrome) == "Terminal 1")
+    await clock.advance(by: .milliseconds(250))
+    try await clock.checkSuspension()
   }
 }

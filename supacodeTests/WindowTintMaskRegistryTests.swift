@@ -66,6 +66,7 @@ struct WindowTintMaskRegistryTests {
   // The observer block escapes, so the captured result travels in a reference.
   private final class RegionBox {
     var view: NSView?
+    var notifications = 0
   }
 
   private func makeWindow() -> NSWindow {
@@ -138,5 +139,65 @@ struct WindowTintMaskRegistryTests {
     #expect(box.view === region)
     region.removeFromSuperview()
     window.orderOut(nil)
+  }
+
+  @Test func unchangedGeometryDoesNotAnnounceAnotherMaskUpdate() {
+    let window = makeWindow()
+    let region = TestMaskRegion(frame: NSRect(x: 10, y: 20, width: 100, height: 100))
+    window.contentView?.addSubview(region)
+    let box = RegionBox()
+    let observer = NotificationCenter.default.addObserver(
+      forName: .ghosttyTintMaskRegionDidChange, object: region, queue: nil
+    ) { _ in
+      MainActor.assumeIsolated { box.notifications += 1 }
+    }
+    defer {
+      NotificationCenter.default.removeObserver(observer)
+      region.removeFromSuperview()
+      window.orderOut(nil)
+    }
+
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+
+    #expect(box.notifications == 1)
+
+    region.frame.origin.x += 5
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+    #expect(box.notifications == 2)
+    region.frame.size.width += 10
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+    #expect(box.notifications == 3)
+    WindowTintMaskRegistry.regionVisibilityDidChange(in: region)
+    #expect(box.notifications == 4)
+  }
+
+  @Test func parentMovementAndWindowReattachmentInvalidateCachedGeometry() {
+    let window = makeWindow()
+    let parent = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
+    let region = TestMaskRegion(frame: NSRect(x: 10, y: 20, width: 100, height: 100))
+    window.contentView?.addSubview(parent)
+    parent.addSubview(region)
+    let box = RegionBox()
+    let observer = NotificationCenter.default.addObserver(
+      forName: .ghosttyTintMaskRegionDidChange, object: region, queue: nil
+    ) { _ in MainActor.assumeIsolated { box.notifications += 1 } }
+    defer {
+      NotificationCenter.default.removeObserver(observer)
+      region.removeFromSuperview()
+      WindowTintMaskRegistry.regionDidMoveToWindow(region)
+      window.orderOut(nil)
+    }
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+    parent.frame.origin.x += 5
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+    #expect(box.notifications == 2)
+    region.removeFromSuperview()
+    WindowTintMaskRegistry.regionDidMoveToWindow(region)
+    parent.addSubview(region)
+    WindowTintMaskRegistry.regionDidMoveToWindow(region)
+    let before = box.notifications
+    WindowTintMaskRegistry.regionGeometryDidChange(region)
+    #expect(box.notifications == before + 1)
   }
 }
