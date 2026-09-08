@@ -523,7 +523,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   override func layout() {
     super.layout()
-    notifySizeChanged()
+    // The wrapper sizes this view and syncs the core in its own layout pass.
+    // Invalidating it from the child's layout schedules another parent pass
+    // even when neither view's geometry changed.
+    if scrollWrapper == nil { updateSurfaceSize() }
   }
 
   override func viewDidUnhide() {
@@ -542,9 +545,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
   }
 
   override func updateTrackingAreas() {
-    if let trackingArea {
-      removeTrackingArea(trackingArea)
-    }
+    super.updateTrackingAreas()
+    // AppKit maintains an inVisibleRect area's bounds across layout and resize.
+    // Replacing it needlessly invalidates the window's tracking regions.
+    guard trackingArea == nil else { return }
     let area = NSTrackingArea(
       rect: bounds,
       options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],

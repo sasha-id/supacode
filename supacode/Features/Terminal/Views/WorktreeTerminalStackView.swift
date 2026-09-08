@@ -193,6 +193,9 @@ final class WorktreeTerminalStackView: NSView {
   ) -> NSHostingView<WorktreeTerminalRoot> {
     let hosting = NSHostingView(rootView: WorktreeTerminalRoot(inputs: inputs))
     hostedRootWrites += 1
+    // Retained trees fill this container; their content need not be measured
+    // again to derive minimum, ideal, or maximum host sizes.
+    hosting.sizingOptions = []
     // The window uses a full-size content view; without this the hosted tree
     // insets below the titlebar wherever the stack overlaps it.
     hosting.safeAreaRegions = []

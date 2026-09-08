@@ -172,11 +172,17 @@ ghostty_patch_files() {
 # list line by line (bash 3.2 compatible) so a path with spaces stays intact.
 reset_ghostty_patch_files() {
   local f
-  local files=()
   while IFS= read -r f; do
-    [ -n "${f}" ] && files+=("${f}")
+    [ -n "${f}" ] || continue
+    if git -C "${ghostty_dir}" cat-file -e "HEAD:${f}" 2>/dev/null; then
+      git -C "${ghostty_dir}" restore --source=HEAD --worktree -- "${f}"
+    elif git -C "${ghostty_dir}" apply --summary "$1" \
+      | sed -n 's/^ create mode [0-9]* //p' | grep -Fx -- "${f}" >/dev/null; then
+      # Only remove files explicitly created by this patch. Mixing these
+      # untracked paths into checkout would prevent tracked-file recovery.
+      rm -f -- "${ghostty_dir}/${f}"
+    fi
   done < <(ghostty_patch_files "$1")
-  [ "${#files[@]}" -eq 0 ] || git -C "${ghostty_dir}" checkout -- "${files[@]}" 2>/dev/null || true
 }
 
 apply_ghostty_patches() {

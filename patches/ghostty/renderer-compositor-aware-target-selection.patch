@@ -16,6 +16,58 @@ index 37f8712ba..bafc12fd9 100644
      pub inline fn getAllocSize(self: *IOSurface) usize {
          return c.IOSurfaceGetAllocSize(@ptrCast(self));
      }
+diff --git a/src/renderer/DrawTimer.zig b/src/renderer/DrawTimer.zig
+new file mode 100644
+index 000000000..ec0eec5fa
+--- /dev/null
++++ b/src/renderer/DrawTimer.zig
+@@ -0,0 +1,46 @@
++//! Tracks one run of deferred draws using timestamps from a monotonic clock.
++const DrawTimer = @This();
++const std = @import("std");
++
++started_at: ?u64 = null,
++
++pub fn elapsed(self: *DrawTimer, now: u64) u64 {
++    const start = self.started_at orelse now;
++    self.started_at = start;
++    return now - start;
++}
++
++pub fn reset(self: *DrawTimer) void {
++    self.* = .{};
++}
++
++test "delayed retries retain elapsed time" {
++    var timer: DrawTimer = .{};
++    try std.testing.expectEqual(0, timer.elapsed(0));
++    try std.testing.expectEqual(45 * std.time.ns_per_ms, timer.elapsed(45 * std.time.ns_per_ms));
++    try std.testing.expectEqual(90 * std.time.ns_per_ms, timer.elapsed(90 * std.time.ns_per_ms));
++}
++
++test "retry at the deadline does not restart it" {
++    var timer: DrawTimer = .{};
++    try std.testing.expectEqual(0, timer.elapsed(100 * std.time.ns_per_ms));
++    try std.testing.expectEqual(40 * std.time.ns_per_ms, timer.elapsed(140 * std.time.ns_per_ms));
++}
++
++test "lifecycle reset grants a new interval" {
++    var timer: DrawTimer = .{};
++    _ = timer.elapsed(0);
++    _ = timer.elapsed(8 * std.time.ns_per_ms);
++    timer.reset();
++    try std.testing.expectEqual(0, timer.elapsed(1_000 * std.time.ns_per_ms));
++    try std.testing.expectEqual(8 * std.time.ns_per_ms, timer.elapsed(1_008 * std.time.ns_per_ms));
++}
++
++test "successful draw reset separates consecutive runs" {
++    var timer: DrawTimer = .{};
++    _ = timer.elapsed(0);
++    _ = timer.elapsed(32 * std.time.ns_per_ms);
++    timer.reset();
++    try std.testing.expectEqual(0, timer.elapsed(36 * std.time.ns_per_ms));
++    try std.testing.expectEqual(40 * std.time.ns_per_ms, timer.elapsed(76 * std.time.ns_per_ms));
++}
 diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
 index 6c7432d21..0fa00ad50 100644
 --- a/src/renderer/Metal.zig
@@ -81,7 +133,7 @@ index 6c7432d21..0fa00ad50 100644
  pub inline fn bufferOptions(self: Metal) bufferpkg.Options {
      return .{
 diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
-index 508721379..e507cb047 100644
+index 508721379..935dbd680 100644
 --- a/src/renderer/Thread.zig
 +++ b/src/renderer/Thread.zig
 @@ -19,6 +19,13 @@ const log = std.log.scoped(.renderer_thread);
@@ -163,7 +215,27 @@ index 508721379..e507cb047 100644
  /// Drain the mailbox.
  fn drainMailbox(self: *Thread) !void {
      // There's probably a more elegant way to do this...
-@@ -593,6 +630,36 @@ fn drawCallback(
+@@ -360,13 +397,14 @@ fn drainMailbox(self: *Thread) !void {
+                 // Visibility affects our QoS class
+                 self.setQosClass();
+ 
++                // Reset renderer lifecycle state before the first reveal draw.
++                self.renderer.setVisible(v);
++
+                 // If we became visible then we immediately trigger a draw.
+                 // We don't need to update frame data because that should
+-                // still be happening.
+-                if (v) self.drawFrame(false);
+-
+-                // Notify the renderer so it can update any state.
+-                self.renderer.setVisible(v);
++                // still be happening. The display link may have just started,
++                // so force this draw instead of waiting for its first tick.
++                if (v) self.drawFrame(true);
+ 
+                 // Note that we're explicitly today not stopping any
+                 // cursor timers, draw timers, etc. These things have very
+@@ -593,6 +631,36 @@ fn drawCallback(
      return .disarm;
  }
  
@@ -201,10 +273,16 @@ index 508721379..e507cb047 100644
      self_: ?*Thread,
      _: *xev.Loop,
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index 0f4a294bc..8bd735ca5 100644
+index 0f4a294bc..7fa9850d2 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
-@@ -199,6 +199,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1,4 +1,5 @@
+ const std = @import("std");
++const DrawTimer = @import("DrawTimer.zig");
+ const builtin = @import("builtin");
+ const xev = @import("xev");
+ const wuffs = @import("wuffs");
+@@ -199,6 +200,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          /// don't support a display link.
          display_link: ?DisplayLink = null,
  
@@ -216,21 +294,15 @@ index 0f4a294bc..8bd735ca5 100644
          /// Health of the most recently completed frame.
          health: std.atomic.Value(Health) = .{ .raw = .healthy },
  
-@@ -262,6 +267,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -262,8 +268,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              /// the renderer is deinited after that.
              defunct: bool = false,
  
-+            /// When we began the current run of declined draws, or null if
-+            /// the last pick succeeded. We bound the run by elapsed time
-+            /// rather than by a count of attempts: what we are waiting for
-+            /// is display refreshes, and draws reach us from more than one
-+            /// trigger, so a count gets spent by whatever happens to fire
-+            /// rather than by the waiting we actually want to do.
-+            declined_since: ?std.time.Instant = null,
-+
-+            /// When we last declined, so that a run still being retried can
-+            /// be told from one that was abandoned. See `nextFrame`.
-+            last_decline: ?std.time.Instant = null,
++            /// A monotonic clock and the current run's start. Scheduling
++            /// delays spend the budget; only a successful pick or an explicit
++            /// focus/visibility transition starts a fresh run.
++            decline_clock: std.time.Timer,
++            decline_timer: DrawTimer = .{},
 +
 +            /// How many times we have given up and drawn into the surface on
 +            /// screen. Only used to rate-limit the log line that reports it.
@@ -243,9 +315,15 @@ index 0f4a294bc..8bd735ca5 100644
 +            const max_decline_ns = 40 * std.time.ns_per_ms;
 +
              pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
-                 var result: SwapChain = .{ .frames = undefined };
+-                var result: SwapChain = .{ .frames = undefined };
++                var result: SwapChain = .{
++                    .frames = undefined,
++                    .decline_clock = try std.time.Timer.start(),
++                };
  
-@@ -286,19 +313,149 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 // Initialize all of our frame state.
+                 for (&result.frames) |*frame| {
+@@ -286,19 +311,125 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              /// Get the next frame state to draw to. This will wait on the
              /// semaphore to ensure that the frame is available. This must
              /// always be paired with a call to releaseFrame.
@@ -318,32 +396,8 @@ index 0f4a294bc..8bd735ca5 100644
 +                // to retry on.
 +                if (free == null) if (unheld) |u| {
 +                    if (u == chosen and targetPresented(api, &self.frames[u].target)) {
-+                        const now = std.time.Instant.now() catch unreachable;
-+
-+                        // A run only earns its budget while it is actually
-+                        // being retried. If nothing has attempted a draw for
-+                        // longer than the whole budget then whatever was
-+                        // driving the run gave up on it -- the display link
-+                        // stopping on occlusion or focus loss is the usual
-+                        // way -- and the time it sat idle is not ours to
-+                        // spend. Anchoring to it would hand the next reveal
-+                        // an already-exhausted budget, so the first frame
-+                        // after the pane comes back would be forced into the
-+                        // surface on screen: exactly the tear the budget is
-+                        // there to prevent. Start a fresh run instead.
-+                        if (self.last_decline) |last| {
-+                            if (now.since(last) >= max_decline_ns) {
-+                                self.declined_since = null;
-+                            }
-+                        }
-+                        self.last_decline = now;
-+
-+                        const waited = if (self.declined_since) |since|
-+                            now.since(since)
-+                        else
-+                            0;
++                        const waited = self.decline_timer.elapsed(self.decline_clock.read());
 +                        if (waited < max_decline_ns) {
-+                            if (self.declined_since == null) self.declined_since = now;
 +                            self.frame_sema.post();
 +                            return null;
 +                        }
@@ -365,7 +419,7 @@ index 0f4a294bc..8bd735ca5 100644
 +                    }
 +                };
 +
-+                self.declined_since = null;
++                self.decline_timer.reset();
 +                self.frame_index = @intCast(chosen);
 +                const frame = &self.frames[chosen];
 +                frame.in_flight.store(true, .monotonic);
@@ -399,7 +453,7 @@ index 0f4a294bc..8bd735ca5 100644
          };
  
          /// State we need duplicated for every frame. Any state that could be
-@@ -324,6 +481,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -324,6 +455,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              /// See property of same name on Renderer for explanation.
              target_config_modified: usize = 0,
  
@@ -411,7 +465,7 @@ index 0f4a294bc..8bd735ca5 100644
              /// Buffer with the vertex data for our background image.
              ///
              /// TODO: Make this an optional and only create it
-@@ -900,6 +1062,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -900,6 +1036,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  self.api.loopEnter();
              }
  
@@ -420,7 +474,7 @@ index 0f4a294bc..8bd735ca5 100644
              // If we don't support a display link we have no work to do.
              if (comptime DisplayLink == void) return;
  
-@@ -922,6 +1086,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -922,6 +1060,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  self.api.loopExit();
              }
  
@@ -429,7 +483,38 @@ index 0f4a294bc..8bd735ca5 100644
              // If we don't support a display link we have no work to do.
              if (comptime DisplayLink == void) return;
  
-@@ -1474,11 +1640,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1029,6 +1169,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         pub fn setFocus(self: *Self, focus: bool) !void {
+             assert(self.focused != focus);
+ 
++            self.resetDrawTimer();
+             self.focused = focus;
+ 
+             // Flag that we need to update our custom shaders
+@@ -1051,6 +1192,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         ///
+         /// Must be called on the render thread.
+         pub fn setVisible(self: *Self, visible: bool) void {
++            self.resetDrawTimer();
+             // If we're not visible, then we want to stop the display link
+             // because it is a waste of resources and we can move to pure
+             // change-driven updates.
+@@ -1064,6 +1206,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             }
+         }
+ 
++        /// A lifecycle transition abandons the old draw run. Draw callbacks
++        /// may also run on the app thread, so use their lock.
++        fn resetDrawTimer(self: *Self) void {
++            self.draw_mutex.lock();
++            defer self.draw_mutex.unlock();
++            self.swap_chain.decline_timer.reset();
++        }
++
+         /// Set the new font grid.
+         ///
+         /// Must be called on the render thread.
+@@ -1474,11 +1624,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
  
              // Conditions under which we need to draw the frame, otherwise we
              // don't need to since the previous frame should be identical.
@@ -450,7 +535,7 @@ index 0f4a294bc..8bd735ca5 100644
  
              if (!needs_redraw) {
                  // We still need to present the last target again, because the
-@@ -1489,9 +1662,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1489,9 +1646,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              }
              self.cells_rebuilt = false;
  
@@ -503,7 +588,7 @@ index 0f4a294bc..8bd735ca5 100644
              // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
  
              // If we need to reinitialize our shaders, do so.
-@@ -1723,6 +1936,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1723,6 +1920,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          // Callback from the graphics API when a frame is completed.
          pub fn frameCompleted(
              self: *Self,
@@ -511,7 +596,7 @@ index 0f4a294bc..8bd735ca5 100644
              health: Health,
          ) void {
              // If our health value hasn't changed, then we do nothing. We don't
-@@ -1738,7 +1952,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1738,7 +1936,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              }
  
              // Always release our semaphore

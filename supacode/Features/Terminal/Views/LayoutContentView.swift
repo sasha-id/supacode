@@ -167,6 +167,8 @@ final class LayoutAXContainerView: NSView {
     } else {
       let hostingView = NSHostingView(rootView: LayoutPaneTreeView(inputs: inputs))
       hostedRootWrites += 1
+      // The parent owns both dimensions through the edge constraints below.
+      hostingView.sizingOptions = []
       // The window uses a full-size content view; without this the hosted
       // tree insets below the titlebar wherever the container overlaps it.
       hostingView.safeAreaRegions = []
@@ -506,7 +508,7 @@ private final class HoverFocusSensorView: NSView {
 
   override func updateTrackingAreas() {
     super.updateTrackingAreas()
-    if let hoverTracking { removeTrackingArea(hoverTracking) }
+    guard hoverTracking == nil else { return }
     // `.inVisibleRect` self-sizes the area, so the rect is ignored.
     let tracking = NSTrackingArea(
       rect: .zero,

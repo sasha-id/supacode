@@ -545,4 +545,46 @@ struct GhosttySurfaceViewTests {
     #expect(surfaceView.hostedView() !== hosted)
     surfaceView.closeSurfaceDeferringFree()
   }
+
+  @Test func unchangedSurfaceLayoutDoesNotInvalidateItsWrapper() {
+    let surfaceView = GhosttySurfaceView(
+      id: UUID(),
+      runtime: GhosttyRuntime(),
+      workingDirectory: nil,
+      initialGeometry: .fallback,
+      context: GHOSTTY_SURFACE_CONTEXT_TAB
+    )
+    defer { surfaceView.closeSurface() }
+    let wrapper = surfaceView.hostedView()
+    wrapper.frame.size = CGSize(width: 800, height: 600)
+    wrapper.layoutSubtreeIfNeeded()
+    #expect(!wrapper.needsLayout)
+
+    surfaceView.layout()
+
+    #expect(!wrapper.needsLayout)
+    #expect(surfaceView.frame.size == CGSize(width: 800, height: 600))
+  }
+
+  @Test func surfaceTrackingAreaSurvivesLayoutAndResize() {
+    let surfaceView = GhosttySurfaceView(
+      id: UUID(),
+      runtime: GhosttyRuntime(),
+      workingDirectory: nil,
+      initialGeometry: .fallback,
+      context: GHOSTTY_SURFACE_CONTEXT_TAB
+    )
+    defer { surfaceView.closeSurface() }
+    surfaceView.updateTrackingAreas()
+    let original = surfaceView.trackingAreas.first
+    #expect(original != nil)
+
+    surfaceView.frame.size = CGSize(width: 800, height: 600)
+    surfaceView.updateTrackingAreas()
+    surfaceView.updateTrackingAreas()
+
+    #expect(surfaceView.trackingAreas.count == 1)
+    #expect(surfaceView.trackingAreas.first === original)
+    #expect(original?.options.contains(.inVisibleRect) == true)
+  }
 }
