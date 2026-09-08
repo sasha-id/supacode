@@ -1121,19 +1121,18 @@ struct AppFeatureCommandAckTests {
 
   @Test(.dependencies) func deleteSocketDeeplinkFailsOnScriptCancellation() async {
     let worktree = makeWorktree()
-    let store = makeStore(worktree: worktree, tabExists: true)
     let (readFD, writeFD) = makePipe()
     defer { close(readFD) }
-
-    await store.send(
-      .deeplink(
-        .worktree(id: worktree.id, action: .delete),
-        source: .socket,
-        responseFD: writeFD,
-        timeoutSeconds: 0
-      )
-    )
-    #expect(store.state.pendingCommandAcks[id: writeFD] != nil)
+    // Start with the script running. A fresh delete with no configured script
+    // can finish successfully before the simulated cancellation reaches it.
+    var repositories = makeRepositoriesState(worktree: worktree)
+    repositories.reconcileSidebarForTesting()
+    repositories.sidebarItems[id: worktree.id]?.lifecycle = .deletingScript
+    var initial = AppFeature.State(repositories: repositories, settings: SettingsFeature.State())
+    initial.pendingCommandAcks[id: writeFD] = AppFeature.PendingCommandAck(
+      responseFD: writeFD, token: 1, match: .worktreeRemoved(worktreeID: worktree.id))
+    let store = TestStore(initialState: initial) { AppFeature() }
+    store.exhaustivity = .off
 
     // Closing the delete-script tab reports a nil exit code (cancellation);
     // no `.worktreeDeleted` follows, so the ack must drain as a failure now.
