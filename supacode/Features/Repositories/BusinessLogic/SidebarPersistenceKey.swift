@@ -25,6 +25,7 @@ nonisolated struct SidebarKey: SharedKey {
     continuation: LoadContinuation<SidebarState>
   ) {
     @Dependency(\.defaultAppStorage) var store
+    PersistenceQueue.shared.flush()
     guard let data = store.data(forKey: Self.storageKey) else {
       // Absent on first run and on installs whose legacy state hasn't migrated.
       continuation.resumeReturningInitialValue()
@@ -54,15 +55,24 @@ nonisolated struct SidebarKey: SharedKey {
     continuation: SaveContinuation
   ) {
     @Dependency(\.defaultAppStorage) var store
-    do {
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.sortedKeys]
-      store.set(try encoder.encode(value), forKey: Self.storageKey)
-      continuation.resume()
-    } catch {
-      Self.logger.error("Failed to persist sidebar state to UserDefaults: \(error)")
-      continuation.resume(throwing: error)
+    let destination = Destination(defaults: store)
+    PersistenceQueue.shared.enqueue {
+      do {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        destination.defaults.set(try encoder.encode(value), forKey: Self.storageKey)
+        continuation.resume()
+      } catch {
+        Self.logger.error("Failed to persist sidebar state to UserDefaults: \(error)")
+        continuation.resume(throwing: error)
+      }
     }
+  }
+
+  // UserDefaults is thread-safe; preserve the dependency-selected suite when
+  // the write outlives the mutation's dependency scope.
+  private struct Destination: @unchecked Sendable {
+    let defaults: UserDefaults
   }
 }
 

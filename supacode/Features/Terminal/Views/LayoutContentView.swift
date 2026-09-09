@@ -414,12 +414,7 @@ struct PaneStripView: View {
           } else if let tabID = pane.selectedTab?.id, store.wakeFailedTabs.contains(tabID) {
             EmptyTerminalPaneView(message: "This terminal is unavailable.")
           } else {
-            // No renderer and no verdict yet: the wake is either in flight or
-            // still a turn away from this reducer. Hold the window's terminal
-            // background over the pane — the error state would flash, and the
-            // fresh surface's zmx re-attach clears and replays into the same
-            // empty background anyway.
-            Color.clear
+            TerminalLoadingView(contentID: contentID.rawValue)
           }
         } else {
           Color.clear

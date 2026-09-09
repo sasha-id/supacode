@@ -1,3 +1,4 @@
+import Clocks
 import SwiftUI
 import Testing
 
@@ -5,6 +6,78 @@ import Testing
 
 @MainActor
 struct TerminalRenderingPolicyTests {
+  @Test func presentationWaitsForDestinationGeometry() async {
+    let clock = TestClock()
+    let presentation = TerminalPresentation(clock: clock)
+    presentation.prepare(size: CGSize(width: 800, height: 600))
+    #expect(presentation.isCovered)
+    presentation.frameAvailable(size: CGSize(width: 400, height: 300))
+    #expect(presentation.isCovered)
+    presentation.frameAvailable(size: CGSize(width: 800, height: 600))
+    #expect(!presentation.isCovered)
+    await clock.advance(by: .seconds(3))
+    #expect(!presentation.showsProgress)
+  }
+
+  @Test func residentPresentationDoesNotFlashALoadingCover() {
+    let presentation = TerminalPresentation()
+    let size = CGSize(width: 800, height: 600)
+    presentation.prepare(size: size)
+    presentation.frameAvailable(size: size)
+    presentation.park()
+    presentation.prepare(size: size)
+    #expect(!presentation.isCovered)
+  }
+
+  @Test func loadingIndicatorIsDelayedAndCoverHasABoundedLifetime() async {
+    let clock = TestClock()
+    let presentation = TerminalPresentation(clock: clock)
+    presentation.prepare(size: CGSize(width: 800, height: 600))
+    #expect(!presentation.showsProgress)
+    await clock.advance(by: .milliseconds(150))
+    #expect(presentation.showsProgress)
+    await clock.advance(by: .seconds(2))
+    #expect(!presentation.isCovered)
+    #expect(!presentation.showsProgress)
+  }
+
+  @Test func parkingCancelsDelayedPresentationWork() async {
+    let clock = TestClock()
+    let presentation = TerminalPresentation(clock: clock)
+    presentation.prepare(size: CGSize(width: 800, height: 600))
+    presentation.park()
+    await clock.advance(by: .seconds(3))
+    #expect(!presentation.showsProgress)
+    #expect(!presentation.isCovered)
+  }
+
+  @Test func changingGeometryDoesNotExtendTheCoverDeadline() async {
+    let clock = TestClock()
+    let presentation = TerminalPresentation(clock: clock)
+    presentation.prepare(size: CGSize(width: 800, height: 600))
+    await clock.advance(by: .seconds(1))
+    presentation.prepare(size: CGSize(width: 1000, height: 600))
+    presentation.frameAvailable(size: CGSize(width: 800, height: 600))
+    #expect(presentation.isCovered)
+    await clock.advance(by: .seconds(1))
+    #expect(!presentation.isCovered)
+    presentation.prepare(size: CGSize(width: 1000, height: 600))
+    #expect(!presentation.isCovered)
+  }
+
+  @Test func parkedTimeoutCannotReleaseANewPresentation() async {
+    let clock = TestClock()
+    let presentation = TerminalPresentation(clock: clock)
+    presentation.prepare(size: CGSize(width: 800, height: 600))
+    await clock.advance(by: .seconds(1))
+    presentation.park()
+    presentation.prepare(size: CGSize(width: 1000, height: 600))
+    await clock.advance(by: .seconds(1))
+    #expect(presentation.isCovered)
+    presentation.frameAvailable(size: CGSize(width: 1000, height: 600))
+    #expect(!presentation.isCovered)
+  }
+
   @Test func resizeSkipsOnlySizesThatWereActuallyApplied() {
     let applied = CGSize(width: 1600, height: 1200)
     let decision = GhosttySurfaceView.ResizePolicy.decision(

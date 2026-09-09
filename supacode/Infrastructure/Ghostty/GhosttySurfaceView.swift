@@ -2,6 +2,7 @@ import AppKit
 import Carbon
 import CoreText
 import GhosttyKit
+import IOSurface
 import QuartzCore
 import SupacodeSettingsShared
 import UniformTypeIdentifiers
@@ -102,6 +103,8 @@ final class GhosttySurfaceView: NSView, Identifiable {
   private var lastAppliedBackingSize: CGSize = .zero
   // A size that arrived while this view was hidden, deferred to the reveal.
   private var needsSizeSyncOnReveal = false
+  let presentation = TerminalPresentation()
+  private var frameObservation: NSKeyValueObservation?
   private var lastPerformKeyEvent: TimeInterval?
   private var currentCursor: NSCursor = .iBeam
   private var focused = false
@@ -354,6 +357,8 @@ final class GhosttySurfaceView: NSView, Identifiable {
   /// Drops every app-side reference to the surface and hands back the C value
   /// still owing a free; nil when there is nothing left to free.
   private func detachSurface() -> ghostty_surface_t? {
+    frameObservation = nil
+    presentation.park()
     clearNotificationObservers()
     ownedScrollWrapper = nil
     guard let surface else { return nil }
@@ -531,9 +536,47 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   override func viewDidUnhide() {
     super.viewDidUnhide()
-    guard needsSizeSyncOnReveal else { return }
-    needsSizeSyncOnReveal = false
-    notifySizeChanged()
+    if needsSizeSyncOnReveal {
+      needsSizeSyncOnReveal = false
+      notifySizeChanged()
+    }
+    preparePresentation()
+  }
+
+  override func viewDidHide() {
+    super.viewDidHide()
+    frameObservation = nil
+    presentation.park()
+  }
+
+  /// Observe layer application only while covered; steady output pays no KVO
+  /// or SwiftUI invalidation cost. This is frame availability, not scan-out.
+  func preparePresentation() {
+    guard surface != nil, window != nil, !isHiddenOrHasHiddenAncestor, let layer else { return }
+    guard !inLiveResize || presentation.isCovered else { return }
+    let size = convertToBacking(bounds.size)
+    presentation.prepare(
+      size: CGSize(width: floor(size.width), height: floor(size.height)), immediateProgress: layer.contents == nil)
+    guard presentation.isCovered else { return }
+    if frameObservation == nil {
+      frameObservation = layer.observe(\.contents) { [weak self] _, _ in
+        // Ghostty applies layer contents on main. Keep the callback synchronous
+        // so the cover and new frame participate in the same CA transaction.
+        MainActor.assumeIsolated { self?.acceptPresentedFrame() }
+      }
+    }
+    acceptPresentedFrame()
+  }
+
+  override func viewDidEndLiveResize() {
+    super.viewDidEndLiveResize()
+    preparePresentation()
+  }
+
+  private func acceptPresentedFrame() {
+    guard let frame = layer?.contents as? IOSurface else { return }
+    presentation.frameAvailable(size: CGSize(width: frame.width, height: frame.height))
+    if !presentation.isCovered { frameObservation = nil }
   }
 
   private func notifySizeChanged() {
@@ -1045,6 +1088,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
     )
     guard decision == .apply else { return }
     lastAppliedBackingSize = backingSize
+    preparePresentation()
     ghostty_surface_set_size(
       surface,
       UInt32(max(1, Int(backingSize.width.rounded(.down)))),
@@ -1140,6 +1184,8 @@ final class GhosttySurfaceView: NSView, Identifiable {
   }
 
   private func createSurface() {
+    let interval = TerminalPerformance.begin("Surface construction")
+    defer { TerminalPerformance.end("Surface construction", interval) }
     guard let app = runtime.app else { return }
     var config = ghostty_surface_config_new()
     config.userdata = Unmanaged.passUnretained(bridge).toOpaque()
@@ -1223,6 +1269,11 @@ final class GhosttySurfaceView: NSView, Identifiable {
     guard let surface else { return }
     if lastOcclusion == visible {
       return
+    }
+    if !visible {
+      TerminalPreviewCache.shared.capture(id: id, contents: layer?.contents)
+      frameObservation = nil
+      presentation.park()
     }
     lastOcclusion = visible
     surfaceLogger.info("Surface \(self.id) occlusion -> \(visible ? "visible" : "occluded")")
@@ -1894,19 +1945,22 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   private func keyboardLayoutId() -> String? {
     if let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID)
+    {
       let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
       return value as String
     }
 
     if let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID)
+    {
       let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
       return value as String
     }
 
     if let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
-       let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) {
+      let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID)
+    {
       let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
       return value as String
     }
@@ -2183,6 +2237,7 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
   private let scrollView: NSScrollView
   private let documentView: NSView
   private let surfaceView: GhosttySurfaceView
+  private let presentationCover = TerminalPresentationCover()
   private var observers: [NSObjectProtocol] = []
   private var isLiveScrolling = false
   private var lastSentRow: Int?
@@ -2203,6 +2258,11 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
     documentView.addSubview(surfaceView)
     super.init(frame: .zero)
     addSubview(scrollView)
+    addSubview(presentationCover)
+    surfaceView.presentation.onChange = { [weak self, weak surfaceView] in
+      guard let self, let surfaceView else { return }
+      self.presentationCover.update(surfaceView.presentation, contentID: surfaceView.id)
+    }
     surfaceView.scrollWrapper = self
     refreshAppearance()
 
@@ -2287,11 +2347,13 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
   override func layout() {
     super.layout()
     scrollView.frame = bounds
+    presentationCover.frame = bounds
     surfaceView.frame.size = scrollView.bounds.size
     documentView.frame.size.width = scrollView.bounds.width
     synchronizeScrollView()
     synchronizeSurfaceView()
     synchronizeCoreSurface()
+    surfaceView.preparePresentation()
     // This wrapper is the tint's subtract mask, so its hole follows the
     // surface's geometry.
     WindowTintMaskRegistry.regionGeometryDidChange(self)

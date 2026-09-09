@@ -18,6 +18,7 @@ private enum CancelID {
   /// Arrow-keying the sidebar re-reads the newly selected repo's settings, so a
   /// held-down key must not queue a read per row it passed through.
   static let worktreeSettings = "app.worktreeSettings"
+  static let terminalSelection = "app.terminalSelection"
   /// Watchdog for a deferred completion ack, keyed by the open client fd and
   /// its generation so a recycled fd gets a distinct cancellation id.
   static func commandAck(_ responseFD: Int32, _ token: Int) -> String {
@@ -545,9 +546,11 @@ struct AppFeature {
           }
           return .merge(
             Self.terminalSelectionEffect(current: state.terminals.selectedWorktreeID, next: nil),
-            .run { _ in
-              await terminalClient.send(.setSelectedWorktreeID(nil))
-            },
+            .run { @MainActor _ in
+              try Task.checkCancellation()
+              terminalClient.send(.setSelectedWorktreeID(nil))
+            }
+            .cancellable(id: CancelID.terminalSelection, cancelInFlight: true),
             .run { _ in
               await worktreeInfoWatcher.send(.setSelectedWorktreeID(nil))
             }
@@ -575,16 +578,18 @@ struct AppFeature {
         let wantsFocus = state.repositories.sidebarItems[id: worktree.id]?.shouldFocusTerminal == true
         return .merge(
           Self.terminalSelectionEffect(current: state.terminals.selectedWorktreeID, next: worktreeID),
-          .run { _ in
-            await terminalClient.send(.setSelectedWorktreeID(worktree.id))
-          },
-          .run { _ in
+          .run { @MainActor _ in
+            try Task.checkCancellation()
+            // These synchronous main-actor commands must stay together: the
+            // destination is selected before its host is activated or focused.
+            terminalClient.send(.setSelectedWorktreeID(worktree.id))
             // Selection wires up the host and focuses whatever is already open.
             // It never opens a terminal: a worktree with an empty layout shows
             // the "Press ⌘T" hint until the user asks for one. The bootstrap
             // tab for a brand-new worktree comes from `worktreeCreated` below.
-            await terminalClient.send(.activateWorktree(worktree, focusing: wantsFocus))
-          },
+            terminalClient.send(.activateWorktree(worktree, focusing: wantsFocus))
+          }
+          .cancellable(id: CancelID.terminalSelection, cancelInFlight: true),
           .run { _ in
             await worktreeInfoWatcher.send(.setSelectedWorktreeID(worktree.id))
           },

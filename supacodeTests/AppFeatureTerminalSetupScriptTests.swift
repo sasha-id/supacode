@@ -435,7 +435,9 @@ struct AppFeatureTerminalSetupScriptTests {
     ) {
       AppFeature()
     } withDependencies: {
-      $0.terminalClient.send = { command in sent.withValue { $0.append(command) } }
+      $0.terminalClient.send = { command in
+        sent.withValue { $0.append(command) }
+      }
       $0.worktreeInfoWatcher.send = { _ in }
       $0.settingsFileStorage = storage.storage
       $0.settingsFileURL = URL(fileURLWithPath: "/tmp/supacode-settings-\(UUID().uuidString).json")
@@ -444,6 +446,13 @@ struct AppFeatureTerminalSetupScriptTests {
 
     await store.send(.repositories(.delegate(.selectedWorktreeChanged(worktree))))
     await store.finish()
+    let activation = sent.value.filter {
+      switch $0 {
+      case .setSelectedWorktreeID, .activateWorktree: true
+      default: false
+      }
+    }
+    #expect(activation == [.setSelectedWorktreeID(worktree.id), .activateWorktree(worktree, focusing: false)])
     #expect(sent.value.contains(.activateWorktree(worktree, focusing: false)))
     #expect(!sent.value.contains { if case .ensureInitialTab = $0 { return true } else { return false } })
     #expect(!sent.value.contains { if case .createTab = $0 { return true } else { return false } })

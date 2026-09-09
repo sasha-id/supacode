@@ -2,12 +2,51 @@ import Dependencies
 import DependenciesTestSupport
 import Foundation
 import Sharing
+import Synchronization
 import Testing
 
 @testable import SupacodeSettingsShared
 @testable import supacode
 
 struct SettingsFilePersistenceTests {
+  @Test(.dependencies) @MainActor func queuedWriteUsesTheCallersDefaultDependencyInstance() async throws {
+    // No storage override: a wrapper resolved on a dispatch queue loses the
+    // test's dependency-cache identity and writes to a different in-memory store.
+    @Dependency(\.settingsFileStorage) var storage
+    @Dependency(\.settingsFileURLs) var urls
+    @Shared(.settingsFile) var settings
+    let destination = storage
+    $settings.withLock { $0.global.appearanceMode = .dark }
+    try await $settings.save()
+    let data = try destination.load(urls.config)
+    #expect(try JSONDecoder().decode(GlobalSettings.self, from: data).appearanceMode == .dark)
+  }
+
+  @Test(.dependencies) @MainActor func writesRunOffMainAndExplicitSaveReportsFailure() async throws {
+    let storage = SettingsTestStorage().storage
+    let mainThreadWrites = Mutex<[Bool]>([])
+    let failWrites = Mutex(false)
+    enum WriteFailure: Error { case unavailable }
+    try await withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(
+        load: storage.load,
+        save: { data, url in
+          mainThreadWrites.withLock { $0.append(Thread.isMainThread) }
+          if failWrites.withLock({ $0 }) { throw WriteFailure.unavailable }
+          try storage.save(data, url)
+        })
+    } operation: {
+      @Shared(.settingsFile) var settings
+      mainThreadWrites.withLock { $0.removeAll() }
+      $settings.withLock { $0.global.appearanceMode = .dark }
+      try await $settings.save()
+      #expect(!mainThreadWrites.withLock { $0.isEmpty })
+      #expect(mainThreadWrites.withLock { $0.allSatisfy { !$0 } })
+      failWrites.withLock { $0 = true }
+      await #expect(throws: WriteFailure.self) { try await $settings.save() }
+    }
+  }
+
   @Test(.dependencies) func loadWritesDefaultsWhenMissing() throws {
     let storage = SettingsTestStorage()
 
@@ -168,10 +207,10 @@ struct SettingsFilePersistenceTests {
     #expect(reloaded.pinnedWorktreeIDs.isEmpty)
   }
 
-  @Test(.dependencies) func savingSplitsAcrossConfigRoutesAndRepositories() throws {
+  @Test(.dependencies) func savingSplitsAcrossConfigRoutesAndRepositories() async throws {
     let storage = SettingsTestStorage()
 
-    try withDependencies {
+    try await withDependencies {
       $0.settingsFileStorage = storage.storage
     } operation: {
       @Shared(.settingsFile) var settings: SettingsFile
@@ -182,6 +221,8 @@ struct SettingsFilePersistenceTests {
         $0.repositories = ["/tmp/repo-a/": .default]
         $0.pinnedWorktreeIDs = ["/tmp/repo-a/wt-1"]
       }
+
+      try await $settings.save()
 
       @Dependency(\.settingsFileURLs) var urls
 

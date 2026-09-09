@@ -73,6 +73,12 @@ struct PaneTabStrip: View {
   @State private var contentWidth: CGFloat = 0
   @State private var containerWidth: CGFloat = 0
   @State private var isAppendDropTargeted = false
+  @State private var recenterTask: Task<Void, Never>?
+
+  private struct ScrollMetrics: Equatable {
+    let width: CGFloat
+    let offset: CGFloat
+  }
 
   var body: some View {
     HStack(spacing: 0) {
@@ -102,23 +108,14 @@ struct PaneTabStrip: View {
       ScrollViewReader { scrollReader in
         ScrollView(.horizontal) {
           tabsRow
-            .background(
-              GeometryReader { contentGeo in
-                Color.clear
-                  .onChange(of: contentGeo.frame(in: .named("tabScroll"))) { _, newFrame in
-                    scrollOffset = -newFrame.minX
-                    contentWidth = newFrame.width
-                  }
-                  .onAppear {
-                    let frame = contentGeo.frame(in: .named("tabScroll"))
-                    scrollOffset = -frame.minX
-                    contentWidth = frame.width
-                  }
-              }
-            )
         }
         .scrollIndicators(.never)
-        .coordinateSpace(name: "tabScroll")
+        .onScrollGeometryChange(for: ScrollMetrics.self) { geometry in
+          ScrollMetrics(width: geometry.contentSize.width, offset: geometry.contentOffset.x)
+        } action: { _, metrics in
+          if scrollOffset != metrics.offset { scrollOffset = metrics.offset }
+          if contentWidth != metrics.width { contentWidth = metrics.width }
+        }
         .onAppear {
           containerWidth = geometryProxy.size.width
           if let selectedID = pane.selectedTabID {
@@ -129,22 +126,34 @@ struct PaneTabStrip: View {
           containerWidth = newWidth
         }
         .onChange(of: pane.selectedTabID) { _, newTabID in
+          recenterTask?.cancel()
+          recenterTask = nil
           if let tabID = newTabID {
-            withAnimation(.easeInOut(duration: TerminalTabBarMetrics.selectionAnimationDuration)) {
+            withAnimation(
+              MotionPreference.reduceMotion
+                ? nil : .easeInOut(duration: TerminalTabBarMetrics.selectionAnimationDuration)
+            ) {
               scrollReader.scrollTo(tabID, anchor: .center)
             }
           }
         }
         .onChange(of: pane.tabs.count) { _, _ in
           // Re-center after the open/close animation settles, like the old bar.
-          Task { @MainActor in
-            try? await ContinuousClock().sleep(for: .seconds(TerminalTabBarMetrics.closeAnimationDuration))
+          recenterTask?.cancel()
+          recenterTask = Task { @MainActor in
+            do {
+              try await ContinuousClock().sleep(for: .seconds(TerminalTabBarMetrics.closeAnimationDuration))
+            } catch { return }
             if let selectedID = pane.selectedTabID {
-              withAnimation {
+              withAnimation(MotionPreference.reduceMotion ? nil : .default) {
                 scrollReader.scrollTo(selectedID)
               }
             }
           }
+        }
+        .onDisappear {
+          recenterTask?.cancel()
+          recenterTask = nil
         }
       }
       .mask(overflowFadeMask)

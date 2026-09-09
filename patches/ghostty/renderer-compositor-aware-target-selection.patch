@@ -1,8 +1,24 @@
 diff --git a/pkg/macos/iosurface/iosurface.zig b/pkg/macos/iosurface/iosurface.zig
-index 37f8712ba..bafc12fd9 100644
+index 37f8712b..7b909546 100644
 --- a/pkg/macos/iosurface/iosurface.zig
 +++ b/pkg/macos/iosurface/iosurface.zig
-@@ -98,6 +98,13 @@ pub const IOSurface = opaque {
+@@ -52,13 +52,8 @@ pub const IOSurface = opaque {
+     }
+ 
+     pub fn deinit(self: *IOSurface) void {
+-        // We mark it purgeable so that it is immediately unloaded, so that we
+-        // don't have to wait for CoreFoundation garbage collection to trigger.
+-        _ = c.IOSurfaceSetPurgeable(
+-            @ptrCast(self),
+-            c.kIOSurfacePurgeableEmpty,
+-            null,
+-        );
++        // Other owners can still be displaying or copying these pixels.
++        // Releasing our reference must not purge their retained storage.
+         foundation.CFRelease(self);
+     }
+ 
+@@ -98,6 +93,21 @@ pub const IOSurface = opaque {
          );
      }
  
@@ -11,6 +27,14 @@ index 37f8712ba..bafc12fd9 100644
 +    /// may cause visual artifacts.
 +    pub inline fn isInUse(self: *IOSurface) bool {
 +        return c.IOSurfaceIsInUse(@ptrCast(self)) != 0;
++    }
++
++    pub inline fn incrementUseCount(self: *IOSurface) void {
++        c.IOSurfaceIncrementUseCount(@ptrCast(self));
++    }
++
++    pub inline fn decrementUseCount(self: *IOSurface) void {
++        c.IOSurfaceDecrementUseCount(@ptrCast(self));
 +    }
 +
      pub inline fn getAllocSize(self: *IOSurface) usize {
@@ -69,10 +93,10 @@ index 000000000..ec0eec5fa
 +    try std.testing.expectEqual(40 * std.time.ns_per_ms, timer.elapsed(76 * std.time.ns_per_ms));
 +}
 diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
-index 6c7432d21..0fa00ad50 100644
+index 6c7432d2..c89e1045 100644
 --- a/src/renderer/Metal.zig
 +++ b/src/renderer/Metal.zig
-@@ -33,13 +33,24 @@ pub const custom_shader_target: shadertoy.Target = .msl;
+@@ -33,8 +33,14 @@ pub const custom_shader_target: shadertoy.Target = .msl;
  // The fragCoord for Metal shaders is +Y = down.
  pub const custom_shader_y_is_down = true;
  
@@ -89,30 +113,7 @@ index 6c7432d21..0fa00ad50 100644
  
  const log = std.log.scoped(.metal);
  
- layer: IOSurfaceLayer,
- 
-+/// The surface most recently handed to the compositor, as a raw address,
-+/// or 0 if we haven't presented yet. Written on whichever thread runs the
-+/// command buffer completion handler, read on the render thread.
-+last_presented_surface: std.atomic.Value(usize) = .{ .raw = 0 },
-+
- /// MTLDevice
- device: objc.Object,
- /// MTLCommandQueue
-@@ -251,6 +262,12 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
- 
- /// Present the provided target.
- pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
-+    // Record the surface we're handing to the compositor before we hand it
-+    // over, so the swap chain can keep off it. `IOSurfaceIsInUse` alone is
-+    // not enough: it's a sample, not a lock, so between the swap chain's
-+    // check and the GPU's write the window server can latch the surface.
-+    self.last_presented_surface.store(@intFromPtr(target.surface), .release);
-+
-     if (sync) {
-         self.layer.setSurfaceSync(target.surface);
-     } else {
-@@ -263,6 +280,19 @@ pub inline fn presentLastTarget(self: *Metal) !void {
+@@ -263,6 +269,13 @@ pub inline fn presentLastTarget(self: *Metal) !void {
      _ = self;
  }
  
@@ -121,12 +122,6 @@ index 6c7432d21..0fa00ad50 100644
 +pub inline fn isTargetInUse(self: *const Metal, target: *const Target) bool {
 +    _ = self;
 +    return target.surface.isInUse();
-+}
-+
-+/// Returns true if the target's surface is the one most recently handed to
-+/// the compositor, i.e. the surface that is on screen or about to be.
-+pub inline fn isTargetPresented(self: *const Metal, target: *const Target) bool {
-+    return self.last_presented_surface.load(.acquire) == @intFromPtr(target.surface);
 +}
 +
  /// Returns the options to use when constructing buffers.
@@ -140,11 +135,11 @@ index 508721379..935dbd680 100644
  const DRAW_INTERVAL = 8; // 120 FPS
  const CURSOR_BLINK_INTERVAL = 600;
  
-+/// How long to wait before retrying a draw the renderer declined. This has
-+/// to outlast a display refresh: the renderer declines when the compositor
-+/// still holds every target it could draw into, and only a refresh frees
-+/// one. Retrying any sooner just spends the retry budget before the
-+/// compositor has had a chance to let go.
++/// How long to wait before retrying a draw the renderer declined. This
++/// spaces retries across real time instead of spinning in the event loop
++/// while the compositor holds the targets. At 60 Hz more than one retry
++/// may happen before a refresh releases a target; every retry preserves
++/// ownership regardless of how long the compositor takes.
 +const RETRY_INTERVAL = 8;
 +
  /// Whether calls to `drawFrame` must be done from the app thread.
@@ -273,16 +268,17 @@ index 508721379..935dbd680 100644
      self_: ?*Thread,
      _: *xev.Loop,
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index 0f4a294bc..7fa9850d2 100644
+index 0f4a294b..35003f70 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  const std = @import("std");
 +const DrawTimer = @import("DrawTimer.zig");
++const TargetSelection = @import("TargetSelection.zig");
  const builtin = @import("builtin");
  const xev = @import("xev");
  const wuffs = @import("wuffs");
-@@ -199,6 +200,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -199,6 +201,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          /// don't support a display link.
          display_link: ?DisplayLink = null,
  
@@ -294,25 +290,19 @@ index 0f4a294bc..7fa9850d2 100644
          /// Health of the most recently completed frame.
          health: std.atomic.Value(Health) = .{ .raw = .healthy },
  
-@@ -262,8 +268,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -262,8 +269,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              /// the renderer is deinited after that.
              defunct: bool = false,
  
 +            /// A monotonic clock and the current run's start. Scheduling
-+            /// delays spend the budget; only a successful pick or an explicit
++            /// delays count toward diagnostics; a successful pick or explicit
 +            /// focus/visibility transition starts a fresh run.
 +            decline_clock: std.time.Timer,
 +            decline_timer: DrawTimer = .{},
 +
-+            /// How many times we have given up and drawn into the surface on
-+            /// screen. Only used to rate-limit the log line that reports it.
-+            forced_draws: usize = 0,
-+
-+            /// How long we will hold out for a target that isn't the one on
-+            /// screen. Long enough to cover the compositor releasing a
-+            /// surface it just latched, short enough that a surface which
-+            /// never frees up costs a stale frame, not a frozen pane.
-+            const max_decline_ns = 40 * std.time.ns_per_ms;
++            /// Long contention is reported once per run, without ever making
++            /// a displayed or queued surface writable.
++            contention_reported: bool = false,
 +
              pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
 -                var result: SwapChain = .{ .frames = undefined };
@@ -323,103 +313,57 @@ index 0f4a294bc..7fa9850d2 100644
  
                  // Initialize all of our frame state.
                  for (&result.frames) |*frame| {
-@@ -286,19 +311,125 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
-             /// Get the next frame state to draw to. This will wait on the
-             /// semaphore to ensure that the frame is available. This must
-             /// always be paired with a call to releaseFrame.
+@@ -286,19 +306,66 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+-            /// Get the next frame state to draw to. This will wait on the
+-            /// semaphore to ensure that the frame is available. This must
+-            /// always be paired with a call to releaseFrame.
++            /// Attempt to acquire a writable frame without waiting. Only a
++            /// successful, non-null acquisition must be paired with a call
++            /// to releaseFrame.
 -            pub fn nextFrame(self: *SwapChain) error{Defunct}!*FrameState {
 +            ///
-+            /// Returns null if the only target we could have drawn into is
-+            /// the one currently on screen, so that we can wait for a better
-+            /// one. The semaphore is posted back before returning, so the
-+            /// caller owes nothing but a redraw.
++            /// Returns null if no frame permit or unowned target is available.
++            /// GPU work, queued/displayed contents, compositor reads, and
++            /// preview copies all prevent reuse. A declined acquisition
++            /// leaves no permit outstanding; the caller owes only a redraw.
 +            pub fn nextFrame(
 +                self: *SwapChain,
 +                api: *const GraphicsAPI,
 +            ) error{Defunct}!?*FrameState {
                  if (self.defunct) return error.Defunct;
  
-                 self.frame_sema.wait();
+-                self.frame_sema.wait();
++                // Never wait for GPU completion while Core Animation is
++                // asking the main thread to display. The retry path also
++                // handles an entirely GPU-owned swap chain.
++                self.frame_sema.timedWait(0) catch return null;
                  errdefer self.frame_sema.post();
 -                self.frame_index = (self.frame_index + 1) % buf_count;
 -                return &self.frames[self.frame_index];
 +
-+                // The semaphore only tracks GPU completion, but a target's
-+                // backing storage may still be read by the window server
-+                // after the GPU is done with it: it stays on screen until a
-+                // newer surface displaces it, which happens later, on the
-+                // main thread. Rendering into it in the meantime tears the
-+                // displayed frame. So we prefer, in round-robin order, a
-+                // frame whose target is not externally in use, and only fall
-+                // back to plain round-robin if every available frame is held.
-+                // The in-use test is a sample, not a lock: the compositor can
-+                // latch a surface between our check and the GPU's write, and
-+                // a revealed layer keeps displaying whatever it last held.
-+                // So we also refuse the surface we most recently presented,
-+                // which is a fact we own rather than a value we poll.
-+                //
-+                // Preference order, round-robin from the last index:
-+                //   1. not in use and not the presented surface
-+                //   2. not in use (what the in-use test alone would pick)
-+                //   3. anything not in flight
-+                var fallback: ?usize = null;
-+                var unheld: ?usize = null;
-+                var free: ?usize = null;
-+                for (1..buf_count + 1) |offset| {
-+                    const i = (@as(usize, self.frame_index) + offset) % buf_count;
-+                    const frame = &self.frames[i];
-+                    if (frame.in_flight.load(.acquire)) continue;
-+                    if (fallback == null) fallback = i;
-+                    if (targetInUse(api, &frame.target)) continue;
-+                    if (unheld == null) unheld = i;
-+                    if (!targetPresented(api, &frame.target)) {
-+                        free = i;
-+                        break;
-+                    }
++                // GPU completion does not release queued layer contents,
++                // displayed contents, compositor reads, or preview captures.
++                // Their IOSurface use counts keep every such target excluded.
++                var available: [buf_count]bool = undefined;
++                for (&self.frames, &available) |*frame, *eligible| {
++                    eligible.* = !frame.in_flight.load(.acquire) and
++                        !targetInUse(api, &frame.target);
 +                }
 +
-+                // The semaphore guarantees at least one frame is not in flight.
-+                const chosen: usize = free orelse unheld orelse fallback.?;
-+
-+                // The case the preference order alone cannot cover: the only
-+                // target we can have is the one we handed the compositor. A
-+                // preference has nothing left to prefer, so drawing here is
-+                // what tears the displayed frame.
-+                //
-+                // Rather than draw, we decline the frame and ask to be called
-+                // again, which turns "avoid the presented surface" from a
-+                // preference into a rule. Declining is only safe while
-+                // something is going to call us back, so we bound it: once
-+                // we have held out for `max_decline_ns` we draw into it
-+                // anyway, because a pane frozen on stale content is a worse
-+                // defect than a torn frame, and the caller may have no vsync
-+                // to retry on.
-+                if (free == null) if (unheld) |u| {
-+                    if (u == chosen and targetPresented(api, &self.frames[u].target)) {
-+                        const waited = self.decline_timer.elapsed(self.decline_clock.read());
-+                        if (waited < max_decline_ns) {
-+                            self.frame_sema.post();
-+                            return null;
-+                        }
-+
-+                        // Out of budget, so we are about to write into the
-+                        // surface the compositor is showing -- the tear this
-+                        // path exists to avoid, accepted because a frozen
-+                        // pane is worse. It should be rare, so say so: if it
-+                        // starts happening in the field this line is the
-+                        // evidence, and there is no probe build to fall back
-+                        // on once this ships.
-+                        self.forced_draws += 1;
-+                        if (self.forced_draws <= 20 or self.forced_draws % 100 == 0) {
-+                            log.warn(
-+                                "drawing into the presented surface after {d}ms of declines n={d}",
-+                                .{ waited / std.time.ns_per_ms, self.forced_draws },
-+                            );
-+                        }
++                const chosen = TargetSelection.next(&available, self.frame_index) orelse {
++                    const waited = self.decline_timer.elapsed(self.decline_clock.read());
++                    if (waited >= std.time.ns_per_s and !self.contention_reported) {
++                        self.contention_reported = true;
++                        log.warn("render targets held for {d}ms; retaining the completed frame", .{
++                            waited / std.time.ns_per_ms,
++                        });
 +                    }
++                    self.frame_sema.post();
++                    return null;
 +                };
 +
 +                self.decline_timer.reset();
++                self.contention_reported = false;
 +                self.frame_index = @intCast(chosen);
 +                const frame = &self.frames[chosen];
 +                frame.in_flight.store(true, .monotonic);
@@ -441,19 +385,10 @@ index 0f4a294bc..7fa9850d2 100644
 +                }
 +                return false;
 +            }
-+
-+            /// True if the target's backing storage is the one we most
-+            /// recently presented, i.e. what the compositor is displaying.
-+            fn targetPresented(api: *const GraphicsAPI, target: *const Target) bool {
-+                if (comptime @hasDecl(GraphicsAPI, "isTargetPresented")) {
-+                    return api.isTargetPresented(target);
-+                }
-+                return false;
-+            }
          };
  
          /// State we need duplicated for every frame. Any state that could be
-@@ -324,6 +455,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -324,6 +391,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              /// See property of same name on Renderer for explanation.
              target_config_modified: usize = 0,
  
@@ -465,7 +400,7 @@ index 0f4a294bc..7fa9850d2 100644
              /// Buffer with the vertex data for our background image.
              ///
              /// TODO: Make this an optional and only create it
-@@ -900,6 +1036,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -900,6 +972,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  self.api.loopEnter();
              }
  
@@ -474,7 +409,7 @@ index 0f4a294bc..7fa9850d2 100644
              // If we don't support a display link we have no work to do.
              if (comptime DisplayLink == void) return;
  
-@@ -922,6 +1060,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -922,6 +996,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  self.api.loopExit();
              }
  
@@ -483,7 +418,7 @@ index 0f4a294bc..7fa9850d2 100644
              // If we don't support a display link we have no work to do.
              if (comptime DisplayLink == void) return;
  
-@@ -1029,6 +1169,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1029,6 +1105,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          pub fn setFocus(self: *Self, focus: bool) !void {
              assert(self.focused != focus);
  
@@ -491,7 +426,7 @@ index 0f4a294bc..7fa9850d2 100644
              self.focused = focus;
  
              // Flag that we need to update our custom shaders
-@@ -1051,6 +1192,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1051,6 +1128,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          ///
          /// Must be called on the render thread.
          pub fn setVisible(self: *Self, visible: bool) void {
@@ -499,7 +434,7 @@ index 0f4a294bc..7fa9850d2 100644
              // If we're not visible, then we want to stop the display link
              // because it is a waste of resources and we can move to pure
              // change-driven updates.
-@@ -1064,6 +1206,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1064,6 +1142,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              }
          }
  
@@ -509,12 +444,13 @@ index 0f4a294bc..7fa9850d2 100644
 +            self.draw_mutex.lock();
 +            defer self.draw_mutex.unlock();
 +            self.swap_chain.decline_timer.reset();
++            self.swap_chain.contention_reported = false;
 +        }
 +
          /// Set the new font grid.
          ///
          /// Must be called on the render thread.
-@@ -1474,11 +1624,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1474,11 +1561,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
  
              // Conditions under which we need to draw the frame, otherwise we
              // don't need to since the previous frame should be identical.
@@ -535,14 +471,14 @@ index 0f4a294bc..7fa9850d2 100644
  
              if (!needs_redraw) {
                  // We still need to present the last target again, because the
-@@ -1489,9 +1646,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1489,9 +1583,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              }
              self.cells_rebuilt = false;
  
 -            // Wait for a frame to be available.
 -            const frame = try self.swap_chain.nextFrame();
 -            errdefer self.swap_chain.releaseFrame();
-+            // Wait for a frame to be available. This can decline to give us
++            // Attempt to acquire a frame. This can decline to give us
 +            // one when the only target left is the one the compositor is
 +            // showing; drawing into that is what tears the displayed frame.
 +            // Synchronous draws decline too — the surface on the glass is no
@@ -556,7 +492,7 @@ index 0f4a294bc..7fa9850d2 100644
 +            //   - async: we ask the thread for a retry, on a timer rather
 +            //     than immediately, since what we are waiting for is a
 +            //     display refresh and retrying inside the same millisecond
-+            //     only burns the budget. We arm it even when a display link
++            //     only wastes event-loop work. We arm it even when a display link
 +            //     is running: the link looks like it will provide the next
 +            //     tick, but it stops on occlusion and on focus loss, which
 +            //     can happen before the tick arrives. Leaving the run with
@@ -565,12 +501,8 @@ index 0f4a294bc..7fa9850d2 100644
 +            //     so arming it alongside a live link costs at most one
 +            //     redundant wakeup.
 +            //
-+            //   - sync: nothing, deliberately. We reach `nextFrame` at all
-+            //     only because a draw is already pending — either a retry is
-+            //     in flight or the render callback that set `cells_rebuilt` is
-+            //     about to run. Arming the timer from here would be wrong as
-+            //     well as unnecessary: this path runs on the main thread and
-+            //     the timer belongs to the render loop.
++            //   - sync: notify the render thread, which retries without
++            //     blocking the main thread or mutating its timer off-thread.
 +            //
 +            // CoreAnimation still asked the layer to display, so a declined
 +            // sync draw answers with the contents we already have rather than
@@ -579,6 +511,9 @@ index 0f4a294bc..7fa9850d2 100644
 +                self.cells_rebuilt = true;
 +                if (sync) {
 +                    try self.api.presentLastTarget();
++                    // xev.Async is thread-safe; only its render-loop callback
++                    // may arm the retry timer if targets remain unavailable.
++                    if (self.thread) |thr| try thr.draw_now.notify();
 +                } else if (self.thread) |thr| {
 +                    thr.scheduleRetryDraw();
 +                }
@@ -588,7 +523,7 @@ index 0f4a294bc..7fa9850d2 100644
              // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
  
              // If we need to reinitialize our shaders, do so.
-@@ -1723,6 +1920,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1723,6 +1856,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          // Callback from the graphics API when a frame is completed.
          pub fn frameCompleted(
              self: *Self,
@@ -596,7 +531,7 @@ index 0f4a294bc..7fa9850d2 100644
              health: Health,
          ) void {
              // If our health value hasn't changed, then we do nothing. We don't
-@@ -1738,7 +1936,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1738,7 +1872,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              }
  
              // Always release our semaphore
@@ -620,58 +555,197 @@ index 388b4f9ed..dd899f4b3 100644
  
  /// Add a render pass to this frame with the provided attachments.
 diff --git a/src/renderer/metal/IOSurfaceLayer.zig b/src/renderer/metal/IOSurfaceLayer.zig
-index 34fbfbed5..f19647b52 100644
+index 34fbfbed..db1ce50a 100644
 --- a/src/renderer/metal/IOSurfaceLayer.zig
 +++ b/src/renderer/metal/IOSurfaceLayer.zig
-@@ -35,6 +35,7 @@ pub fn init() !IOSurfaceLayer {
+@@ -18,6 +18,12 @@ var Subclass: ?objc.Class = null;
+ /// The underlying CALayer
+ layer: objc.Object,
+ 
++/// Owned by the layer, whose lifetime includes queued dispatch blocks.
++const PresentationState = struct {
++    latest: std.atomic.Value(usize) = .init(0),
++    displayed: ?*IOSurface = null,
++};
++
+ pub fn init() !IOSurfaceLayer {
+     // The layer returned by `[CALayer layer]` is autoreleased, which means
+     // that at the end of the current autorelease pool it will be deallocated
+@@ -35,11 +41,16 @@ pub fn init() !IOSurfaceLayer {
  
      layer.setInstanceVariable("display_cb", .{ .value = null });
      layer.setInstanceVariable("display_ctx", .{ .value = null });
-+    layer.setInstanceVariable("latest_surface", .{ .value = null });
++    const state = try std.heap.c_allocator.create(PresentationState);
++    state.* = .{};
++    layer.setInstanceVariable("presentation_state", objc.Object.fromId(state));
  
      return .{ .layer = layer };
  }
-@@ -52,6 +53,11 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+ 
+ pub fn release(self: *IOSurfaceLayer) void {
++    // Queued applies retain the layer, but must not keep a renderer callback.
++    self.setDisplayCallback(null, null);
+     self.layer.release();
+ }
+ 
+@@ -52,6 +63,13 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
      //
      // We release in the callback after setting the contents.
      surface.retain();
++    surface.incrementUseCount();
 +
-+    // Record this surface as the most recently presented one so that the
-+    // callback can discard applies that have been superseded while queued.
-+    self.layer.setInstanceVariable("latest_surface", objc.Object.fromId(surface));
++    // Reserve a generation before releasing the GPU's frame ownership.
++    // Unlike an Objective-C ivar, this is safe across the completion and
++    // main threads. The pin prevents reuse while its apply is queued.
++    const generation = presentationState(self.layer).latest.fetchAdd(1, .acq_rel) + 1;
 +
      // NOTE: Since `self.layer` is passed as an `objc.c.id`, it's
      //       automatically retained when the block is copied, so we
      //       don't need to retain it ourselves like with the surface.
-@@ -81,6 +87,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+@@ -59,6 +77,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+     var block = SetSurfaceBlock.init(.{
+         .layer = self.layer.value,
+         .surface = surface,
++        .generation = generation,
+     }, &setSurfaceCallback);
+ 
+     // We check if we're on the main thread and run the block directly if so.
+@@ -81,12 +100,14 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
  ///
  /// Does not ensure this happens on the main thread.
  pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
-+    self.layer.setInstanceVariable("latest_surface", objc.Object.fromId(surface));
-     self.layer.setProperty("contents", surface);
+-    self.layer.setProperty("contents", surface);
++    _ = presentationState(self.layer).latest.fetchAdd(1, .acq_rel);
++    applySurface(self.layer, surface);
  }
  
-@@ -98,6 +105,12 @@ fn setSurfaceCallback(
+ const SetSurfaceBlock = objc.Block(struct {
+     layer: objc.c.id,
+     surface: *IOSurface,
++    generation: usize,
+ }, .{}, void);
+ 
+ fn setSurfaceCallback(
+@@ -97,6 +118,10 @@ fn setSurfaceCallback(
+ 
      // See explanation of why we retain and release in `setSurface`.
      defer surface.release();
- 
-+    // If a newer surface has been presented since this block was queued,
-+    // discard this one: applying it would put stale contents on screen, and
-+    // the swap chain may already have cycled back to redraw into it.
-+    const latest = layer.getInstanceVariable("latest_surface");
-+    if (@intFromPtr(latest.value) != @intFromPtr(surface)) return;
++    defer surface.decrementUseCount();
 +
++    // Discard superseded applies while balancing their queue ownership.
++    if (presentationState(layer).latest.load(.acquire) != block.generation) return;
+ 
      // We check to see if the surface is the appropriate size for
      // the layer, if it's not then we discard it. This is because
-     // asynchronously drawn frames can sometimes finish just after
-@@ -147,6 +160,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
+@@ -115,7 +140,26 @@ fn setSurfaceCallback(
+         return;
+     }
+ 
++    applySurface(layer, surface);
++}
++
++fn presentationState(layer: objc.Object) *PresentationState {
++    return @ptrCast(@alignCast(layer.getInstanceVariable("presentation_state").value));
++}
++
++/// Called only on the main thread. Acquire the new ownership before KVO
++/// observers see the frame, and retire the previous layer contents afterward.
++fn applySurface(layer: objc.Object, surface: *IOSurface) void {
++    const state = presentationState(layer);
++    surface.retain();
++    surface.incrementUseCount();
++    const previous = state.displayed;
++    state.displayed = surface;
+     layer.setProperty("contents", surface);
++    if (previous) |old| {
++        old.decrementUseCount();
++        old.release();
++    }
+ }
+ 
+ pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
+@@ -147,6 +191,28 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
  
      if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
      if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
-+    if (!subclass.addIvar("latest_surface")) return error.ObjCFailed;
++    if (!subclass.addIvar("presentation_state")) return error.ObjCFailed;
++
++    subclass.replaceMethod("dealloc", struct {
++        fn dealloc(target: objc.c.id, _: objc.c.SEL) callconv(.c) void {
++            const layer = objc.Object.fromId(target);
++            if (layer.getInstanceVariable("presentation_state").value) |raw| {
++                const state: *PresentationState = @ptrCast(@alignCast(raw));
++                if (state.displayed) |surface| {
++                    surface.decrementUseCount();
++                    surface.release();
++                }
++                std.heap.c_allocator.destroy(state);
++            }
++            const selector = objc.sel("dealloc");
++            const implementation = objc.c.class_getMethodImplementation(
++                objc.getClass("CALayer").?.value,
++                selector.value,
++            );
++            const dealloc_super: *const fn (objc.c.id, objc.c.SEL) callconv(.c) void = @ptrCast(implementation);
++            dealloc_super(target, selector.value);
++        }
++    }.dealloc);
  
      subclass.replaceMethod("display", struct {
          fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
+@@ -181,3 +247,52 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
+ 
+     return subclass;
+ }
++
++test "ownership protects displayed pixels until layer destruction" {
++    const pool = objc.getClass("NSAutoreleasePool").?.msgSend(objc.Object, "alloc", .{})
++        .msgSend(objc.Object, "init", .{});
++    const surface = try IOSurface.init(.{
++        .width = 4,
++        .height = 4,
++        .pixel_format = .@"32BGRA",
++        .bytes_per_element = 4,
++        .colorspace = null,
++    });
++    defer surface.release();
++    var layer = try init();
++    layer.setSurfaceSync(surface);
++    try std.testing.expect(surface.isInUse());
++    layer.release();
++    objc.getClass("CATransaction").?.msgSend(void, "flush", .{});
++    pool.msgSend(void, "drain", .{});
++    try std.testing.expectEqual(@as(i32, 0), macos.c.IOSurfaceGetUseCount(@ptrCast(surface)));
++}
++
++test "ownership releases superseded and wrong-size queued frames" {
++    const pool = objc.getClass("NSAutoreleasePool").?.msgSend(objc.Object, "alloc", .{})
++        .msgSend(objc.Object, "init", .{});
++    defer pool.msgSend(void, "drain", .{});
++    const surface = try IOSurface.init(.{
++        .width = 4,
++        .height = 4,
++        .pixel_format = .@"32BGRA",
++        .bytes_per_element = 4,
++        .colorspace = null,
++    });
++    defer surface.release();
++    var layer = try init();
++    defer layer.release();
++    presentationState(layer.layer).latest.store(2, .release);
++    for ([_]usize{ 1, 2 }) |generation| {
++        surface.retain();
++        surface.incrementUseCount();
++        var block = SetSurfaceBlock.init(.{
++            .layer = layer.layer.value,
++            .surface = surface,
++            .generation = generation,
++        }, &setSurfaceCallback);
++        setSurfaceCallback(&block);
++        try std.testing.expectEqual(@as(i32, 0), macos.c.IOSurfaceGetUseCount(@ptrCast(surface)));
++        try std.testing.expectEqual(null, presentationState(layer.layer).displayed);
++    }
++}
 diff --git a/src/renderer/opengl/Frame.zig b/src/renderer/opengl/Frame.zig
 index 289413b0a..aa89fc3ae 100644
 --- a/src/renderer/opengl/Frame.zig
@@ -683,3 +757,48 @@ index 289413b0a..aa89fc3ae 100644
 -    self.renderer.frameCompleted(health);
 +    self.renderer.frameCompleted(self.target, health);
  }
+diff --git a/src/renderer/TargetSelection.zig b/src/renderer/TargetSelection.zig
+new file mode 100644
+index 00000000..a4fdfcc8
+--- /dev/null
++++ b/src/renderer/TargetSelection.zig
+@@ -0,0 +1,39 @@
++//! Round-robin selection among targets whose owners have released them.
++const std = @import("std");
++
++pub fn next(available: []const bool, previous: usize) ?usize {
++    for (1..available.len + 1) |offset| {
++        const index = (previous + offset) % available.len;
++        if (available[index]) return index;
++    }
++    return null;
++}
++
++test "all ownership combinations preserve exclusion and round-robin order" {
++    for (0..16) |mask| {
++        var available: [4]bool = undefined;
++        for (&available, 0..) |*value, index| {
++            value.* = mask & (@as(usize, 1) << @intCast(index)) != 0;
++        }
++        for (0..4) |previous| {
++            const chosen = next(&available, previous);
++            if (mask == 0) {
++                try std.testing.expectEqual(null, chosen);
++                continue;
++            }
++            try std.testing.expect(chosen != null);
++            try std.testing.expect(available[chosen.?]);
++            const distance = (chosen.? + 4 - previous - 1) % 4;
++            for (0..distance) |offset| {
++                try std.testing.expect(!available[(previous + offset + 1) % 4]);
++            }
++        }
++    }
++}
++
++test "a retired target becomes eligible without an unsafe timeout fallback" {
++    var available = [_]bool{ false, false, false, false };
++    for (0..1_000) |_| try std.testing.expectEqual(null, next(&available, 0));
++    available[2] = true;
++    try std.testing.expectEqual(@as(?usize, 2), next(&available, 0));
++}

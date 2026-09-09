@@ -92,6 +92,8 @@ final class WorktreeTerminalStackView: NSView {
   }
 
   func select(_ inputs: WorktreeTerminalInputs?) {
+    let interval = TerminalPerformance.begin("Worktree host selection")
+    defer { TerminalPerformance.end("Worktree host selection", interval) }
     guard let inputs else {
       park()
       return

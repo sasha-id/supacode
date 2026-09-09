@@ -71,17 +71,34 @@ struct SidebarPersistenceKeyTests {
     }
   }
 
-  @Test func savePersistsToUserDefaultsBlob() throws {
-    try withDependencies {
+  @Test func savePersistsToUserDefaultsBlob() async throws {
+    try await withDependencies {
       $0.defaultAppStorage = .inMemory
     } operation: {
       @Shared(.sidebar) var sidebar
       $sidebar.withLock { $0.schemaVersion = 3 }
+      try await $sidebar.save()
 
       @Dependency(\.defaultAppStorage) var store
       let data = try #require(store.data(forKey: SidebarKey.storageKey))
       let decoded = try JSONDecoder().decode(SidebarState.self, from: data)
       #expect(decoded.schemaVersion == 3)
+    }
+  }
+
+  @Test func queuedSidebarMutationsPersistTheLatestSelection() async throws {
+    try await withDependencies {
+      $0.defaultAppStorage = .inMemory
+    } operation: {
+      @Shared(.sidebar) var sidebar
+      for id in ["/first", "/second", "/final"] {
+        $sidebar.withLock { $0.focusedWorktreeID = WorktreeID(id) }
+      }
+      try await $sidebar.save()
+      @Dependency(\.defaultAppStorage) var store
+      let data = try #require(store.data(forKey: SidebarKey.storageKey))
+      let decoded = try JSONDecoder().decode(SidebarState.self, from: data)
+      #expect(decoded.focusedWorktreeID == WorktreeID("/final"))
     }
   }
 }

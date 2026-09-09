@@ -48,6 +48,7 @@ final class SupacodeAppDelegate: NSObject, NSApplicationDelegate {
   private var bufferedDeeplinkURLs: [URL] = []
 
   func applicationWillTerminate(_ notification: Notification) {
+    PersistenceQueue.shared.flush()
     // Release the global Carbon registration explicitly rather than leaning on
     // deinit timing.
     globalHotkeyMonitor?.tearDown()

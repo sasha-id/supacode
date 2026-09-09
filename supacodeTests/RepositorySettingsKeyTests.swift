@@ -195,7 +195,7 @@ struct RepositorySettingsKeyTests {
   /// The steady state for anyone who has ever saved repository settings: the
   /// global entry already exists. The old seeding `withLock` wrote back the same
   /// bytes here, so a save-counting assertion alone would not have caught it.
-  @Test(.dependencies) func repeatedLoadNeverWritesWhenGlobalEntryAlreadyExists() throws {
+  @Test(.dependencies) func repeatedLoadNeverWritesWhenGlobalEntryAlreadyExists() async throws {
     let globalStorage = SettingsTestStorage()
     let localStorage = RepositoryLocalSettingsTestStorage()
     let rootURL = URL(fileURLWithPath: "/tmp/repo-seeded-entry")
@@ -204,13 +204,14 @@ struct RepositorySettingsKeyTests {
     var seeded = RepositorySettings.default
     seeded.setupScript = "echo seeded"
 
-    withDependencies {
+    try await withDependencies {
       $0.settingsFileStorage = globalStorage.storage
       $0.settingsFileURL = settingsFileURL
       $0.repositoryLocalSettingsStorage = localStorage.storage
     } operation: {
       @Shared(.settingsFile) var settingsFile: SettingsFile
       $settingsFile.withLock { $0.repositories[repositoryID] = seeded }
+      try await $settingsFile.save()
       globalStorage.resetCounts()
 
       for _ in 0..<10 {

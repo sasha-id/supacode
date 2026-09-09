@@ -214,6 +214,7 @@ public nonisolated struct SettingsFileKey: SharedKey {
   }
 
   public func load(context: LoadContext<SettingsFile>, continuation: LoadContinuation<SettingsFile>) {
+    PersistenceQueue.shared.flush()
     @Dependency(\.settingsFileStorage) var storage
     @Dependency(\.settingsStoreHealth) var health
     let decoder = JSONDecoder()
@@ -261,7 +262,7 @@ public nonisolated struct SettingsFileKey: SharedKey {
         break
       }
       health.markHealthy(urls)
-      _ = try? save(initialValue, storage: storage)
+      _ = try? save(initialValue, storage: storage, health: health)
       continuation.resumeReturningInitialValue()
       return
     }
@@ -348,19 +349,25 @@ public nonisolated struct SettingsFileKey: SharedKey {
 
   public func save(_ value: SettingsFile, context _: SaveContext, continuation: SaveContinuation) {
     @Dependency(\.settingsFileStorage) var storage
-    do {
-      try save(value, storage: storage)
-      continuation.resume()
-    } catch {
-      continuation.resume(throwing: error)
+    @Dependency(\.settingsStoreHealth) var health
+    // Resolve the values here: capturing the property wrappers would defer
+    // dependency resolution until after leaving the caller's task context.
+    let destination = storage
+    let storeHealth = health
+    PersistenceQueue.shared.enqueue {
+      do {
+        try save(value, storage: destination, health: storeHealth)
+        continuation.resume()
+      } catch {
+        continuation.resume(throwing: error)
+      }
     }
   }
 
-  private func save(_ value: SettingsFile, storage: SettingsFileStorage) throws {
+  private func save(_ value: SettingsFile, storage: SettingsFileStorage, health: SettingsStoreHealth) throws {
     // Refuse to persist over a store that loaded degraded (a slice was present but
     // unreadable): the in-memory value is default-derived, so writing it would
     // overwrite the real data. Cleared by a clean reload on the next launch.
-    @Dependency(\.settingsStoreHealth) var health
     guard !health.isDegraded(urls) else {
       Self.logger.error("Settings save refused: store loaded degraded; changes will not persist until relaunch.")
       throw SettingsStoreError.degraded

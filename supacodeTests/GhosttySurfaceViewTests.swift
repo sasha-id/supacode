@@ -8,6 +8,44 @@ import Testing
 
 @MainActor
 struct GhosttySurfaceViewTests {
+  @Test func nativeFrameReleasesPresentationCover() async throws {
+    let runtime = GhosttyRuntime()
+    let geometry = try #require(ContentGeometry.candidate(pointSize: CGSize(width: 800, height: 600), scale: 2))
+    let start = ContinuousClock.now
+    let view = GhosttySurfaceView(
+      id: UUID(), runtime: runtime, workingDirectory: nil,
+      command: "/bin/cat", disableShellIntegration: true,
+      initialGeometry: geometry, context: GHOSTTY_SURFACE_CONTEXT_WINDOW)
+    defer { view.closeSurface() }
+    if TerminalPerformance.enabled {
+      SupaLogger("TerminalPerformance").info("Test surface construction: \(start.duration(to: .now))")
+    }
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: .borderless, backing: .buffered, defer: false)
+    window.contentView = view.hostedView()
+    window.contentView?.layoutSubtreeIfNeeded()
+    view.preparePresentation()
+    let surface = try #require(view.surface)
+    await withCheckedContinuation { continuation in
+      guard view.presentation.isCovered else {
+        continuation.resume()
+        return
+      }
+      let updateCover = view.presentation.onChange
+      view.presentation.onChange = {
+        updateCover?()
+        guard !view.presentation.isCovered else { return }
+        view.presentation.onChange = updateCover
+        continuation.resume()
+      }
+      ghostty_surface_draw(surface)
+    }
+    #expect(view.layer?.contents != nil)
+    #expect(!view.presentation.isCovered)
+    window.contentView = nil
+  }
+
   @Test func normalizedWorkingDirectoryPathRemovesTrailingSlashForNonRootPath() {
     #expect(
       GhosttySurfaceView.normalizedWorkingDirectoryPath("/Users/onevcat/Sync/github/supacode/")
