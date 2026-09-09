@@ -21,9 +21,10 @@ struct RepositoriesFeatureSidebarTests {
         id: Worktree.ID("/tmp/sidebar-profile/wt-\(index)"), name: "feature-\(index)", detail: "",
         workingDirectory: root.appending(path: "wt-\(index)"), repositoryRootURL: root)
     }
-    var state = makeState(repository: Repository(
-      id: Repository.ID(root.path()), rootURL: root, name: "profile",
-      worktrees: IdentifiedArray(uniqueElements: worktrees)))
+    var state = makeState(
+      repository: Repository(
+        id: Repository.ID(root.path()), rootURL: root, name: "profile",
+        worktrees: IdentifiedArray(uniqueElements: worktrees)))
     state.isInitialLoadComplete = true
     RepositoriesFeature.syncSidebar(&state)
     state.applyCacheRecomputes(.allSidebar)
@@ -37,7 +38,10 @@ struct RepositoriesFeatureSidebarTests {
       state.applyCacheRecomputes(.allSidebar)
       let cached = ProcessInfo.processInfo.systemUptime
       logger.info(
-        "Sidebar reconciliation: rows=\(worktreeCount) iteration=\(iteration) items_ms=\((reconciled - start) * 1_000) grouping_ms=\((grouped - reconciled) * 1_000) caches_ms=\((cached - grouped) * 1_000)"
+        """
+        Sidebar reconciliation: rows=\(worktreeCount) iteration=\(iteration) items_ms=\((reconciled - start) * 1_000) \
+        grouping_ms=\((grouped - reconciled) * 1_000) caches_ms=\((cached - grouped) * 1_000)
+        """
       )
     }
     #expect(state.sidebarItems.count == worktreeCount)

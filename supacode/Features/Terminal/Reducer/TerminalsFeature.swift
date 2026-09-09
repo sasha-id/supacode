@@ -138,40 +138,46 @@ struct TerminalsFeature {
     }
   }
 
+  private func reconcileLayoutChange(
+    _ state: inout State, worktreeID: Worktree.ID, action: LayoutFeature.Action, previousTabs: Set<TabID>
+  ) -> Effect<Action> {
+    // The element reducer already ran; any topology change may flip tab
+    // visibility, so re-diff the grace timers and fire the app-shell
+    // hooks (persistence debounce, sidebar projection).
+    let scope = Self.changeScope(action)
+    var timerCleanup: Effect<Action> = .none
+    var completedHibernation: TabID?
+    if case .hibernateTab(let tabID) = action {
+      completedHibernation = tabID
+      // A completed hibernate has no work for a grace timer. A refused
+      // hibernate can re-arm below while its renderer remains live.
+      state.hibernationDeferralLogged.remove(tabID)
+      if state.hibernationArmedTabs.remove(tabID) != nil {
+        timerCleanup = .cancel(id: HibernationTimerID.tab(tabID))
+      }
+    }
+    let hibernation =
+      scope == .structural
+      ? reconcileHibernation(
+        &state, affectedWorktrees: [worktreeID], previousTabs: previousTabs,
+        onlyTab: completedHibernation)
+      : .none
+    return .concatenate(
+      timerCleanup,
+      .merge(
+        hibernation,
+        .run { _ in await layoutChangeObserver.layoutChanged(worktreeID, scope) }
+      )
+    )
+  }
+
   private func reconciledReducer(previousTabs: Set<TabID>) -> some Reducer<State, Action> {
     Reduce { state, action in
       switch action {
       case .layouts(.element(let worktreeID, let action)):
-        // The element reducer already ran; any topology change may flip tab
-        // visibility, so re-diff the grace timers and fire the app-shell
-        // hooks (persistence debounce, sidebar projection).
-        let scope = Self.changeScope(action)
-        var timerCleanup: Effect<Action> = .none
-        var completedHibernation: TabID?
-        if case .hibernateTab(let tabID) = action {
-          completedHibernation = tabID
-          // A completed hibernate has no work for a grace timer. A refused
-          // hibernate can re-arm below while its renderer remains live.
-          state.hibernationDeferralLogged.remove(tabID)
-          if state.hibernationArmedTabs.remove(tabID) != nil {
-            timerCleanup = .cancel(id: HibernationTimerID.tab(tabID))
-          }
-        }
-        let hibernation =
-          scope == .structural
-          ? reconcileHibernation(
-            &state, affectedWorktrees: [worktreeID], previousTabs: previousTabs,
-            onlyTab: completedHibernation)
-          : .none
-        return .concatenate(
-          timerCleanup,
-          .merge(
-            hibernation,
-            .run { _ in await layoutChangeObserver.layoutChanged(worktreeID, scope) }
-          )
-        )
+        return reconcileLayoutChange(&state, worktreeID: worktreeID, action: action, previousTabs: previousTabs)
 
-      case .layouts:
+      case .layouts, .hibernationPolicyChanged:
         return reconcileHibernation(&state)
 
       case .task:
@@ -204,9 +210,6 @@ struct TerminalsFeature {
           &state,
           affectedWorktrees: previousSelection.map { Set([$0, worktreeID].compactMap { $0 }) }
         )
-
-      case .hibernationPolicyChanged:
-        return reconcileHibernation(&state)
 
       case .hibernationGraceElapsed(let worktreeID, let tabID):
         return reduceHibernationGraceElapsed(&state, worktreeID: worktreeID, tabID: tabID)

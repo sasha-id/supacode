@@ -359,3 +359,79 @@ scanout, or custom shaders. Samples and test output are retained as
 `retained-reveal-samples.log` and `retained-reveal-release.log`.
 The strengthened backing-dimension assertions also passed all four Release
 cases (`retained-reveal-verified-release.log`); the required app build passed.
+
+## Continuous output and unfocused reveal
+
+A disposable `/usr/bin/yes performance` workload measures layer applications
+over visible, hidden, and revealed two-second phases, with 200 ms settling after
+each visibility transition. The initial Release run applied 120, zero, and 1,857
+frames respectively. A second run reproduced the disparity at 120, zero, and
+817. This is layer application activity, not monitor scanout frequency.
+
+Tracing the native renderer explains the transition: hiding stops the display
+link, but revealing restarts it only when focused. With no active display link,
+the render thread draws on each output update. Thus an unfocused visible terminal
+can submit far more frames after reveal than while display-paced. The profiling
+regression now rejects a greater-than-threefold reveal increase while allowing
+refresh-rate variation; it failed against the original policy at 817 versus a
+360-frame bound (`background-output-regression-red.log`).
+
+A native patch makes visibility, rather than focus, control display pacing.
+Terminal bytes and focus state are unchanged. With the rebuilt native library,
+the continuous-output regression passed at 120 visible, zero hidden, and 121
+revealed frame applications (`shader-policy-corrected-release.log`).
+
+The initial candidate bypassed shader animation policy because generic
+`hasAnimations()` meant only that custom shaders existed. A real shader workload
+reproduced unwanted display-rate animation under disabled and focused-only
+unfocused policies (`shader-policy-regression-red.log`). The correction includes
+the animation policy in derived renderer configuration and applies it at the
+redraw decision, including configuration updates on the existing surface.
+
+The corrected workload measured three focused disabled-policy frames, zero
+unfocused disabled-policy frames, 120 focused-only focused frames, zero
+focused-only unfocused frames, and 120–121 always-policy frames per two seconds.
+The original disabled-policy assertion allowed only two frames and failed.
+Timestamp instrumentation attributed the three frames to the existing 600 ms
+focused cursor timer: offsets 0.444, 1.041, and 1.640 seconds
+(`shader-policy-cadence.log`). That timer wakes cell rebuilding even with cursor
+blinking disabled. The test now allows up to five focused timer frames while
+keeping the unfocused bound at two; it still rejects the original display-rate
+regression. Both adjusted Release regressions passed in
+`shader-policy-verified-release.log`: output applied 120/0/120 frames and all six
+shader policy/focus combinations passed.
+
+The retained-reveal workload then ran alone with a three-second idle interval
+for each configuration (`idle-split-verified-release.log`). All 400 reveal
+assertions passed again. Quiet visible unfocused panes used the following
+whole-test-host CPU, where 100% means one CPU core:
+
+| Panes | Translucent | Process CPU | Process footprint |
+| --- | --- | --- | --- |
+| 1 | No | 0.75% | 92.8 MiB |
+| 1 | Yes | 0.85% | 92.0 MiB |
+| 4 | No | 1.55% | 128.2 MiB |
+| 4 | Yes | 1.34% | 135.8 MiB |
+
+These short intervals bound the observed visible-pacing cost in this isolated
+workload, not system-wide energy use or a before/after CPU improvement. The
+continuous-output and shader workloads were not running during idle sampling.
+The four-pane lifecycle soak passed 120 creation/first-frame/teardown cycles
+(480 native surfaces, at most four live) in 139.4 seconds
+(`lifecycle-soak-release.log`). It used the existing cold-construction runtime
+configuration, not the bundled-only shader/idle setup. Each cycle waited one
+second after the previous group closed. Initial process footprint was 80.1 MiB;
+after the final group closed and the 200 ms cleanup interval it was 104.1 MiB.
+Mean pre-construction footprint across successive 20-cycle windows was 88.4,
+88.6, 90.7, 101.5, 103.0, and 103.1 MiB. The final two windows show no continuing
+mean growth, but this finite run does not establish absence of long-term leaks.
+Four-pane first-frame latency was median 63.1 ms, p95 94.5 ms, and maximum
+150.1 ms; native construction was median 49.2 ms and p95 72.1 ms. These sustained
+measurements should not be conflated with the earlier five-sample cold baseline.
+
+The final standard functional suite after native pacing and lint cleanup passed
+3,531 tests with zero failures, 16 expected failures, and six opt-in profiling
+tests skipped (`Test-supacode-tests-2026.09.09_14-27-35-+0800.xcresult`).
+`make lint` and the required `make build-app` also passed
+(`native-pacing-lint.log`, `native-pacing-build-app.log`). Native profiling ran separately in optimized Release;
+the standard suite does not supply performance timing evidence.

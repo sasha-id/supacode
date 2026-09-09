@@ -22,9 +22,11 @@ struct PersistenceQueueTests {
     ]
     let writes = Mutex<[Int]>([])
     for value in 0..<6 {
-      queue.save(coalescing: keys[value % 3], operation: { writes.withLock { $0.append(value) } }) { result in
-        #expect(throws: Never.self) { try result.get() }
-      }
+      queue.save(
+        coalescing: keys[value % 3], operation: { writes.withLock { $0.append(value) } },
+        completion: { result in
+          #expect(throws: Never.self) { try result.get() }
+        })
     }
     gate.signal()
     queue.flush()
@@ -46,21 +48,24 @@ struct PersistenceQueueTests {
         operation: {
           attempts.withLock { $0 += 1 }
           throw WriteFailure.unavailable
+        },
+        completion: { result in
+          #expect(throws: WriteFailure.self) { try result.get() }
+          failures.withLock { $0.append(value) }
         }
-      ) { result in
-        #expect(throws: WriteFailure.self) { try result.get() }
-        failures.withLock { $0.append(value) }
-      }
+      )
     }
     gate.signal()
     queue.flush()
     #expect(attempts.withLock { $0 } == 1)
     #expect(failures.withLock { $0 } == [1, 2, 3])
     let recovered = Mutex(false)
-    queue.save(coalescing: key, operation: {}) { result in
-      #expect(throws: Never.self) { try result.get() }
-      recovered.withLock { $0 = true }
-    }
+    queue.save(
+      coalescing: key, operation: {},
+      completion: { result in
+        #expect(throws: Never.self) { try result.get() }
+        recovered.withLock { $0 = true }
+      })
     queue.flush()
     #expect(recovered.withLock { $0 })
   }
@@ -78,15 +83,18 @@ struct PersistenceQueueTests {
         started.signal()
         finish.wait()
         writes.withLock { $0.append(1) }
-      }
-    ) { result in
-      #expect(throws: Never.self) { try result.get() }
-    }
-    #expect(started.wait(timeout: .now() + 5) == .success)
-    for value in 2...3 {
-      queue.save(coalescing: key, operation: { writes.withLock { $0.append(value) } }) { result in
+      },
+      completion: { result in
         #expect(throws: Never.self) { try result.get() }
       }
+    )
+    #expect(started.wait(timeout: .now() + 5) == .success)
+    for value in 2...3 {
+      queue.save(
+        coalescing: key, operation: { writes.withLock { $0.append(value) } },
+        completion: { result in
+          #expect(throws: Never.self) { try result.get() }
+        })
     }
     finish.signal()
     queue.flush()
@@ -102,10 +110,12 @@ struct PersistenceQueueTests {
     let writes = Mutex<[Int]>([])
     let completed = Mutex<[Int]>([])
     for value in 1...3 {
-      queue.save(coalescing: key, operation: { writes.withLock { $0.append(value) } }) { result in
-        #expect(throws: Never.self) { try result.get() }
-        completed.withLock { $0.append(value) }
-      }
+      queue.save(
+        coalescing: key, operation: { writes.withLock { $0.append(value) } },
+        completion: { result in
+          #expect(throws: Never.self) { try result.get() }
+          completed.withLock { $0.append(value) }
+        })
     }
     gate.signal()
     queue.flush()
@@ -121,9 +131,11 @@ struct PersistenceQueueTests {
     let key = PersistenceQueue.CoalescingKey(owner: owner, name: "settings")
     let writes = Mutex<[Int]>([])
     for (value, automatic) in [(1, true), (2, false), (3, true), (4, true)] {
-      queue.save(coalescing: automatic ? key : nil, operation: { writes.withLock { $0.append(value) } }) { result in
-        #expect(throws: Never.self) { try result.get() }
-      }
+      queue.save(
+        coalescing: automatic ? key : nil, operation: { writes.withLock { $0.append(value) } },
+        completion: { result in
+          #expect(throws: Never.self) { try result.get() }
+        })
     }
     gate.signal()
     queue.flush()

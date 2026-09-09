@@ -6,12 +6,163 @@ import GhosttyKit
 import IOSurface
 import Sharing
 import SupacodeSettingsShared
+import Synchronization
 import Testing
 
 @testable import supacode
 
 @MainActor
 struct GhosttySurfaceViewTests {
+  @Test(.dependencies, .enabled(if: TerminalPerformance.enabled))
+  func profileShaderFocusPolicy() async throws {
+    let directory = FileManager.default.temporaryDirectory.appending(path: "shader-profile-\(UUID())")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let shader = directory.appending(path: "pulse.glsl")
+    try """
+    void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+      vec2 uv = fragCoord / iResolution.xy;
+      fragColor = texture2D(iChannel0, uv);
+      fragColor.rgb += vec3(0.02 * sin(iTime));
+    }
+    """.write(to: shader, atomically: true, encoding: .utf8)
+    let configURL = directory.appending(path: "config")
+    let runtime = GhosttyRuntime(
+      configResolutionPlan: .init(loadUserDefaultFiles: false, loadSupacodeUserConfig: false))
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: .borderless, backing: .buffered, defer: false)
+    let geometry = try #require(
+      ContentGeometry.candidate(
+        pointSize: CGSize(width: 800, height: 600), scale: window.backingScaleFactor))
+    let view = GhosttySurfaceView(
+      id: UUID(), runtime: runtime, workingDirectory: nil,
+      command: "/bin/cat", disableShellIntegration: true,
+      initialGeometry: geometry, context: GHOSTTY_SURFACE_CONTEXT_WINDOW)
+    defer {
+      window.orderOut(nil)
+      window.contentView = nil
+      view.closeSurface()
+    }
+    let surface = try #require(view.surface, "Native profiling requires an active display.")
+    window.contentView = view.hostedView()
+    window.orderFront(nil)
+    window.contentView?.layoutSubtreeIfNeeded()
+    let layer = try #require(view.layer)
+    let frames = Mutex<[Double]>([])
+    let observation = layer.observe(\.contents) { _, _ in
+      frames.withLock { $0.append(ProcessInfo.processInfo.systemUptime) }
+    }
+    defer { observation.invalidate() }
+    view.setOcclusion(true)
+    for mode in ["false", "true", "always"] {
+      try """
+      custom-shader = \(shader.path())
+      custom-shader-animation = \(mode)
+      cursor-style-blink = false
+      window-vsync = true
+      """.write(to: configURL, atomically: true, encoding: .utf8)
+      let config = try #require(ghostty_config_new())
+      defer { ghostty_config_free(config) }
+      configURL.path().withCString { ghostty_config_load_file(config, $0) }
+      ghostty_config_finalize(config)
+      #expect(ghostty_config_diagnostics_count(config) == 0)
+      ghostty_surface_update_config(surface, config)
+      for focused in [true, false] {
+        view.focusDidChange(focused)
+        await Self.settleNativeCleanup()
+        let before = frames.withLock { $0.count }
+        let sampleStarted = ProcessInfo.processInfo.systemUptime
+        await withCheckedContinuation { continuation in
+          DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) { continuation.resume() }
+        }
+        let samples = frames.withLock { Array($0.dropFirst(before)) }
+        let applied = samples.count
+        let animates = mode == "always" || (mode == "true" && focused)
+        SupaLogger("TerminalPerformance").info(
+          "Shader policy: mode=\(mode) focused=\(focused) applied_frames=\(applied)")
+        if animates {
+          #expect(applied > 10, "The custom shader must animate under its enabled policy.")
+        } else {
+          SupaLogger("TerminalPerformance").info(
+            "Disabled shader frame offsets: \(samples.map { $0 - sampleStarted })")
+          // Ghostty's focused cursor timer still rebuilds cells every 600 ms,
+          // even with cursor blinking disabled. Allow those, not display-rate animation.
+          #expect(applied <= (focused ? 5 : 2), "Disabled shaders must not animate at display cadence.")
+        }
+      }
+    }
+  }
+
+  /// Isolated continuous-output workload; measures layer application, not PTY bytes.
+  @Test(.dependencies, .enabled(if: TerminalPerformance.enabled))
+  func profileBackgroundOutput() async throws {
+    let runtime = GhosttyRuntime(
+      configResolutionPlan: .init(loadUserDefaultFiles: false, loadSupacodeUserConfig: false))
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: .borderless, backing: .buffered, defer: false)
+    let geometry = try #require(
+      ContentGeometry.candidate(
+        pointSize: CGSize(width: 800, height: 600), scale: window.backingScaleFactor))
+    let view = GhosttySurfaceView(
+      id: UUID(), runtime: runtime, workingDirectory: nil,
+      command: "/usr/bin/yes performance", disableShellIntegration: true,
+      initialGeometry: geometry, context: GHOSTTY_SURFACE_CONTEXT_WINDOW)
+    defer {
+      window.orderOut(nil)
+      window.contentView = nil
+      view.closeSurface()
+    }
+    _ = try #require(view.surface, "Native profiling requires an active display.")
+    let hosted = view.hostedView()
+    window.contentView = hosted
+    window.orderFront(nil)
+    hosted.layoutSubtreeIfNeeded()
+    let layer = try #require(view.layer)
+    let frames = Mutex(0)
+    let observation = layer.observe(\.contents) { _, _ in frames.withLock { $0 += 1 } }
+    defer { observation.invalidate() }
+    var initiallyApplied = 0
+    var initialSeconds = 0.0
+    view.focusDidChange(true)
+    for (phase, visible) in [("visible", true), ("hidden", false), ("revealed", true)] {
+      if !visible { view.focusDidChange(false) }
+      hosted.isHidden = !visible
+      view.setOcclusion(visible)
+      if visible { view.preparePresentation() }
+      await Self.settleNativeCleanup()
+      let before = frames.withLock { $0 }
+      let footprintBefore = Self.physicalFootprint()
+      let started = ProcessInfo.processInfo.systemUptime
+      await withCheckedContinuation { continuation in
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) { continuation.resume() }
+      }
+      let elapsed = ProcessInfo.processInfo.systemUptime - started
+      let applied = frames.withLock { $0 } - before
+      SupaLogger("TerminalPerformance").info(
+        """
+        Background output: phase=\(phase) seconds=\(elapsed) applied_frames=\(applied) \
+        footprint_before=\(Self.formatBytes(footprintBefore)) \
+        footprint_after=\(Self.formatBytes(Self.physicalFootprint()))
+        """)
+      if visible {
+        #expect(applied > 0, "Continuous output must render while visible and resume after reveal.")
+        #expect(view.layer?.contents is IOSurface)
+        if phase == "visible" {
+          initiallyApplied = applied
+          initialSeconds = elapsed
+        } else {
+          // Allow refresh-rate variation, but not an order-of-magnitude jump
+          // into unpaced drawing after an unfocused surface is revealed.
+          #expect(Double(applied) / elapsed <= Double(initiallyApplied) / initialSeconds * 3)
+        }
+      } else {
+        #expect(applied == 0, "Hidden output must not keep applying rendered frames after settling.")
+      }
+    }
+  }
+
   /// Measures native retained-frame reveal only, not SwiftUI selection or scan-out.
   @Test(.dependencies, .serialized, .enabled(if: TerminalPerformance.enabled), arguments: [1, 4], [false, true])
   func profileRetainedReveal(paneCount: Int, translucent: Bool) async throws {
@@ -84,19 +235,54 @@ struct GhosttySurfaceViewTests {
         "Retained reveal: panes=\(paneCount) translucent=\(translucent) iteration=\(iteration) reveal_ms=\(elapsed)")
       await Task.yield()
     }
+    for view in views {
+      view.focusDidChange(true)
+      view.focusDidChange(false)
+      view.setOcclusion(true)
+    }
+    await Self.settleNativeCleanup()
+    let cpuBefore = try #require(Self.cpuSeconds())
+    let idleStarted = ProcessInfo.processInfo.systemUptime
+    await withCheckedContinuation { continuation in
+      DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(3)) { continuation.resume() }
+    }
+    let idleSeconds = ProcessInfo.processInfo.systemUptime - idleStarted
+    let cpuAfter = try #require(Self.cpuSeconds())
+    SupaLogger("TerminalPerformance").info(
+      """
+      Idle split: panes=\(paneCount) translucent=\(translucent) seconds=\(idleSeconds) \
+      process_cpu_percent=\((cpuAfter - cpuBefore) / idleSeconds * 100) \
+      footprint_bytes=\(Self.formatBytes(Self.physicalFootprint()))
+      """)
   }
 
   /// Opt-in native construction workload. Disposable windows never take
   /// keyboard focus; this measures native creation, not zmx replay completion.
   @Test(.serialized, .enabled(if: TerminalPerformance.enabled), arguments: [1, 4], [false, true])
   func profileColdConstruction(paneCount: Int, keepResident: Bool) async throws {
+    try await runColdConstruction(paneCount: paneCount, keepResident: keepResident, iterations: 5)
+  }
+
+  @Test(.enabled(if: TerminalPerformance.enabled))
+  func profileLifecycleSoak() async throws {
+    try await runColdConstruction(paneCount: 4, keepResident: false, iterations: 120, settleBetween: true)
+  }
+
+  private func runColdConstruction(
+    paneCount: Int, keepResident: Bool, iterations: Int, settleBetween: Bool = false
+  ) async throws {
     let runtime = GhosttyRuntime()
     let logger = SupaLogger("TerminalPerformance")
     await Self.settleNativeCleanup()
     let initialFootprint = Self.physicalFootprint()
     var retained: [GhosttySurfaceView] = []
     defer { for view in retained { view.closeSurface() } }
-    for iteration in 0..<5 {
+    for iteration in 0..<iterations {
+      if settleBetween {
+        await withCheckedContinuation { continuation in
+          DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) { continuation.resume() }
+        }
+      }
       let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
         styleMask: .borderless, backing: .buffered, defer: false)
@@ -160,12 +346,20 @@ struct GhosttySurfaceViewTests {
         displayedTargetBytes += surface.allocationSize
       }
       logger.info(
-        "Cold construction: panes=\(paneCount) retained=\(keepResident) iteration=\(iteration) construction_ms=\(constructionMilliseconds) first_frame_ms=\(readyMilliseconds) displayed_target_bytes=\(displayedTargetBytes) footprint_before=\(Self.formatBytes(footprintBefore)) footprint_after=\(Self.formatBytes(Self.physicalFootprint()))"
+        """
+        Cold construction: panes=\(paneCount) retained=\(keepResident) iteration=\(iteration) \
+        construction_ms=\(constructionMilliseconds) first_frame_ms=\(readyMilliseconds) \
+        displayed_target_bytes=\(displayedTargetBytes) footprint_before=\(Self.formatBytes(footprintBefore)) \
+        footprint_after=\(Self.formatBytes(Self.physicalFootprint()))
+        """
       )
     }
     await Self.settleNativeCleanup()
     logger.info(
-      "Cold retained footprint: panes=\(paneCount) retained=\(keepResident) live_renderers=\(retained.count) initial_bytes=\(Self.formatBytes(initialFootprint)) settled_bytes=\(Self.formatBytes(Self.physicalFootprint()))"
+      """
+      Cold retained footprint: panes=\(paneCount) retained=\(keepResident) live_renderers=\(retained.count) \
+      initial_bytes=\(Self.formatBytes(initialFootprint)) settled_bytes=\(Self.formatBytes(Self.physicalFootprint()))
+      """
     )
   }
 
@@ -191,6 +385,13 @@ struct GhosttySurfaceViewTests {
       }
     }
     return status == KERN_SUCCESS ? info.phys_footprint : nil
+  }
+
+  private static func cpuSeconds() -> Double? {
+    var usage = rusage()
+    guard getrusage(RUSAGE_SELF, &usage) == 0 else { return nil }
+    return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+      + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
   }
 
   @Test func nativeFrameReleasesPresentationCover() async throws {

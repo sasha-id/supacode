@@ -1,0 +1,53 @@
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -559,6 +559,7 @@
+             min_contrast: f32,
+             padding_color: configpkg.WindowPaddingColor,
+             custom_shaders: configpkg.RepeatablePath,
++            custom_shader_animation: configpkg.CustomShaderAnimation,
+             bg_image: ?configpkg.Path,
+             bg_image_opacity: f32,
+             bg_image_position: configpkg.BackgroundImagePosition,
+@@ -635,3 +636,4 @@
+                     .custom_shaders = custom_shaders,
++                    .custom_shader_animation = config.@"custom-shader-animation",
+                     .bg_image = bg_image,
+                     .bg_image_opacity = config.@"background-image-opacity",
+@@ -1013,3 +1015,7 @@
+         pub fn hasAnimations(self: *const Self) bool {
+-            return self.has_custom_shaders;
++            return self.has_custom_shaders and switch (self.config.custom_shader_animation) {
++                .always => true,
++                .true => self.focused,
++                .false => false,
++            };
+         }
+@@ -1035,16 +1035,7 @@
+             self.custom_shader_focused_changed = true;
+ 
+-            // If we're not focused, then we want to stop the display link
+-            // because it is a waste of resources and we can move to pure
+-            // change-driven updates.
+-            if (comptime DisplayLink != void) link: {
+-                const display_link = self.display_link orelse break :link;
+-                if (focus) {
+-                    display_link.start() catch {};
+-                } else {
+-                    display_link.stop() catch {};
+-                }
+-            }
++            // Visibility owns display pacing. Unfocused visible terminals
++            // must not switch to unbounded draws driven by continuous output.
+         }
+ 
+         /// Callback when the window is visible or occluded.
+@@ -1057,7 +1048,7 @@
+             if (comptime DisplayLink != void) link: {
+                 const display_link = self.display_link orelse break :link;
+-                if (visible and self.focused) {
++                if (visible) {
+                     display_link.start() catch {};
+                 } else {
+                     display_link.stop() catch {};
+                 }
