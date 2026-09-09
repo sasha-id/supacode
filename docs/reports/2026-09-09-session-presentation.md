@@ -257,3 +257,41 @@ The existing deferred surface-activity reassertion remains: it compensates for
 AppKit focus reset during remount, and the current mount path does not yet offer
 an equivalent explicit readiness callback. Removing it without that replacement
 would weaken focus correctness. Reducing this work remains a separate follow-up.
+
+## Sidebar profiling: test-host attribution
+
+An opt-in Release test measured repeated reconciliation of synthetic rosters
+with 100 and 1,000 worktrees. Median item-reconciliation times were 92.6 ms and
+937.8 ms respectively; grouping and derived-cache phases were much smaller.
+These numbers must **not** be treated as production sidebar or switching latency.
+
+A five-second native sample of the repeated benchmark traced the dominant
+stacks through `Shared.wrappedValue`, dependency cache lookup,
+`TestContext.current`, and `_currentTest()` into repeated `dlsym` symbol searches.
+The dependency library checks the current Swift Testing identity on cache-key
+creation. Its `TestContext.current` returns immediately when `isTesting` is
+false, so this sampled overhead is specific to the test host. Changing the
+dependency context alone would not remove that process-level test detection.
+
+Artifacts: `.build/performance-investigation/sidebar-release.sample.txt`,
+`sidebar-sampling-release.log`, and `sidebar-baseline-samples.log`. The synthetic
+fixture also starts with an empty persisted sidebar section. A non-test-host
+measurement with representative populated buckets is required before using
+these timings to justify a production optimization.
+
+## Bundled-theme verification isolation
+
+The two bundled-theme integration tests previously loaded user configuration,
+allowing a fixed user theme to override the light/dark pair they intended to
+verify. Runtime construction now accepts an optional configuration-resolution
+plan and retains it through reloads and config-change callbacks. Normal callers
+leave it nil, preserving live policy resolution on every load. The two tests
+disable user-file tiers, enable theme synchronization in in-memory settings, and
+retain the original real-Ghostty color assertions. App reload is also checked.
+
+All 19 bundled-override tests passed in Release, and `make build-app` passed.
+The subsequent full Release test attempt encountered a test-host crash resolving
+a TCA generic reducer conformance in `CloneRepositoryFormFeatureTests`; that run
+does not establish a passing full suite. Logs are `theme-isolation-release.log`,
+`theme-isolation-build-app.log`, and `full-suite-release.log` under the same
+performance-investigation artifact directory.

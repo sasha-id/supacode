@@ -1,4 +1,6 @@
+import DependenciesTestSupport
 import Foundation
+import Sharing
 import SupacodeSettingsShared
 import SwiftUI
 import Testing
@@ -11,8 +13,12 @@ struct GhosttyRuntimeBundledOverridesTests {
   // a dark scheme yields a dark background, a light scheme a light one. Guards
   // that the bundled themes actually differ so a missing embed hard-fails
   // instead of passing vacuously (both sides would be `windowBackgroundColor`).
-  @Test func backgroundColorTracksColorScheme() throws {
-    let runtime = GhosttyRuntime(initialColorScheme: .light)
+  @Test(.dependencies) func backgroundColorTracksColorScheme() throws {
+    @Shared(.settingsFile) var settings
+    $settings.withLock { $0.global.terminalThemeSyncEnabled = true }
+    let runtime = GhosttyRuntime(
+      initialColorScheme: .light,
+      configResolutionPlan: .init(loadUserDefaultFiles: false, loadSupacodeUserConfig: false))
     let light = runtime.backgroundColor()
     runtime.setColorScheme(.dark)
     let dark = runtime.backgroundColor()
@@ -22,6 +28,8 @@ struct GhosttyRuntimeBundledOverridesTests {
     // Re-resolution works in both directions, not just the first transition.
     runtime.setColorScheme(.light)
     #expect(runtime.backgroundColor().isLightColor)
+    runtime.reloadAppConfig()
+    #expect(runtime.backgroundColor().isLightColor)
   }
 
   // The launch-flash fix: `init` seeds the resolved scheme so the FIRST
@@ -29,14 +37,18 @@ struct GhosttyRuntimeBundledOverridesTests {
   // `setColorScheme`) is already scheme-correct, not Ghostty's default-light
   // resolution. Asserting with no interim `setColorScheme` also documents that
   // the seed's config swap lands synchronously within `init`.
-  @Test func initSeedsResolvedColorSchemeBeforeFirstRead() {
-    let dark = GhosttyRuntime(initialColorScheme: .dark)
+  @Test(.dependencies) func initSeedsResolvedColorSchemeBeforeFirstRead() {
+    @Shared(.settingsFile) var settings
+    $settings.withLock { $0.global.terminalThemeSyncEnabled = true }
+    let plan = GhosttyRuntime.ConfigResolution.Plan(
+      loadUserDefaultFiles: false, loadSupacodeUserConfig: false)
+    let dark = GhosttyRuntime(initialColorScheme: .dark, configResolutionPlan: plan)
     #expect(!dark.backgroundColor().isLightColor)
     #expect(!dark.windowTintColor().isLightColor)
     // With no focused-surface provider installed (the launch state),
     // `windowTintColor()` falls through to exactly `backgroundColor()`.
     #expect(dark.windowTintColor().matchesTint(dark.backgroundColor()))
-    let light = GhosttyRuntime(initialColorScheme: .light)
+    let light = GhosttyRuntime(initialColorScheme: .light, configResolutionPlan: plan)
     #expect(light.backgroundColor().isLightColor)
     #expect(light.windowTintColor().isLightColor)
   }

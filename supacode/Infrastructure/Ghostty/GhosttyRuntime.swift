@@ -31,6 +31,7 @@ final class GhosttyRuntime {
   }
 
   private var config: ghostty_config_t?
+  private let configResolutionPlan: ConfigResolution.Plan?
   private(set) var app: ghostty_app_t?
   private var observers: [NSObjectProtocol] = []
   private var surfaceRefs: [SurfaceReference] = []
@@ -47,8 +48,9 @@ final class GhosttyRuntime {
   }
   var onConfigChange: (() -> Void)?
 
-  init(initialColorScheme: ColorScheme? = nil) {
-    guard let loaded = Self.loadConfig() else {
+  init(initialColorScheme: ColorScheme? = nil, configResolutionPlan: ConfigResolution.Plan? = nil) {
+    self.configResolutionPlan = configResolutionPlan
+    guard let loaded = Self.loadConfig(plan: configResolutionPlan) else {
       preconditionFailure("ghostty_config_new failed")
     }
     self.config = loaded.config
@@ -203,7 +205,7 @@ final class GhosttyRuntime {
     }
     var target = ghostty_target_s()
     target.tag = GHOSTTY_TARGET_APP
-    guard let loaded = Self.loadConfig() else {
+    guard let loaded = Self.loadConfig(plan: configResolutionPlan) else {
       Self.logger.warning("Failed to reload app config.")
       return
     }
@@ -228,14 +230,14 @@ final class GhosttyRuntime {
       // Soft reload reuses the in-memory config (already overridden), so we
       // re-snapshot the user's `background-opacity` from disk to keep the
       // window tint in lockstep with what the user actually has configured.
-      if let snapshot = Self.loadConfig() {
+      if let snapshot = Self.loadConfig(plan: configResolutionPlan) {
         userBackgroundOpacity = snapshot.userBackgroundOpacity
         ghostty_config_free(snapshot.config)
       }
       notifyConfigChanged()
       return
     }
-    guard let loaded = Self.loadConfig() else { return }
+    guard let loaded = Self.loadConfig(plan: configResolutionPlan) else { return }
     userBackgroundOpacity = loaded.userBackgroundOpacity
     applyConfig(loaded.config, target: target, app: app)
     ghostty_config_free(loaded.config)
@@ -455,7 +457,7 @@ final class GhosttyRuntime {
         // config may already carry our `loadBundledOverrides` overlay, so
         // reading it from the clone would return the override (0) instead of
         // the user's intended value.
-        if let snapshot = Self.loadConfig() {
+        if let snapshot = Self.loadConfig(plan: runtime.configResolutionPlan) {
           runtime.userBackgroundOpacity = snapshot.userBackgroundOpacity
           ghostty_config_free(snapshot.config)
         }
@@ -560,12 +562,14 @@ final class GhosttyRuntime {
     }
   }
 
-  private static func loadConfig() -> (config: ghostty_config_t, userBackgroundOpacity: Double)? {
+  private static func loadConfig(plan override: ConfigResolution.Plan?) -> (
+    config: ghostty_config_t, userBackgroundOpacity: Double
+  )? {
     @Shared(.settingsFile) var settingsFile
     let themeSyncEnabled = settingsFile.global.terminalThemeSyncEnabled
     let translucencyEnabled = settingsFile.global.terminalTranslucencyEnabled
     let supacodeUserConfigURL = SupacodePaths.ghosttyUserConfigURL
-    let plan = ConfigResolution.plan(
+    let plan = override ?? ConfigResolution.plan(
       mode: settingsFile.global.ghosttyUserConfigMode,
       supacodeUserConfigExists: SupacodePaths.ghosttyUserConfigHasContent()
     )
