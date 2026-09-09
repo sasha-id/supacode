@@ -62,9 +62,13 @@ valid frame. Those later replay jumps are intentionally outside the readiness ga
 
 Native surface creation and disposal remain on the main actor, consistent with
 the embedded renderer's AppKit requirements. Moving those calls to an arbitrary
-background task is not a safe optimization. Immutable shader-resource reuse and
-incremental hibernation scans are deferred until profiling attributes enough cost
-to justify their additional lifecycle complexity.
+background task is not a safe optimization. Incremental hibernation reconciliation
+is implemented as described below. Immutable shader-resource caching is not added:
+the measured native first-frame costs are tens of milliseconds, not the roughly
+one-second restoration seen in the recording, and these measurements do not
+attribute a sufficient share specifically to immutable Metal resources to justify
+a new cross-surface device/configuration cache. Cold restoration retains its UI
+cover; no unsupported background native lifecycle work is introduced.
 
 ## Profiling and acceptance checks
 
@@ -76,7 +80,9 @@ Profiling is disabled by default.
 
 A five-second sample of the previously running build was approximately 99% idle
 on the main thread. It was not a controlled switching workload and cannot support
-a switching speedup claim. No before/after p50 or p95 latency is claimed here.
+a switching speedup claim. No before/after end-to-end worktree-switch p50 or p95
+latency is claimed here; the later native and sidebar workloads have narrower
+measurement boundaries.
 
 For an interactive acceptance run, test warm A/B switching, selection beyond eight
 worktrees, a cold split session, rapid A/B/C selection, hidden-window resize,
@@ -99,7 +105,7 @@ exercise all four-buffer ownership combinations and queued/displayed pin cleanup
   settings/repository/deeplink run passed 218 tests with 10 expected failures and
   no unexpected failures. A direct default-dependency-instance regression was
   subsequently added and passed in the full run.
-- Final full workspace result: 3,515 tests, comprising 3,497 passed, 16 expected
+- Earlier full workspace result: 3,515 tests, comprising 3,497 passed, 16 expected
   failures, and two unexpected failures. The failures are
   `GhosttyRuntimeBundledOverridesTests.backgroundColorTracksColorScheme` and
   `initSeedsResolvedColorSchemeBeforeFirstRead`. Both also fail with synchronous
@@ -435,3 +441,32 @@ tests skipped (`Test-supacode-tests-2026.09.09_14-27-35-+0800.xcresult`).
 `make lint` and the required `make build-app` also passed
 (`native-pacing-lint.log`, `native-pacing-build-app.log`). Native profiling ran separately in optimized Release;
 the standard suite does not supply performance timing evidence.
+
+## Versioned production candidate
+
+The normal Release build of 0.11.7 (156) succeeded for arm64 and x86_64
+(`production-0.11.7-build.log`). Both app compiler invocations use Swift `-O`
+without DEBUG or test-only defines. The app contains no debug dylib, its two
+binary UUIDs match the dSYM, and strict deep code-signature verification passed.
+The artifact is `.build/ProductionProducts/Release/supacode.app` in the
+session-presentation worktree; the installed `/Applications` copy was not replaced.
+
+With permission, the previously running installed app was quit normally and the
+candidate launched from that build directory. The running executable path and
+new app socket were verified. A production CLI smoke run checked 30 selections
+across the three Supacode worktrees, created four disposable `/bin/cat` tabs in
+a four-pane layout, checked tab focus, zoom/unzoom, and selection after switching
+away and back. Cleanup closed only those four tabs and verified the original tab
+IDs, pane IDs, and prior worktree selection were restored
+(`production-cli-smoke.log`).
+
+CLI acknowledgements and selected IDs do not prove physical display smoothness.
+This execution environment lacks Screen Recording and Accessibility permission;
+interactive visual acceptance remains pending user confirmation. Typing remains
+deferred by request, and later zmx replay redraws remain outside the cover gate.
+
+The versioned tree passed the full standard suite again: 3,531 passed, zero
+failures, 16 expected failures, and six opt-in skips
+(`Test-supacode-tests-2026.09.09_15-04-38-+0800.xcresult`). The required
+`make build-app` and `make lint` also passed (`version-0.11.7-build-app.log`,
+`version-0.11.7-lint.log`). The version bump does not create a release tag.
