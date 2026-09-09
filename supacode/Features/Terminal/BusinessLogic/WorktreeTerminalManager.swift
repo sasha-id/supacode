@@ -1831,11 +1831,11 @@ final class WorktreeTerminalManager {
     for (worktreeID, host) in hosts {
       for surfaceID in host.allSurfaceIDs {
         let contentID = ContentID(rawValue: surfaceID)
-        guard let content = ContentRuntime.liveValue.content(for: contentID) else { continue }
+        guard ContentRuntime.liveValue.content(for: contentID) != nil else { continue }
         // The quit-time snapshot save runs after this sweep has emptied the
         // runtime, so the titles have to be in the layout by then.
         commitReportedTitle(of: contentID, worktreeID: worktreeID)
-        content.hibernate()
+        ContentRuntime.liveValue.hibernate(contentID)
         ContentRuntime.liveValue.remove(contentID, tombstone: false)
       }
     }

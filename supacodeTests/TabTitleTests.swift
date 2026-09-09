@@ -1,6 +1,7 @@
 import Clocks
 import ConcurrencyExtras
 import Observation
+import SupacodeSettingsShared
 import Testing
 
 @testable import supacode
@@ -103,20 +104,20 @@ struct TabTitleTests {
     let clock = TestClock()
     let chrome = TerminalTabChrome(clock: clock)
     chrome.reportedTitle = "First"
-    chrome.setTitlePresentation(active: false, selected: false)
+    chrome.setPresentation(active: false, selected: false)
     chrome.reportedTitle = "Hidden"
     try await clock.checkSuspension()
     #expect(chrome.presentedTitle == "First")
     #expect(chrome.reportedTitle == "Hidden")
-    chrome.setTitlePresentation(active: true, selected: false)
+    chrome.setPresentation(active: true, selected: false)
     #expect(chrome.presentedTitle == "Hidden")
     chrome.reportedTitle = "Selected"
-    chrome.setTitlePresentation(active: true, selected: true)
+    chrome.setPresentation(active: true, selected: true)
     #expect(chrome.presentedTitle == "Selected")
     chrome.reportedTitle = "Pending"
-    chrome.setTitlePresentation(active: true, selected: true)
+    chrome.setPresentation(active: true, selected: true)
     #expect(chrome.presentedTitle == "Selected")
-    chrome.setTitlePresentation(active: false, selected: false)
+    chrome.setPresentation(active: false, selected: false)
     try await clock.checkSuspension()
   }
 
@@ -129,6 +130,64 @@ struct TabTitleTests {
     chrome = nil
     #expect(weakChrome == nil)
     try await clock.checkSuspension()
+  }
+
+  @Test func hiddenAgentUpdatesDoNotInvalidateTheAccessory() {
+    let chrome = TerminalTabChrome()
+    chrome.setPresentation(active: false, selected: false)
+    let changes = LockIsolated(0)
+    withObservationTracking {
+      _ = chrome.accessory
+    } onChange: {
+      changes.withValue { $0 += 1 }
+    }
+    let agent = AgentPresenceFeature.AgentInstance(agent: .claude, activity: .busy)
+    chrome.agents = [agent]
+    #expect(changes.value == 0)
+    #expect(chrome.agents == [agent])
+    #expect(chrome.accessory == nil)
+    chrome.setPresentation(active: true, selected: false)
+    #expect(changes.value == 1)
+    #expect(chrome.accessory != nil)
+  }
+
+  @Test func hiddenProgressAndWorkingStateStopAnimatingAndCatchUpOnReveal() {
+    let chrome = TerminalTabChrome()
+    chrome.isWorking = true
+    chrome.progress = .init(style: .indeterminate)
+    chrome.setPresentation(active: false, selected: false)
+    #expect(!chrome.presentedIsWorking)
+    #expect(chrome.presentedProgress == nil)
+    let changes = LockIsolated(0)
+    withObservationTracking {
+      _ = chrome.presentedIsWorking
+      _ = chrome.presentedProgress
+    } onChange: {
+      changes.withValue { $0 += 1 }
+    }
+    chrome.isWorking = false
+    chrome.progress = .init(style: .determinate(percent: 75))
+    chrome.isWorking = true
+    #expect(changes.value == 0)
+    #expect(chrome.isWorking)
+    #expect(chrome.progress == .init(style: .determinate(percent: 75)))
+    chrome.setPresentation(active: true, selected: false)
+    #expect(changes.value == 1)
+    #expect(chrome.presentedIsWorking)
+    #expect(chrome.presentedProgress == chrome.progress)
+
+    let visibleChanges = LockIsolated(0)
+    withObservationTracking {
+      _ = chrome.presentedIsWorking
+      _ = chrome.presentedProgress
+    } onChange: {
+      visibleChanges.withValue { $0 += 1 }
+    }
+    chrome.setPresentation(active: true, selected: false)
+    #expect(visibleChanges.value == 0)
+    chrome.progress = nil
+    #expect(visibleChanges.value == 1)
+    #expect(chrome.presentedProgress == nil)
   }
 
   @Test func rawReportsDoNotInvalidateTheObservedLabelAndEmptyTitlesEventuallyClearIt() async throws {

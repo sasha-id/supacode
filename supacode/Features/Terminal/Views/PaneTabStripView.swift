@@ -387,12 +387,11 @@ private struct PaneTabView: View {
   }
 
   var body: some View {
-    let _ = store.renderEpoch
     // Content-owned observable chrome: reads register per-tab observation, so
     // an agent storm or progress tick re-renders only this tab.
     let chrome = runtime.content(for: tab.content.id)?.chrome
     let isDormant = runtime.renderer(for: tab.content.id) == nil
-    let progressDisplay = chrome?.progress
+    let progressDisplay = chrome?.presentedProgress
     // The tab owns its lock (a blocking script's whole life), so the marker
     // shows while the script runs, not only once it parks.
     let isLocked = tab.isLocked
@@ -604,7 +603,7 @@ private struct PaneTabView: View {
     chrome: (any TabChrome)?,
     progressDisplay: TerminalTabProgressDisplay?
   ) -> Bool {
-    chrome?.isWorking == true
+    chrome?.presentedIsWorking == true
       || progressDisplay != nil
       || (isSelected && isFocusedPane && isLifecycleBusy)
   }

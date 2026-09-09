@@ -1,25 +1,34 @@
 import AppKit
 import ComposableArchitecture
+import Observation
 import SupacodeSettingsShared
 
 /// Reference-world registry of live contents; the value-world layout stores
 /// only `ContentID`s and resolves renderers here.
 @MainActor
+@Observable
 final class ContentRuntime {
   private static let logger = SupaLogger("ContentRuntime")
 
-  private(set) var contents: [ContentID: any TabContent] = [:]
+  @ObservationIgnored private(set) var contents: [ContentID: any TabContent] = [:]
   /// Tombstones for contents whose async kill is still in flight; a tombstoned
   /// ID cannot be re-provisioned until `confirmKill` clears it.
-  private(set) var pendingKill: Set<ContentID> = []
+  @ObservationIgnored private(set) var pendingKill: Set<ContentID> = []
   /// Monotonic per-content render-host generation. Structural rebuilds create
   /// a new host container before the old one is dismantled; only the newest
   /// claimant may mount, so a stale container can never steal the renderer
   /// into a dying hierarchy.
-  private var renderHostGenerations: [ContentID: UInt64] = [:]
-  private var nextRenderHostGeneration: UInt64 = 0
+  @ObservationIgnored private var renderHostGenerations: [ContentID: UInt64] = [:]
+  @ObservationIgnored private var nextRenderHostGeneration: UInt64 = 0
 
   nonisolated init() {}
+
+  /// Subscript key paths include the ID, so lifecycle changes invalidate only
+  /// readers of that content, including readers waiting for its first provision.
+  private subscript(id: ContentID) -> (any TabContent)? {
+    access(keyPath: \.[id])
+    return contents[id]
+  }
 
   /// Registers `content` and starts its session synchronously, exactly once.
   /// Refuses IDs that are tombstoned or already registered.
@@ -32,15 +41,17 @@ final class ContentRuntime {
       Self.logger.warning("Refused provisioning already-registered content \(content.id.rawValue)")
       return false
     }
-    contents[content.id] = content
-    content.startSession(at: geometry)
+    withMutation(keyPath: \.[content.id]) {
+      contents[content.id] = content
+      content.startSession(at: geometry)
+    }
     return true
   }
 
   /// The registered content's renderer; nil when unknown or hibernated.
   /// Read-only: never creates.
   func renderer(for id: ContentID) -> NSView? {
-    contents[id]?.renderer
+    self[id]?.renderer
   }
 
   /// Spawn geometry for content created next to `id`: the source's mounted
@@ -54,7 +65,21 @@ final class ContentRuntime {
   }
 
   func content(for id: ContentID) -> (any TabContent)? {
-    contents[id]
+    self[id]
+  }
+
+  func startSession(_ id: ContentID, at geometry: ContentGeometry) {
+    guard let content = contents[id], content.renderer == nil else { return }
+    withMutation(keyPath: \.[id]) {
+      content.startSession(at: geometry)
+    }
+  }
+
+  func hibernate(_ id: ContentID) {
+    guard let content = contents[id], content.renderer != nil else { return }
+    withMutation(keyPath: \.[id]) {
+      content.hibernate()
+    }
   }
 
   /// Unregisters and tears the content down; when `tombstone` is true the ID
@@ -64,8 +89,12 @@ final class ContentRuntime {
   /// whose claim must stay current, and a stale entry can never block a
   /// fresh host, which claims on creation.
   func remove(_ id: ContentID, tombstone: Bool) {
-    contents[id]?.tearDown()
-    contents[id] = nil
+    if let content = contents[id] {
+      withMutation(keyPath: \.[id]) {
+        content.tearDown()
+        contents[id] = nil
+      }
+    }
     guard tombstone else { return }
     pendingKill.insert(id)
   }

@@ -134,3 +134,22 @@ coalescing, explicit-save boundaries, destination separation, every caller's
 failure completion, in-flight isolation, partial-write recovery, backend
 rebinding, and reload/write ordering. These are functional guarantees, not a
 measured switching-latency improvement.
+
+## Content observation follow-up
+
+Renderer availability now registers observation per content ID, including IDs
+that have not been provisioned yet. Lifecycle mutations notify only that ID's
+readers. Terminal views no longer observe the layout-wide render epoch; the
+renderer mount is resolved in a dedicated leaf view, with renderer identity and
+host-generation checks preserving ownership during hierarchy replacement.
+
+Hidden terminal strips stop observing raw agent, progress, and working-state
+changes. Their raw state continues updating for non-presentation consumers, and
+the strip catches up when shown. Detached panes use their own window visibility
+when deciding whether to publish presentation state.
+
+The focused observation/layout result contains 138 passing tests, zero failures
+and zero skips, verified from the test-result bundle. It includes native hosting
+of first provision, replacement under the same content ID, and hibernate/rewake
+without rewriting the root view or relying on a layout render epoch. Functional
+coverage does not replace the remaining optimized switching workload checks.

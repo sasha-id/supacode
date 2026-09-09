@@ -13,6 +13,9 @@ protocol TabChrome: AnyObject {
   var isWorking: Bool { get }
   /// Drives the top-of-tab progress stripe.
   var progress: TerminalTabProgressDisplay? { get }
+  /// Presentation-only activity; hidden strips must not observe live updates.
+  var presentedIsWorking: Bool { get }
+  var presentedProgress: TerminalTabProgressDisplay? { get }
   /// Whether the terminal refuses input (a completed blocking script's parked
   /// shell). The tab's own `isLocked` drives the visible lock marker.
   var isReadOnly: Bool { get }
@@ -28,6 +31,8 @@ extension TabChrome {
   // Content kinds that never report a title fall back to the layout's own.
   var reportedTitle: String? { nil }
   var presentedTitle: String? { reportedTitle }
+  var presentedIsWorking: Bool { isWorking }
+  var presentedProgress: TerminalTabProgressDisplay? { progress }
 }
 
 /// Resolves what a tab shows, and what the layout should store for it, from the
@@ -71,14 +76,14 @@ final class TerminalTabChrome: TabChrome {
   var isReadOnly = false
   @ObservationIgnored var reportedTitle: String? {
     didSet {
-      guard reportedTitle != oldValue, titlePresentationActive else { return }
+      guard reportedTitle != oldValue, presentationActive else { return }
       publishTitleIfReady()
     }
   }
   private(set) var presentedTitle: String?
   @ObservationIgnored private let clock: any Clock<Duration>
   @ObservationIgnored private var titlePublicationTask: Task<Void, Never>?
-  @ObservationIgnored private var titlePresentationActive = true
+  private var presentationActive = true
   @ObservationIgnored private var titleSelected = false
 
   init(clock: any Clock<Duration> = ContinuousClock()) {
@@ -89,11 +94,11 @@ final class TerminalTabChrome: TabChrome {
     titlePublicationTask?.cancel()
   }
 
-  /// Hidden strips retain reports without waking their mounted SwiftUI trees.
-  /// Revealing a strip or selecting a tab immediately catches up to its title.
-  func setTitlePresentation(active: Bool, selected: Bool) {
-    let shouldFlush = active && (!titlePresentationActive || (selected && !titleSelected))
-    titlePresentationActive = active
+  /// Hidden strips retain reports without observing their live presentation
+  /// fields. Revealing a strip catches up immediately and restarts activity.
+  func setPresentation(active: Bool, selected: Bool) {
+    let shouldFlush = active && (!presentationActive || (selected && !titleSelected))
+    presentationActive = active
     titleSelected = selected
     if !active {
       titlePublicationTask?.cancel()
@@ -126,9 +131,12 @@ final class TerminalTabChrome: TabChrome {
   }
 
   var accessory: AnyView? {
-    guard !agents.isEmpty else { return nil }
+    guard presentationActive, !agents.isEmpty else { return nil }
     return AnyView(TerminalAgentBadgeAccessory(agents: agents).equatable())
   }
+
+  var presentedIsWorking: Bool { presentationActive && isWorking }
+  var presentedProgress: TerminalTabProgressDisplay? { presentationActive ? progress : nil }
 }
 
 /// Equatable barrier under the type-erased accessory: the tab body re-runs on

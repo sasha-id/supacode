@@ -664,7 +664,7 @@ final class WorktreeContentHost {
           isKeyed = lastWindowIsKey == true
         }
         (runtime.content(for: tab.content.id)?.chrome as? TerminalTabChrome)?
-          .setTitlePresentation(active: stripIsVisible, selected: isSelectedTab)
+          .setPresentation(active: stripIsVisible, selected: isSelectedTab)
         guard let surface else { continue }
         let isVisible = stripIsVisible && isSelectedTab
         let isFocused = isVisible && isKeyed && focusedContentID == tab.content.id.rawValue

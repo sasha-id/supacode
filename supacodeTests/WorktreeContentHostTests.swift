@@ -206,13 +206,19 @@ struct WorktreeContentHostTests {
     host.applySurfaceActivity()
     first.terminalChrome.reportedTitle = "Hidden first"
     second.terminalChrome.reportedTitle = "Hidden second"
+    first.terminalChrome.isWorking = true
+    second.terminalChrome.progress = .init(style: .indeterminate)
     #expect(first.terminalChrome.presentedTitle == "First")
     #expect(second.terminalChrome.presentedTitle == "Second")
+    #expect(!first.terminalChrome.presentedIsWorking)
+    #expect(second.terminalChrome.presentedProgress == nil)
     // An unknown window fails open during a window-mode transition.
     host.paneWindow = { _ in nil }
     host.applySurfaceActivity()
     #expect(first.terminalChrome.presentedTitle == "Hidden first")
     #expect(second.terminalChrome.presentedTitle == "Hidden second")
+    #expect(first.terminalChrome.presentedIsWorking)
+    #expect(second.terminalChrome.presentedProgress == .init(style: .indeterminate))
   }
 
   @Test func aWindowedPaneReclaimsFirstResponderWhileTheWorktreeIsDeselected() {

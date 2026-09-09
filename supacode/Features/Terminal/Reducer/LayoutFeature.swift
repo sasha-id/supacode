@@ -755,7 +755,7 @@ extension LayoutFeature {
       Self.logger.warning("hibernateTab found no runtime content for \(contentID.rawValue)")
       return cancelWake
     }
-    content.hibernate()
+    contentRuntime.hibernate(contentID)
     // Land the frozen grid recorded at hibernation in persisted state.
     pane.tabs[id: tabID]?.content = content.snapshot()
     state.layout.panes[id: pane.id] = pane
@@ -790,8 +790,8 @@ extension LayoutFeature {
       // effect's cancellation point, and a test clock can hold it open long
       // enough to assert what a second wake or a hibernate does mid-flight.
       try await clock.sleep(for: Self.wakeDeferral)
-      if let content = contentRuntime.content(for: snapshot.id) {
-        content.startSession(at: geometry)
+      if contentRuntime.content(for: snapshot.id) != nil {
+        contentRuntime.startSession(snapshot.id, at: geometry)
       } else {
         // Post-relaunch the runtime is empty; rebuild the content from stored
         // state, whatever its kind.

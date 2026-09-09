@@ -29,7 +29,6 @@ struct LayoutContentView: View {
     // Body reads register the observation; the AppKit container below only
     // receives resolved values.
     let visiblePaneIDs = store.layout.tree.visibleLeaves()
-    let _ = store.renderEpoch
     LayoutAXContainer(
       store: store,
       renderContext: PaneRenderContext(
@@ -394,28 +393,14 @@ struct PaneStripView: View {
         dragModel: dragModel
       )
       if let contentID = pane.selectedTab?.content.id {
-        PaneContentToolbarView(contentID: contentID, runtime: runtime, epoch: store.renderEpoch)
+        PaneContentToolbarView(contentID: contentID, runtime: runtime)
       }
       Group {
         if let contentID = pane.selectedTab?.content.id {
-          // The epoch read keeps this branch re-evaluating on hibernate/wake;
-          // a content whose wake reported back without a renderer gets an
-          // explicit placeholder, never a silent blank.
-          let epoch = store.renderEpoch
-          if runtime.renderer(for: contentID) != nil {
-            ContentHostView(contentID: contentID, runtime: runtime, epoch: epoch)
-              .overlay {
-                if isDimmed, let fill = unfocusedOverlay.fill, unfocusedOverlay.opacity > 0 {
-                  fill
-                    .opacity(unfocusedOverlay.opacity)
-                    .allowsHitTesting(false)
-                }
-              }
-          } else if let tabID = pane.selectedTab?.id, store.wakeFailedTabs.contains(tabID) {
-            EmptyTerminalPaneView(message: "This terminal is unavailable.")
-          } else {
-            TerminalLoadingView(contentID: contentID.rawValue)
-          }
+          PaneRendererView(
+            contentID: contentID, runtime: runtime,
+            isUnavailable: pane.selectedTab.map { store.wakeFailedTabs.contains($0.id) } ?? false,
+            isDimmed: isDimmed, unfocusedOverlay: unfocusedOverlay)
         } else {
           Color.clear
         }
@@ -443,6 +428,31 @@ struct PaneStripView: View {
   }
 }
 
+/// Renderer availability is observed below the strip, so a wake does not
+/// rebuild the pane's toolbar, tab bar, or interaction overlays.
+struct PaneRendererView: View {
+  let contentID: ContentID
+  let runtime: ContentRuntime
+  var isUnavailable = false
+  var isDimmed = false
+  var unfocusedOverlay = UnfocusedSplitOverlay()
+
+  var body: some View {
+    if let renderer = runtime.renderer(for: contentID) {
+      ContentHostView(contentID: contentID, runtime: runtime, renderer: renderer)
+        .overlay {
+          if isDimmed, let fill = unfocusedOverlay.fill, unfocusedOverlay.opacity > 0 {
+            fill.opacity(unfocusedOverlay.opacity).allowsHitTesting(false)
+          }
+        }
+    } else if isUnavailable {
+      EmptyTerminalPaneView(message: "This terminal is unavailable.")
+    } else {
+      TerminalLoadingView(contentID: contentID.rawValue)
+    }
+  }
+}
+
 /// Docks a content's own toolbar above its renderer, resolved from the runtime
 /// like the renderer and chrome. Content-agnostic: it names no toolbar kind, so
 /// a terminal find bar or a browser URL bar renders here without the layout
@@ -451,12 +461,8 @@ struct PaneStripView: View {
 private struct PaneContentToolbarView: View {
   let contentID: ContentID
   let runtime: ContentRuntime
-  /// The runtime is not observable; the reducer bumps this on hibernate, wake,
-  /// and provision so the toolbar re-resolves when the content appears.
-  let epoch: UInt64
 
   var body: some View {
-    let _ = epoch
     if let toolbar = runtime.content(for: contentID)?.toolbar?.view {
       toolbar
     }
@@ -795,9 +801,7 @@ private struct PaneSpanDropPreview: View {
 private struct ContentHostView: NSViewRepresentable {
   let contentID: ContentID
   let runtime: ContentRuntime
-  /// The runtime is not observable; the reducer bumps this on hibernate and
-  /// wake so `updateNSView` re-runs even when the layout value is unchanged.
-  let epoch: UInt64
+  let renderer: NSView
 
   /// This host's claim on the content it last mounted. Structural rebuilds
   /// and window-mode flips briefly overlap two hosts for one content; the
@@ -841,7 +845,7 @@ private struct ContentHostView: NSViewRepresentable {
   }
 
   private func mount(into container: NSView) {
-    guard let renderer = runtime.renderer(for: contentID) else {
+    guard runtime.renderer(for: contentID) === renderer else {
       container.subviews.forEach { $0.removeFromSuperview() }
       return
     }
