@@ -80,6 +80,7 @@ struct TerminalsFeatureTests {
     var claimsHibernation = true
     var estimatedRetentionBytes = ContentRetentionPolicy.unknownContentBytes
     private(set) var startCalls = 0
+    private(set) var rendererReads = 0
     private var view: NSView?
     private let state: TerminalContentState
 
@@ -88,7 +89,10 @@ struct TerminalsFeatureTests {
       self.state = state
     }
 
-    var renderer: NSView? { view }
+    var renderer: NSView? {
+      rendererReads += 1
+      return view
+    }
     var isHibernatable: Bool { view != nil && claimsHibernation }
 
     func startSession(at geometry: ContentGeometry) {
@@ -656,6 +660,189 @@ struct TerminalsFeatureTests {
       tabs: tabs,
       contents: contents
     )
+  }
+
+  @Test(.dependencies, arguments: [4, 256])
+  func localLayoutReconciliationDoesNotReadUnrelatedRenderers(count: Int) async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: count)
+    for content in harness.contents.dropFirst() { content.hibernate() }
+    let selected = harness.worktreeIDs[0]
+    await harness.store.send(.selectedWorktreeChanged(selected)) {
+      $0.selectedWorktreeID = selected
+      $0.recentWorktreeIDs = [selected]
+    }
+    let before = harness.contents.map(\.rendererReads)
+    await harness.store.send(.layouts(.element(id: selected, action: .selectTab(id: harness.tabs[0]))))
+    #expect(harness.contents.dropFirst().map(\.rendererReads) == Array(before.dropFirst()))
+    await harness.store.send(.hibernationPolicyChanged)
+    #expect(harness.contents.dropFirst().map(\.rendererReads) == before.dropFirst().map { $0 + 1 })
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies) func switchingWorktreesDoesNotReadUnrelatedHibernatedRenderers() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: 4)
+    for content in harness.contents.dropFirst(2) { content.hibernate() }
+    await harness.store.send(.selectedWorktreeChanged(harness.worktreeIDs[0])) {
+      $0.selectedWorktreeID = harness.worktreeIDs[0]
+      $0.recentWorktreeIDs = [harness.worktreeIDs[0]]
+      $0.hibernationArmedTabs = [harness.tabs[1]]
+    }
+    let before = harness.contents.dropFirst(2).map(\.rendererReads)
+    await harness.store.send(.selectedWorktreeChanged(harness.worktreeIDs[1])) {
+      $0.selectedWorktreeID = harness.worktreeIDs[1]
+      $0.recentWorktreeIDs = [harness.worktreeIDs[1], harness.worktreeIDs[0]]
+      $0.hibernationArmedTabs = []
+    }
+    #expect(harness.contents.dropFirst(2).map(\.rendererReads) == before)
+    await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies, arguments: [false, true])
+  func removingAWorktreeOrItsLastTabPreservesUnrelatedTimers(detach: Bool) async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: 3)
+    await harness.store.send(.selectedWorktreeChanged(harness.worktreeIDs[0])) {
+      $0.selectedWorktreeID = harness.worktreeIDs[0]
+      $0.recentWorktreeIDs = [harness.worktreeIDs[0]]
+      $0.hibernationArmedTabs = Set(harness.tabs.dropFirst())
+    }
+    let removed = harness.worktreeIDs[1]
+    let action: TerminalsFeature.Action =
+      detach
+      ? .detachLayout(worktreeID: removed)
+      : .layouts(.element(id: removed, action: .closeTab(id: harness.tabs[1])))
+    await harness.store.send(action) {
+      if detach { $0.layouts.remove(id: removed) } else { $0.layouts[id: removed]?.layout = PaneLayout() }
+      $0.hibernationArmedTabs = [harness.tabs[2]]
+    }
+    if !detach { await harness.store.receive(\.layouts) }
+    await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+    await harness.store.receive(\.hibernationGraceElapsed) { $0.hibernationArmedTabs = [] }
+    await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[2]]?.renderEpoch = 1 }
+    #expect(harness.contents[2].renderer == nil)
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies, arguments: [false, true])
+  func pressureLeavesNoTimersAfterHibernatingTwoTabsInOneLayout(parked: Bool) async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeHibernationHarness()
+    let other = Worktree.ID("/tmp/other")
+    if parked {
+      await harness.store.send(.hibernationPolicyChanged) {
+        $0.hibernationArmedTabs = [harness.selectedTab, harness.hiddenTab]
+      }
+    } else {
+      await harness.store.send(.selectedWorktreeChanged(other)) {
+        $0.selectedWorktreeID = other
+        $0.recentWorktreeIDs = [other]
+        $0.hibernationArmedTabs = [harness.selectedTab, harness.hiddenTab]
+      }
+    }
+    await harness.store.send(.memoryPressureWarning) { $0.hibernationArmedTabs = [] }
+    // A renderer-only completion must not re-arm its still-live sibling
+    // while that sibling's pressure action is queued.
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
+    }
+    await harness.store.receive(\.layouts) {
+      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
+      $0.hibernationArmedTabs = []
+    }
+    await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+    #expect(harness.selectedContent.renderer == nil)
+    #expect(harness.hiddenContent.renderer == nil)
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies) func pressureRearmsIneligibleRetainedContentWhenOtherWorktreesHibernate() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: 3)
+    var recents: [Worktree.ID] = []
+    for (index, id) in harness.worktreeIDs.enumerated() {
+      recents.insert(id, at: 0)
+      let expected = recents
+      await harness.store.send(.selectedWorktreeChanged(id)) {
+        $0.selectedWorktreeID = id
+        $0.recentWorktreeIDs = expected
+        $0.hibernationArmedTabs = Set(harness.tabs.dropFirst(index + 1))
+      }
+    }
+    harness.contents[0].claimsHibernation = false
+    await harness.store.send(.memoryPressureWarning) {
+      $0.recentWorktreeIDs = [harness.worktreeIDs[2]]
+      $0.hibernationArmedTabs = [harness.tabs[0]]
+    }
+    await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[1]]?.renderEpoch = 1 }
+    harness.contents[0].claimsHibernation = true
+    await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+    await harness.store.receive(\.hibernationGraceElapsed) { $0.hibernationArmedTabs = [] }
+    await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[0]]?.renderEpoch = 1 }
+    #expect(harness.contents[0].renderer == nil)
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies, arguments: [false, true])
+  func crossingTheTreeBackstopArmsTheEvictedWorktree(cancelImmediately: Bool) async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: ContentRetentionPolicy.maximumWorktrees + 1)
+    for content in harness.contents { content.estimatedRetentionBytes = 1 }
+    for (index, id) in harness.worktreeIDs.enumerated() {
+      let visited = Array(harness.worktreeIDs.prefix(index + 1).reversed())
+      let retained = Array(visited.prefix(ContentRetentionPolicy.maximumWorktrees))
+      let armed = Set(
+        harness.tabs.enumerated().compactMap { offset, tab in
+          retained.contains(harness.worktreeIDs[offset]) ? nil : tab
+        })
+      await harness.store.send(.selectedWorktreeChanged(id)) {
+        $0.selectedWorktreeID = id
+        $0.recentWorktreeIDs = retained
+        $0.hibernationArmedTabs = armed
+      }
+    }
+    #expect(harness.store.state.hibernationArmedTabs == [harness.tabs[0]])
+    if cancelImmediately {
+      $settingsFile.withLock { $0.global.terminalHibernationEnabled = false }
+      await harness.store.send(.hibernationPolicyChanged) { $0.hibernationArmedTabs = [] }
+      await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+      #expect(harness.contents.allSatisfy { $0.renderer != nil })
+    } else {
+      await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+      await harness.store.receive(\.hibernationGraceElapsed) { $0.hibernationArmedTabs = [] }
+      await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[0]]?.renderEpoch = 1 }
+      #expect(harness.contents[0].renderer == nil)
+    }
+    await harness.store.finish()
+  }
+
+  @Test(.dependencies) func localCostChangeReconcilesOtherEvictedWorktrees() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: 3)
+    for (index, id) in harness.worktreeIDs.enumerated() {
+      await harness.store.send(.selectedWorktreeChanged(id)) {
+        $0.selectedWorktreeID = id
+        $0.recentWorktreeIDs = Array(harness.worktreeIDs.prefix(index + 1).reversed())
+        $0.hibernationArmedTabs = Set(harness.tabs.dropFirst(index + 1))
+      }
+    }
+    harness.contents[2].estimatedRetentionBytes = ContentRetentionPolicy.testValue.budgetBytes
+    await harness.store.send(.layouts(.element(id: harness.worktreeIDs[2], action: .selectTab(id: harness.tabs[2])))) {
+      $0.recentWorktreeIDs = [harness.worktreeIDs[2]]
+      $0.hibernationArmedTabs = Set(harness.tabs.prefix(2))
+    }
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = false }
+    await harness.store.send(.hibernationPolicyChanged) { $0.hibernationArmedTabs = [] }
+    await harness.store.finish()
   }
 
   @Test(.dependencies) func cheapWorktreesRemainRetainedBeyondEightSelections() async {

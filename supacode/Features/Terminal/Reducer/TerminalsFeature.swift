@@ -1,3 +1,4 @@
+import Combine
 import ComposableArchitecture
 import Foundation
 import SupacodeSettingsShared
@@ -120,16 +121,54 @@ struct TerminalsFeature {
 
   var body: some Reducer<State, Action> {
     Reduce { state, action in
+      // Capture removed tabs before forEach runs the element reducer. Cleanup
+      // must include their timers without walking unrelated worktrees.
+      let previousTabs: Set<TabID>
+      switch action {
+      case .layouts(.element(_, .hibernateTab(let tabID))):
+        previousTabs = [tabID]
+      case .layouts(.element(let id, let action)) where Self.changeScope(action) == .structural:
+        previousTabs = Set(state.layouts[id: id]?.layout.panes.flatMap(\.tabs.ids) ?? [])
+      case .detachLayout(let id):
+        previousTabs = Set(state.layouts[id: id]?.layout.panes.flatMap(\.tabs.ids) ?? [])
+      default:
+        previousTabs = []
+      }
+      return reconciledReducer(previousTabs: previousTabs).reduce(into: &state, action: action)
+    }
+  }
+
+  private func reconciledReducer(previousTabs: Set<TabID>) -> some Reducer<State, Action> {
+    Reduce { state, action in
       switch action {
       case .layouts(.element(let worktreeID, let action)):
         // The element reducer already ran; any topology change may flip tab
         // visibility, so re-diff the grace timers and fire the app-shell
         // hooks (persistence debounce, sidebar projection).
         let scope = Self.changeScope(action)
-        let hibernation = scope == .structural ? reconcileHibernation(&state) : .none
-        return .merge(
-          hibernation,
-          .run { _ in await layoutChangeObserver.layoutChanged(worktreeID, scope) }
+        var timerCleanup: Effect<Action> = .none
+        var completedHibernation: TabID?
+        if case .hibernateTab(let tabID) = action {
+          completedHibernation = tabID
+          // A completed hibernate has no work for a grace timer. A refused
+          // hibernate can re-arm below while its renderer remains live.
+          state.hibernationDeferralLogged.remove(tabID)
+          if state.hibernationArmedTabs.remove(tabID) != nil {
+            timerCleanup = .cancel(id: HibernationTimerID.tab(tabID))
+          }
+        }
+        let hibernation =
+          scope == .structural
+          ? reconcileHibernation(
+            &state, affectedWorktrees: [worktreeID], previousTabs: previousTabs,
+            onlyTab: completedHibernation)
+          : .none
+        return .concatenate(
+          timerCleanup,
+          .merge(
+            hibernation,
+            .run { _ in await layoutChangeObserver.layoutChanged(worktreeID, scope) }
+          )
         )
 
       case .layouts:
@@ -155,12 +194,16 @@ struct TerminalsFeature {
         // the armed entries to emit their timer cancellations.
         state.layouts.remove(id: worktreeID)
         state.recentWorktreeIDs.removeAll { $0 == worktreeID }
-        return reconcileHibernation(&state)
+        return reconcileHibernation(&state, affectedWorktrees: [worktreeID], previousTabs: previousTabs)
 
       case .selectedWorktreeChanged(let worktreeID):
+        let previousSelection = state.selectedWorktreeID
         state.selectedWorktreeID = worktreeID
         Self.recordSelection(worktreeID, in: &state.recentWorktreeIDs)
-        return reconcileHibernation(&state)
+        return reconcileHibernation(
+          &state,
+          affectedWorktrees: previousSelection.map { Set([$0, worktreeID].compactMap { $0 }) }
+        )
 
       case .hibernationPolicyChanged:
         return reconcileHibernation(&state)
@@ -251,26 +294,48 @@ extension TerminalsFeature {
     guard let worktreeID else { return }
     recents.removeAll { $0 == worktreeID }
     recents.insert(worktreeID, at: 0)
-    if recents.count > ContentRetentionPolicy.maximumWorktrees {
-      recents.removeLast(recents.count - ContentRetentionPolicy.maximumWorktrees)
-    }
   }
 
-  /// Diffs the hidden set against armed timers and wakes newly visible
-  /// hibernated tabs. Cheap enough to run after every layout action.
-  private func reconcileHibernation(_ state: inout State) -> Effect<Action> {
+  /// Reconciles affected layouts plus retention changes. Initial selection and
+  /// global policy/hydration changes still establish a complete baseline.
+  private func reconcileHibernation(
+    _ state: inout State,
+    affectedWorktrees: Set<Worktree.ID>? = nil,
+    previousTabs: Set<TabID> = [],
+    onlyTab: TabID? = nil,
+    pendingHibernation: Set<TabID> = [],
+    pendingWakeCancellation: Set<TabID> = []
+  ) -> Effect<Action> {
+    let previousRetained = Set(state.recentWorktreeIDs)
     let candidates = state.recentWorktreeIDs.map { id in
       ContentRetentionPolicy.Candidate(id: id, estimatedBytes: retentionBytes(for: id, in: state))
     }
     state.recentWorktreeIDs = retentionPolicy.retained(
       candidates, selected: state.selectedWorktreeID)
+    let retentionChanged = previousRetained.symmetricDifference(state.recentWorktreeIDs)
+    let affected =
+      state.selectedWorktreeID == nil && onlyTab == nil
+      ? nil
+      : affectedWorktrees.map {
+        $0.union(retentionChanged)
+      }
+    let layouts =
+      affected.map { ids in
+        ids.sorted { $0.rawValue < $1.rawValue }.compactMap { state.layouts[id: $0] }
+      } ?? Array(state.layouts)
     @Shared(.settingsFile) var settingsFile: SettingsFile
     let enabled = settingsFile.global.terminalHibernationEnabled
     var hidden: Set<TabID> = []
     var retained: Set<TabID> = []
     var allTabs: Set<TabID> = []
     var effects: [Effect<Action>] = []
-    for layout in state.layouts {
+    for layout in layouts {
+      // A hibernate completion changes one renderer, not its siblings'
+      // visibility. In a pressure batch those siblings may still be queued
+      // for release; revisiting them would create redundant grace timers.
+      let limitsToTab =
+        onlyTab != nil && affected != nil
+        && affectedWorktrees?.contains(layout.id) == true && !retentionChanged.contains(layout.id)
       let visiblePanes = Set(layout.layout.tree.visibleLeaves())
       for pane in layout.layout.panes {
         let showsContent = Self.paneShowsContent(
@@ -279,12 +344,15 @@ extension TerminalsFeature {
           visiblePanes: visiblePanes,
           selectedWorktreeID: state.selectedWorktreeID
         )
-        for tab in pane.tabs {
+        for tab in pane.tabs where !limitsToTab || tab.id == onlyTab {
           allTabs.insert(tab.id)
           let isHidden = Self.isTabHidden(tab, pane: pane, paneShowsContent: showsContent)
           if isHidden {
             hidden.insert(tab.id)
             state.wakeRequestedTabs.remove(tab.id)
+            // Pressure already queued these renderers for release; do not
+            // arm another timer while their hibernate actions are in flight.
+            if pendingHibernation.contains(tab.id) { continue }
             guard
               !Self.recencyRetains(
                 tab,
@@ -301,7 +369,7 @@ extension TerminalsFeature {
             // spawn a surface nobody shows and nothing recency-retains; drop it
             // before the spawn lands. Scrubbing through N hibernated worktrees
             // then costs N-1 cancellations instead of N-1 full spawns.
-            if layout.wakingTabs.contains(tab.id) {
+            if layout.wakingTabs.contains(tab.id), !pendingWakeCancellation.contains(tab.id) {
               effects.append(.send(.layouts(.element(id: layout.id, action: .cancelWake(id: tab.id)))))
             }
             guard enabled, !state.hibernationArmedTabs.contains(tab.id) else { continue }
@@ -324,14 +392,24 @@ extension TerminalsFeature {
     }
     // Cancel timers for tabs that became visible, vanished, gained recency
     // cover, or lost the flag.
+    let examinedTabs = allTabs.union(previousTabs)
     for armed in state.hibernationArmedTabs
-    where !enabled || !hidden.contains(armed) || retained.contains(armed) {
+    where !enabled
+      || ((affected == nil || examinedTabs.contains(armed))
+        && (!hidden.contains(armed) || retained.contains(armed)))
+    {
       state.hibernationArmedTabs.remove(armed)
       state.hibernationDeferralLogged.remove(armed)
       effects.append(.cancel(id: HibernationTimerID.tab(armed)))
     }
-    state.wakeRequestedTabs.formIntersection(allTabs)
-    state.hibernationDeferralLogged.formIntersection(allTabs)
+    if affected == nil {
+      state.wakeRequestedTabs.formIntersection(allTabs)
+      state.hibernationDeferralLogged.formIntersection(allTabs)
+    } else {
+      let removed = previousTabs.subtracting(allTabs)
+      state.wakeRequestedTabs.subtract(removed)
+      state.hibernationDeferralLogged.subtract(removed)
+    }
     return effects.isEmpty ? .none : .merge(effects)
   }
 
@@ -359,9 +437,27 @@ extension TerminalsFeature {
   }
 
   private func armGraceTimer(worktreeID: Worktree.ID, tabID: TabID) -> Effect<Action> {
-    .run { send in
-      try await clock.sleep(for: Self.hibernationGraceWindow)
-      await send(.hibernationGraceElapsed(worktreeID: worktreeID, tabID: tabID))
+    let clock = clock
+    // Register cancellation synchronously with the subscription. An async
+    // run effect can register after a rapid selection already cancelled it,
+    // leaving a hidden timer alive until its deadline.
+    return .publisher {
+      Deferred {
+        let subject = PassthroughSubject<Action, Never>()
+        let timerTask = Task { @MainActor in
+          defer { subject.send(completion: .finished) }
+          do {
+            try await clock.sleep(for: Self.hibernationGraceWindow)
+            try Task.checkCancellation()
+            subject.send(.hibernationGraceElapsed(worktreeID: worktreeID, tabID: tabID))
+          } catch is CancellationError {
+            // Selection, closure, policy changes, and pressure cancel timers.
+          } catch {
+            Self.logger.error("Hibernation timer failed: \(error)")
+          }
+        }
+        return subject.handleEvents(receiveCancel: { timerTask.cancel() })
+      }
     }
     .cancellable(id: HibernationTimerID.tab(tabID), cancelInFlight: true)
   }
@@ -431,7 +527,9 @@ extension TerminalsFeature {
     guard settingsFile.global.terminalHibernationEnabled else { return .none }
     state.recentWorktreeIDs = state.selectedWorktreeID.map { [$0] } ?? []
     var effects: [Effect<Action>] = []
-    var swept = 0
+    var wakeCancellations: [Effect<Action>] = []
+    var pendingWakeCancellation: Set<TabID> = []
+    var pendingHibernation: Set<TabID> = []
     for layout in state.layouts {
       let visiblePanes = Set(layout.layout.tree.visibleLeaves())
       for pane in layout.layout.panes {
@@ -443,11 +541,9 @@ extension TerminalsFeature {
         )
         for tab in pane.tabs
         where Self.isTabHidden(tab, pane: pane, paneShowsContent: showsContent) {
-          // A hidden tab whose wake is still deferring has no renderer yet, so
-          // the hibernatable gate below would skip it and the spawn would land
-          // right after the pressure event — cancel the wake instead.
           if layout.wakingTabs.contains(tab.id) {
-            effects.append(.send(.layouts(.element(id: layout.id, action: .cancelWake(id: tab.id)))))
+            pendingWakeCancellation.insert(tab.id)
+            wakeCancellations.append(.send(.layouts(.element(id: layout.id, action: .cancelWake(id: tab.id)))))
           }
           guard contentRuntime.content(for: tab.content.id)?.isHibernatable == true else { continue }
           // Disarm first: a timer left over a hibernated tab would fire into
@@ -456,15 +552,23 @@ extension TerminalsFeature {
             state.hibernationDeferralLogged.remove(tab.id)
             effects.append(.cancel(id: HibernationTimerID.tab(tab.id)))
           }
-          swept += 1
+          pendingHibernation.insert(tab.id)
           effects.append(.send(.layouts(.element(id: layout.id, action: .hibernateTab(id: tab.id)))))
         }
       }
     }
-    // Each hibernate re-diffs on its way back through `.layouts`; with nothing
-    // to shed the shrunken budget still has to re-arm what it just exposed.
-    guard swept > 0 else { return reconcileHibernation(&state) }
-    Self.logger.info("Memory pressure: hibernating \(swept) hidden tabs.")
-    return .merge(effects)
+    // Pressure changes retention globally. Local hibernate completions cannot
+    // re-arm newly uncovered, temporarily ineligible content in other layouts.
+    let reconciliation = reconcileHibernation(
+      &state, pendingHibernation: pendingHibernation,
+      pendingWakeCancellation: pendingWakeCancellation)
+    if !pendingHibernation.isEmpty {
+      Self.logger.info("Memory pressure: hibernating \(pendingHibernation.count) hidden tabs.")
+    }
+    // Cancel hidden pending wakes before hibernate completions inspect their
+    // layout, so those completions cannot enqueue the same cancellation.
+    // Only immediate cancellation actions precede the release. Grace timers
+    // for ineligible content must run alongside it, never delay it.
+    return .concatenate(.merge(wakeCancellations), .merge(reconciliation, .merge(effects)))
   }
 }

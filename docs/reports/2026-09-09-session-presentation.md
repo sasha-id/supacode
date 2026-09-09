@@ -219,3 +219,41 @@ Focused verification passed 35 tests with no failures or skips, covering reducer
 grace/pressure behavior, mounted-root retention, budget overflow, deduplication,
 and the view-tree backstop. The required `make build-app` also passed. This is
 not the final optimized Release smoke test or a long-running memory benchmark.
+
+## Incremental hibernation reconciliation
+
+Local structural actions now reconcile their own worktree and any other worktree
+whose budget retention changes. Selection considers outgoing/incoming worktrees
+and retention changes. Old tab IDs are captured before the child reducer runs,
+so closing a tab or detaching a layout cancels removed work without scanning or
+discarding unrelated timers and wake requests. Initial selection, hydration,
+policy changes, and memory pressure retain full reconciliation. No persistent
+ownership index was introduced.
+
+The operation-count regression includes 256 worktrees: a local selection action
+does not query the 255 unrelated hibernated renderers, while a global policy
+action still visits them. This verifies reduced reconciliation work, not an
+end-to-end switching latency percentile.
+
+Pressure verification exposed and now covers mixed eligible/ineligible content,
+duplicate wake cancellation, and multiple queued hibernations in the same layout
+with or without a selected worktree. Renderer-only completions reconcile their
+own terminal, preventing sibling timer re-arming during a pressure batch. Pending
+wake cancellation precedes release, while ineligible-content grace timers run
+alongside it rather than delaying it.
+
+A rapid 33-worktree sequence also exposed delayed cancellation registration in
+the previous asynchronous timer effect. Grace timers now register cancellation
+synchronously through a publisher subscription that owns and cancels the clock
+task. Delivery remains on the main actor, checks cancellation after the injected
+clock sleep, and completes the subscription on every exit path.
+
+Final focused verification passed 147 tests (151 runs including parameterized
+cases), with zero failures or skips. This includes the immediate-cancellation
+variant of the rapid 33-worktree sequence, ordinary expiry, policy disable,
+pressure, close/detach, and layout lifecycle tests. `make build-app` passed.
+
+The existing deferred surface-activity reassertion remains: it compensates for
+AppKit focus reset during remount, and the current mount path does not yet offer
+an equivalent explicit readiness callback. Removing it without that replacement
+would weaken focus correctness. Reducing this work remains a separate follow-up.
