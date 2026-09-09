@@ -9,6 +9,28 @@ import Testing
 /// so no live Ghostty surface is ever reparented by a selection change.
 @MainActor
 struct WorktreeTerminalStackViewTests {
+  @Test func mountingHonorsTheCoordinatedRetentionSetBeyondEightTrees() {
+    let fixture = Fixture()
+    let retained = (0..<12).map { Worktree.ID("/tmp/repo/cheap-\($0)") }
+    for id in retained {
+      fixture.stack.select(fixture.inputs(id.rawValue), retaining: retained)
+    }
+    #expect(fixture.stack.mountedWorktreeIDs == retained)
+  }
+
+  @Test func shrinkingRetentionEvictsHiddenTreesWithoutRewritingTheSelectedRoot() {
+    let fixture = Fixture()
+    let first = fixture.inputs("/tmp/repo/wt-a")
+    let second = fixture.inputs("/tmp/repo/wt-b")
+    fixture.select(first)
+    fixture.select(second)
+    let writes = fixture.stack.hostedRootWrites
+    fixture.stack.select(second, retaining: [])
+    #expect(fixture.stack.mountedWorktreeIDs == [second.worktree.id])
+    #expect(fixture.stack.hostedView(for: first.worktree.id) == nil)
+    #expect(fixture.stack.hostedRootWrites == writes)
+  }
+
   /// The shared references a stack's inputs carry, minted once per test so
   /// only the worktree distinguishes two input values.
   @MainActor
@@ -25,6 +47,11 @@ struct WorktreeTerminalStackViewTests {
       manager = WorktreeTerminalManager(runtime: runtime)
       terminalsStore = Store(initialState: TerminalsFeature.State()) { TerminalsFeature() }
       shortcuts = GhosttyShortcutManager(runtime: runtime)
+    }
+
+    func select(_ inputs: WorktreeTerminalInputs?) {
+      terminalsStore.send(.selectedWorktreeChanged(inputs?.worktree.id))
+      stack.select(inputs, retaining: terminalsStore.withState { $0.recentWorktreeIDs })
     }
 
     func inputs(_ id: String) -> WorktreeTerminalInputs {
@@ -49,10 +76,10 @@ struct WorktreeTerminalStackViewTests {
     let fixture = Fixture()
     let inputs = fixture.inputs("/tmp/repo/wt-a")
 
-    fixture.stack.select(inputs)
+    fixture.select(inputs)
     #expect(fixture.stack.hostedRootWrites == 1)
 
-    fixture.stack.select(inputs)
+    fixture.select(inputs)
     #expect(fixture.stack.hostedRootWrites == 1)
     #expect(fixture.stack.mountedWorktreeIDs == [inputs.worktree.id])
   }
@@ -62,9 +89,9 @@ struct WorktreeTerminalStackViewTests {
     let first = fixture.inputs("/tmp/repo/wt-a")
     let second = fixture.inputs("/tmp/repo/wt-b")
 
-    fixture.stack.select(first)
+    fixture.select(first)
     let firstHost = fixture.stack.hostedView(for: first.worktree.id)
-    fixture.stack.select(second)
+    fixture.select(second)
 
     #expect(fixture.stack.selectedWorktreeID == second.worktree.id)
     // Same view object, still in the hierarchy: nothing it hosts was detached,
@@ -80,10 +107,10 @@ struct WorktreeTerminalStackViewTests {
     let first = fixture.inputs("/tmp/repo/wt-a")
     let second = fixture.inputs("/tmp/repo/wt-b")
 
-    fixture.stack.select(first)
+    fixture.select(first)
     let firstHost = fixture.stack.hostedView(for: first.worktree.id)
-    fixture.stack.select(second)
-    fixture.stack.select(first)
+    fixture.select(second)
+    fixture.select(first)
 
     #expect(fixture.stack.hostedView(for: first.worktree.id) === firstHost)
     #expect(firstHost?.isHidden == false)
@@ -122,12 +149,12 @@ struct WorktreeTerminalStackViewTests {
     let first = fixture.inputs("/tmp/repo/wt-a")
     let second = fixture.inputs("/tmp/repo/wt-b")
 
-    fixture.stack.select(first)
-    fixture.stack.select(second)
+    fixture.select(first)
+    fixture.select(second)
     let firstHost = fixture.stack.hostedView(for: first.worktree.id)
     let secondHost = fixture.stack.hostedView(for: second.worktree.id)
 
-    fixture.stack.select(nil)
+    fixture.select(nil)
 
     #expect(fixture.stack.selectedWorktreeID == nil)
     #expect(fixture.stack.hostedView(for: first.worktree.id) === firstHost)
@@ -137,7 +164,7 @@ struct WorktreeTerminalStackViewTests {
     #expect(firstHost?.isHidden == true)
     #expect(secondHost?.isHidden == true)
 
-    fixture.stack.select(second)
+    fixture.select(second)
     #expect(fixture.stack.hostedView(for: second.worktree.id) === secondHost)
     #expect(secondHost?.isHidden == false)
     #expect(fixture.stack.mountedWorktreeIDs == [first.worktree.id, second.worktree.id])
@@ -145,13 +172,13 @@ struct WorktreeTerminalStackViewTests {
 
   @Test func mountingPastTheLimitEvictsTheLeastRecentlySelected() {
     let fixture = Fixture()
-    let visited = (0...WorktreeTerminalStackView.mountLimit).map { fixture.inputs("/tmp/repo/wt-\($0)") }
+    let visited = (0...8).map { fixture.inputs("/tmp/repo/wt-\($0)") }
 
     for inputs in visited {
-      fixture.stack.select(inputs)
+      fixture.select(inputs)
     }
 
-    #expect(fixture.stack.mountedWorktreeIDs.count == WorktreeTerminalStackView.mountLimit)
+    #expect(fixture.stack.mountedWorktreeIDs.count == 8)
     #expect(fixture.stack.hostedView(for: visited[0].worktree.id) == nil)
     #expect(fixture.stack.selectedWorktreeID == visited[visited.count - 1].worktree.id)
   }

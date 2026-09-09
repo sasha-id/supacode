@@ -31,14 +31,6 @@ struct TerminalsFeature {
   /// Grace window a tab must stay hidden before it hibernates.
   static let hibernationGraceWindow: Duration = .seconds(5 * 60)
 
-  /// How many most-recently-selected worktrees keep their visible tabs live no
-  /// matter how long they stay deselected. Switching inside that set costs no
-  /// wake at all, which is the interaction the clock alone traded away. Matches
-  /// `WorktreeTerminalStackView.mountLimit`: a tree that is still mounted but
-  /// whose surface was freed is the case that shows a blank pane on the way
-  /// back, so the two bounds move together.
-  static let liveWorktreeLimit = 8
-
   /// Per-tab cancellation key for the hibernation grace timer.
   nonisolated enum HibernationTimerID: Hashable, Sendable {
     case tab(TabID)
@@ -58,8 +50,8 @@ struct TerminalsFeature {
     /// The selected worktree; only its panes' selected tabs are visible, so
     /// everything else is a hibernation candidate.
     var selectedWorktreeID: Worktree.ID?
-    /// Most-recently-selected worktrees, newest first, capped at
-    /// `liveWorktreeLimit`. Their visible panes' selected tabs never arm a
+    /// Most-recently-selected worktrees, newest first, within the optional
+    /// renderer retention budget. Their visible panes' selected tabs never arm a
     /// grace timer, so switching back among them is a visibility change.
     var recentWorktreeIDs: [Worktree.ID] = []
     /// Tabs with an armed hibernation grace timer.
@@ -121,6 +113,7 @@ struct TerminalsFeature {
   }
 
   @Dependency(ContentRuntime.self) private var contentRuntime
+  @Dependency(ContentRetentionPolicy.self) private var retentionPolicy
   @Dependency(LayoutChangeObserver.self) private var layoutChangeObserver
   @Dependency(MemoryPressureClient.self) private var memoryPressure
   @Dependency(\.continuousClock) private var clock
@@ -251,21 +244,26 @@ extension TerminalsFeature {
     return recentWorktreeIDs.contains(layout.id)
   }
 
-  /// Moves a selection to the front of the recency list, capped at
-  /// `liveWorktreeLimit`. Deselecting keeps the list, so the worktree just left
+  /// Moves a selection to the front of the candidate list. Deselecting keeps
+  /// the list, so the worktree just left
   /// stays the most recent.
   private static func recordSelection(_ worktreeID: Worktree.ID?, in recents: inout [Worktree.ID]) {
     guard let worktreeID else { return }
     recents.removeAll { $0 == worktreeID }
     recents.insert(worktreeID, at: 0)
-    if recents.count > liveWorktreeLimit {
-      recents.removeLast(recents.count - liveWorktreeLimit)
+    if recents.count > ContentRetentionPolicy.maximumWorktrees {
+      recents.removeLast(recents.count - ContentRetentionPolicy.maximumWorktrees)
     }
   }
 
   /// Diffs the hidden set against armed timers and wakes newly visible
   /// hibernated tabs. Cheap enough to run after every layout action.
   private func reconcileHibernation(_ state: inout State) -> Effect<Action> {
+    let candidates = state.recentWorktreeIDs.map { id in
+      ContentRetentionPolicy.Candidate(id: id, estimatedBytes: retentionBytes(for: id, in: state))
+    }
+    state.recentWorktreeIDs = retentionPolicy.retained(
+      candidates, selected: state.selectedWorktreeID)
     @Shared(.settingsFile) var settingsFile: SettingsFile
     let enabled = settingsFile.global.terminalHibernationEnabled
     var hidden: Set<TabID> = []
@@ -335,6 +333,23 @@ extension TerminalsFeature {
     state.wakeRequestedTabs.formIntersection(allTabs)
     state.hibernationDeferralLogged.formIntersection(allTabs)
     return effects.isEmpty ? .none : .merge(effects)
+  }
+
+  private func retentionBytes(for worktreeID: Worktree.ID, in state: State) -> UInt64 {
+    guard let layout = state.layouts[id: worktreeID] else {
+      return ContentRetentionPolicy.unknownContentBytes
+    }
+    var bytes: UInt64 = 0
+    for paneID in layout.layout.tree.visibleLeaves() {
+      guard let tab = layout.layout.panes[id: paneID]?.selectedTab else { continue }
+      let cost =
+        contentRuntime.content(for: tab.content.id)?.estimatedRetentionBytes
+        ?? ContentRetentionPolicy.unknownContentBytes
+      let (total, overflow) = bytes.addingReportingOverflow(cost)
+      if overflow { return .max }
+      bytes = total
+    }
+    return bytes == 0 ? ContentRetentionPolicy.unknownContentBytes : bytes
   }
 
   /// True when a visible tab's content has no live renderer to show.

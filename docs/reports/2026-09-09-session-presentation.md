@@ -50,10 +50,10 @@ how much time belongs to surface construction, layout, or zmx replay.
 
 ## Deliberate limits
 
-The eight-worktree retained-host policy remains unchanged. Increasing it without
-memory-pressure measurements trades cold restores for potentially substantial
-terminal/GPU memory. The cover makes that resource-saving policy visible without
-pretending cold construction has become free.
+The original eight-worktree retained-host bound is superseded by the measured,
+resource-aware policy described below. Retention still trades cold restores for
+terminal/GPU memory. The cover makes eviction visible without pretending cold
+construction has become free.
 
 Frame availability is not physical display scan-out, and is not zmx replay
 completion. This change does not add a replay-completion protocol or delay terminal
@@ -153,3 +153,69 @@ and zero skips, verified from the test-result bundle. It includes native hosting
 of first provision, replacement under the same content ID, and hibernate/rewake
 without rewriting the root view or relying on a layout render epoch. Functional
 coverage does not replace the remaining optimized switching workload checks.
+
+## Optimized native construction measurements
+
+An isolated Release test host, with Swift optimization enabled and no DEBUG
+condition, measured five fresh constructions per layout at an 800 × 600 point
+viewport. The four-pane layout divides the same area into quarters. The test
+uses disposable `/bin/cat` terminals and does not measure zmx replay or agent UI
+redraws. Run the probe alone with parallel testing disabled; concurrent test
+hosts produced first-split outliers that did not recur in the isolated run.
+
+| Layout | Construction min / median / max | First frame min / median / max |
+| --- | --- | --- |
+| One pane | 5.15 / 8.72 / 17.10 ms | 13.97 / 16.78 / 30.50 ms |
+| Four panes | 28.25 / 29.06 / 29.70 ms | 38.74 / 39.85 / 43.90 ms |
+
+These small samples establish an initial cost range, not reliable tail-latency
+percentiles. First-frame readiness is still not physical display scan-out.
+
+A subsequent isolated comparison retained or closed five successive layouts,
+then allowed 200 ms for compositor/autorelease cleanup before reading process
+physical footprint. Five retained one-pane layouts added approximately 321 MiB
+(64 MiB each); five retained four-pane layouts added approximately 458 MiB
+(92 MiB each). Closing the renderers instead left approximately 10 MiB and 3 MiB
+over each case's initial footprint. Immediate create/destroy samples temporarily
+grew much larger, so they must not be treated as steady retained-renderer cost
+or as proof of a leak. Longer-lived workload measurements remain necessary.
+
+The displayed IOSurfaces totaled approximately 7.33 MiB for one pane and
+7.38 MiB for four panes. This is only one displayed target per renderer, not all
+swap-chain buffers, atlases, compositor copies, scrollback, or cached resources.
+A retention estimate therefore needs both viewport size and per-renderer
+overhead; displayed-target bytes alone substantially undercount the observed
+footprint. Any resulting budget is a soft renderer-retention budget, not a hard
+process-memory limit.
+
+The profiling test is `GhosttySurfaceViewTests.profileColdConstruction`, enabled
+only by `SUPACODE_PROFILE_TERMINAL=1`. Release test builds also define
+`SUPACODE_TESTING` to expose an existing test-support accessor without enabling
+DEBUG logging. Neither flag is required by normal production builds.
+
+## Resource-aware retention
+
+The reducer budgets recently selected worktrees by their selected-pane renderer
+cost instead of a fixed count of eight. The estimate uses eight times displayed
+IOSurface bytes plus 12 MiB per renderer, conservatively fitted to the isolated
+measurements above. A hibernated renderer uses its recorded backing dimensions;
+unavailable content uses a 64 MiB estimate. The budget is one thirty-second of
+physical RAM, clamped to 256 MiB–1 GiB, with a separate 32-worktree view-tree cap.
+Selection survives even when its estimate exceeds the entire budget. More
+expensive older candidates can be skipped to retain affordable recent sessions.
+
+Mounted trees consume the reducer's retained list, so an independent eight-tree
+UI limit cannot undo that decision. Trimming hidden roots does not rewrite the
+selected root. Transient loading/multi-selection still parks the existing trees.
+
+This is a conservative selected-pane residency estimate, not exact avoidable
+memory accounting: floating and nonhibernatable content can be counted despite
+remaining live independently of recency. Existing visibility and eligibility
+checks remain authoritative. Normal eviction still observes the five-minute
+hibernation grace period; memory pressure retains the existing immediate sweep.
+Neither the budget nor its estimate is a hard process-memory ceiling.
+
+Focused verification passed 35 tests with no failures or skips, covering reducer
+grace/pressure behavior, mounted-root retention, budget overflow, deduplication,
+and the view-tree backstop. The required `make build-app` also passed. This is
+not the final optimized Release smoke test or a long-running memory benchmark.

@@ -1,6 +1,8 @@
 import AppKit
+import Darwin
 import Foundation
 import GhosttyKit
+import IOSurface
 import SupacodeSettingsShared
 import Testing
 
@@ -8,6 +10,113 @@ import Testing
 
 @MainActor
 struct GhosttySurfaceViewTests {
+  /// Opt-in native construction workload. Disposable windows never take
+  /// keyboard focus; this measures native creation, not zmx replay completion.
+  @Test(.serialized, .enabled(if: TerminalPerformance.enabled), arguments: [1, 4], [false, true])
+  func profileColdConstruction(paneCount: Int, keepResident: Bool) async throws {
+    let runtime = GhosttyRuntime()
+    let logger = SupaLogger("TerminalPerformance")
+    await Self.settleNativeCleanup()
+    let initialFootprint = Self.physicalFootprint()
+    var retained: [GhosttySurfaceView] = []
+    defer { for view in retained { view.closeSurface() } }
+    for iteration in 0..<5 {
+      let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+        styleMask: .borderless, backing: .buffered, defer: false)
+      let container = NSView(frame: window.contentLayoutRect)
+      window.contentView = container
+      var views: [GhosttySurfaceView] = []
+      defer {
+        window.orderOut(nil)
+        window.contentView = nil
+        if keepResident {
+          retained.append(contentsOf: views)
+        } else {
+          for view in views { view.closeSurface() }
+        }
+      }
+      let columns = paneCount == 1 ? 1 : 2
+      let size = CGSize(width: 800 / columns, height: 600 / columns)
+      let geometry = try #require(
+        ContentGeometry.candidate(pointSize: size, scale: window.backingScaleFactor))
+      let footprintBefore = Self.physicalFootprint()
+      let started = ProcessInfo.processInfo.systemUptime
+      for index in 0..<paneCount {
+        let view = GhosttySurfaceView(
+          id: UUID(), runtime: runtime, workingDirectory: nil,
+          command: "/bin/cat", disableShellIntegration: true,
+          initialGeometry: geometry, context: GHOSTTY_SURFACE_CONTEXT_WINDOW)
+        views.append(view)
+        _ = try #require(
+          view.surface, "Native profiling requires an active display and a valid surface.")
+        let hosted = view.hostedView()
+        hosted.frame = NSRect(
+          x: CGFloat(index % columns) * size.width, y: CGFloat(index / columns) * size.height,
+          width: size.width, height: size.height)
+        container.addSubview(hosted)
+      }
+      let constructionMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+      window.orderFront(nil)
+      container.layoutSubtreeIfNeeded()
+      for view in views { view.preparePresentation() }
+      for view in views {
+        let surface = try #require(view.surface)
+        await withCheckedContinuation { continuation in
+          guard view.presentation.isCovered else {
+            continuation.resume()
+            return
+          }
+          let updateCover = view.presentation.onChange
+          view.presentation.onChange = {
+            updateCover?()
+            guard !view.presentation.isCovered else { return }
+            view.presentation.onChange = updateCover
+            continuation.resume()
+          }
+          ghostty_surface_draw(surface)
+        }
+      }
+      let readyMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+      var displayedTargetBytes = 0
+      for view in views {
+        let surface = try #require(view.layer?.contents as? IOSurface)
+        displayedTargetBytes += surface.allocationSize
+      }
+      logger.info(
+        "Cold construction: panes=\(paneCount) retained=\(keepResident) iteration=\(iteration) construction_ms=\(constructionMilliseconds) first_frame_ms=\(readyMilliseconds) displayed_target_bytes=\(displayedTargetBytes) footprint_before=\(Self.formatBytes(footprintBefore)) footprint_after=\(Self.formatBytes(Self.physicalFootprint()))"
+      )
+    }
+    await Self.settleNativeCleanup()
+    logger.info(
+      "Cold retained footprint: panes=\(paneCount) retained=\(keepResident) live_renderers=\(retained.count) initial_bytes=\(Self.formatBytes(initialFootprint)) settled_bytes=\(Self.formatBytes(Self.physicalFootprint()))"
+    )
+  }
+
+  private static func settleNativeCleanup() async {
+    // This opt-in workload uses a fixed real-time settling interval, not a CI
+    // timing assertion. Allow compositor/autorelease cleanup before sampling.
+    await withCheckedContinuation { continuation in
+      DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) { continuation.resume() }
+    }
+  }
+
+  private static func formatBytes(_ bytes: UInt64?) -> String {
+    bytes.map(String.init) ?? "unavailable"
+  }
+
+  private static func physicalFootprint() -> UInt64? {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+      MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let status = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+      }
+    }
+    return status == KERN_SUCCESS ? info.phys_footprint : nil
+  }
+
   @Test func nativeFrameReleasesPresentationCover() async throws {
     let runtime = GhosttyRuntime()
     let geometry = try #require(ContentGeometry.candidate(pointSize: CGSize(width: 800, height: 600), scale: 2))

@@ -7,6 +7,68 @@ import Testing
 
 @testable import supacode
 
+struct ContentRetentionPolicyTests {
+  @Test func rendererEstimateIncludesOverheadAndSaturatesOnOverflow() {
+    #expect(
+      ContentRetentionPolicy.terminalBytes(displayedTargetBytes: 1_024) == 12 * 1_024 * 1_024
+        + 8_192)
+    #expect(ContentRetentionPolicy.terminalBytes(displayedTargetBytes: .max) == .max)
+    #expect(ContentRetentionPolicy.terminalBytes(displayedTargetBytes: .max / 8) == .max)
+  }
+
+  @Test func viewTreeBackstopAppliesEvenWhenEveryCandidateIsFree() {
+    let candidates = (0..<40).map {
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("/tmp/free-\($0)"), estimatedBytes: 0)
+    }
+    let retained = ContentRetentionPolicy(budgetBytes: .max).retained(
+      candidates, selected: candidates.last?.id)
+    #expect(retained.count == ContentRetentionPolicy.maximumWorktrees)
+    #expect(retained.first == candidates.last?.id)
+    #expect(Set(retained).count == retained.count)
+  }
+
+  @Test func duplicateCandidatesConsumeTheirBudgetOnlyOnce() {
+    let candidate = ContentRetentionPolicy.Candidate(
+      id: Worktree.ID("duplicate"), estimatedBytes: 40)
+    let other = ContentRetentionPolicy.Candidate(id: Worktree.ID("other"), estimatedBytes: 50)
+    #expect(
+      ContentRetentionPolicy(budgetBytes: 100).retained(
+        [candidate, candidate, other], selected: nil) == [candidate.id, other.id])
+  }
+
+  @Test func cheapSessionsSurviveBeyondEightWorktrees() {
+    let policy = ContentRetentionPolicy(budgetBytes: 100)
+    let candidates = (0..<12).map {
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("/tmp/cheap-\($0)"), estimatedBytes: 5)
+    }
+    #expect(policy.retained(candidates, selected: candidates[0].id) == candidates.map(\.id))
+  }
+
+  @Test func oversizedOlderSessionsDoNotDisplaceAffordableRecentContent() {
+    let policy = ContentRetentionPolicy(budgetBytes: 100)
+    let candidates = [
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("selected"), estimatedBytes: 40),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("expensive"), estimatedBytes: 80),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("affordable"), estimatedBytes: 50),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("over-budget"), estimatedBytes: 20),
+    ]
+    #expect(
+      policy.retained(candidates, selected: Worktree.ID("selected")) == [
+        Worktree.ID("selected"), Worktree.ID("affordable"),
+      ])
+  }
+
+  @Test func selectionSurvivesEvenWhenItExceedsTheBudget() {
+    let policy = ContentRetentionPolicy(budgetBytes: 100)
+    let candidates = [
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("old"), estimatedBytes: 10),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("selected"), estimatedBytes: .max),
+    ]
+    #expect(
+      policy.retained(candidates, selected: Worktree.ID("selected")) == [Worktree.ID("selected")])
+  }
+}
+
 @MainActor
 struct TerminalsFeatureTests {
   /// Minimal live content whose renderer and eligibility the tests control.
@@ -16,6 +78,7 @@ struct TerminalsFeatureTests {
     let kind: ContentKind = .terminal
     /// Eligibility knob for the fire-time re-arm path.
     var claimsHibernation = true
+    var estimatedRetentionBytes = ContentRetentionPolicy.unknownContentBytes
     private(set) var startCalls = 0
     private var view: NSView?
     private let state: TerminalContentState
@@ -290,7 +353,7 @@ struct TerminalsFeatureTests {
     }
     // Scrub past the recency window before the wake's deferral elapses; every
     // hop but the last keeps the worktree retained, the last drops its cover.
-    let limit = TerminalsFeature.liveWorktreeLimit
+    let limit = 8
     let others = (1...limit).map { Worktree.ID("/tmp/other-\($0)") }
     var recents = [harness.worktreeID]
     for (index, other) in others.enumerated() {
@@ -595,6 +658,30 @@ struct TerminalsFeatureTests {
     )
   }
 
+  @Test(.dependencies) func cheapWorktreesRemainRetainedBeyondEightSelections() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
+    let harness = makeRecencyHarness(count: 12)
+    for content in harness.contents { content.estimatedRetentionBytes = 1 }
+    var recents: [Worktree.ID] = []
+    for (index, id) in harness.worktreeIDs.enumerated() {
+      recents.insert(id, at: 0)
+      let expected = recents
+      let neverSelected = Set(harness.tabs.dropFirst(index + 1))
+      await harness.store.send(.selectedWorktreeChanged(id)) {
+        $0.selectedWorktreeID = id
+        $0.recentWorktreeIDs = expected
+        $0.hibernationArmedTabs = neverSelected
+      }
+    }
+    #expect(harness.store.state.recentWorktreeIDs.count == 12)
+    await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
+    #expect(harness.contents.allSatisfy { $0.renderer != nil })
+    $settingsFile.withLock { $0.global.terminalHibernationEnabled = false }
+    await harness.store.send(.hibernationPolicyChanged)
+    await harness.store.finish()
+  }
+
   @Test(.dependencies) func recentlySelectedWorktreesSurviveTheGraceWindow() async {
     @Shared(.settingsFile) var settingsFile
     $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
@@ -620,7 +707,7 @@ struct TerminalsFeatureTests {
   @Test(.dependencies) func worktreesEvictedFromTheRecencyWindowHibernate() async {
     @Shared(.settingsFile) var settingsFile
     $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
-    let count = TerminalsFeature.liveWorktreeLimit + 1
+    let count = 9
     let harness = makeRecencyHarness(count: count)
     // Every worktree past the first starts unseen, so selecting the first arms
     // all of them; each later selection cancels its own timer.

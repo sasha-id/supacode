@@ -49,28 +49,35 @@ struct WorktreeTerminalRoot: View {
 /// Mounts the selected worktree's terminal tree and keeps the recently visited
 /// ones mounted but hidden, so selecting another worktree flips visibility
 /// instead of tearing the hosting chain down and reparenting live surfaces.
-struct WorktreeTerminalStack: NSViewRepresentable {
+struct WorktreeTerminalStack: View {
   /// nil parks the stack: every tree stays mounted but hidden, so a transient
   /// detail state (loading, multi-selection, archived list) never tears the
   /// hosting chain down.
   let inputs: WorktreeTerminalInputs?
+
+  var body: some View {
+    WorktreeTerminalStackBridge(
+      inputs: inputs,
+      retainedWorktreeIDs: inputs?.terminalsStore.recentWorktreeIDs ?? []
+    )
+  }
+}
+
+private struct WorktreeTerminalStackBridge: NSViewRepresentable {
+  let inputs: WorktreeTerminalInputs?
+  let retainedWorktreeIDs: [Worktree.ID]
 
   func makeNSView(context: Context) -> WorktreeTerminalStackView {
     WorktreeTerminalStackView()
   }
 
   func updateNSView(_ nsView: WorktreeTerminalStackView, context: Context) {
-    nsView.select(inputs)
+    nsView.select(inputs, retaining: retainedWorktreeIDs)
   }
 }
 
 @MainActor
 final class WorktreeTerminalStackView: NSView {
-  /// Trees kept mounted past deselection, so the common back-and-forth costs
-  /// nothing. Bounds the resident view trees; switching past this many
-  /// worktrees only pays the remount that every switch used to pay.
-  static let mountLimit = 8
-
   private var hosted: [Worktree.ID: NSHostingView<WorktreeTerminalRoot>] = [:]
   /// Mounted worktrees, least recently selected first.
   private var mountOrder: [Worktree.ID] = []
@@ -91,7 +98,7 @@ final class WorktreeTerminalStackView: NSView {
     hosted[worktreeID]
   }
 
-  func select(_ inputs: WorktreeTerminalInputs?) {
+  func select(_ inputs: WorktreeTerminalInputs?, retaining retainedWorktreeIDs: [Worktree.ID]) {
     let interval = TerminalPerformance.begin("Worktree host selection")
     defer { TerminalPerformance.end("Worktree host selection", interval) }
     guard let inputs else {
@@ -132,7 +139,7 @@ final class WorktreeTerminalStackView: NSView {
       // Parking took the keyboard away by hand; selecting again gives it back.
       inputs.manager.hostIfExists(for: worktreeID)?.focusSelectedTab()
     }
-    evictBeyondMountLimit()
+    evictOutsideRetention(Set(retainedWorktreeIDs).union([worktreeID]))
   }
 
   /// Deselects and hides the current tree without unmounting anything; the
@@ -213,10 +220,10 @@ final class WorktreeTerminalStackView: NSView {
     return hosting
   }
 
-  private func evictBeyondMountLimit() {
-    while mountOrder.count > Self.mountLimit {
-      let evicted = mountOrder.removeFirst()
+  private func evictOutsideRetention(_ retained: Set<Worktree.ID>) {
+    for evicted in mountOrder where !retained.contains(evicted) {
       hosted.removeValue(forKey: evicted)?.removeFromSuperview()
     }
+    mountOrder.removeAll { !retained.contains($0) }
   }
 }

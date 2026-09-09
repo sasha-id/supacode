@@ -5,6 +5,7 @@ import SupacodeSettingsShared
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor
 final class GhosttyRuntime {
   private static let logger = SupaLogger("Ghostty")
 

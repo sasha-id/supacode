@@ -1,4 +1,5 @@
 import AppKit
+import IOSurface
 
 /// A tab's live content: stable identity, a renderer once the session has
 /// started, and enough recorded state to snapshot across hibernation.
@@ -14,6 +15,8 @@ protocol TabContent: AnyObject {
   /// Whether the renderer can be torn down with the session surviving (a
   /// terminal whose process lives in zmx).
   var isHibernatable: Bool { get }
+  /// Estimated live or restored renderer cost for the optional retention budget.
+  var estimatedRetentionBytes: UInt64 { get }
   /// Spawns the session eagerly at an explicit geometry; a second call while
   /// the renderer is alive is a no-op.
   func startSession(at geometry: ContentGeometry)
@@ -38,6 +41,7 @@ extension TabContent {
   // Hibernation is opt-in: only content whose session outlives the renderer
   // may claim it.
   var isHibernatable: Bool { false }
+  var estimatedRetentionBytes: UInt64 { ContentRetentionPolicy.unknownContentBytes }
   // Renderless content has nothing to release.
   func tearDown() {}
   // Chrome is opt-in per content kind.
@@ -161,6 +165,19 @@ final class TerminalContent: TabContent {
   }
 
   var renderer: NSView? { surfaceView }
+
+  var estimatedRetentionBytes: UInt64 {
+    if let target = surfaceView?.layer?.contents as? IOSurface {
+      return ContentRetentionPolicy.terminalBytes(
+        displayedTargetBytes: UInt64(max(0, target.allocationSize)))
+    }
+    let size =
+      state.frozenGrid.map { CGSize(width: $0.backingWidth, height: $0.backingHeight) }
+      ?? ContentGeometry.fallback.pixelSize
+    let bytes = size.width * size.height * 4
+    guard bytes.isFinite, bytes > 0, bytes < Double(UInt64.max) else { return .max }
+    return ContentRetentionPolicy.terminalBytes(displayedTargetBytes: UInt64(bytes.rounded(.up)))
+  }
 
   // Hibernated terminals have no live surface, so nothing is interruptible.
   // A locked tab (completed blocking script) parks its runner alive, so
