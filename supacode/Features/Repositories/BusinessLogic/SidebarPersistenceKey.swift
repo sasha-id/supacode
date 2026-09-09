@@ -51,22 +51,27 @@ nonisolated struct SidebarKey: SharedKey {
 
   func save(
     _ value: SidebarState,
-    context _: SaveContext,
+    context: SaveContext,
     continuation: SaveContinuation
   ) {
     @Dependency(\.defaultAppStorage) var store
     let destination = Destination(defaults: store)
-    PersistenceQueue.shared.enqueue {
-      do {
+    let key = PersistenceQueue.CoalescingKey(owner: store, name: Self.storageKey)
+    PersistenceQueue.shared.save(
+      coalescing: context == .didSet ? key : nil,
+      operation: {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         destination.defaults.set(try encoder.encode(value), forKey: Self.storageKey)
-        continuation.resume()
-      } catch {
-        Self.logger.error("Failed to persist sidebar state to UserDefaults: \(error)")
-        continuation.resume(throwing: error)
-      }
-    }
+      },
+      completion: { result in
+        switch result {
+        case .success: continuation.resume()
+        case .failure(let error):
+          Self.logger.error("Failed to persist sidebar state to UserDefaults: \(error)")
+          continuation.resume(throwing: error)
+        }
+      })
   }
 
   // UserDefaults is thread-safe; preserve the dependency-selected suite when

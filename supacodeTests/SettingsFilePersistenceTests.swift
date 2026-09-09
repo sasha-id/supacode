@@ -8,7 +8,311 @@ import Testing
 @testable import SupacodeSettingsShared
 @testable import supacode
 
+struct PersistenceQueueTests {
+  @Test func distinctDestinationsNeverSupersedeEachOther() {
+    let queue = PersistenceQueue()
+    let gate = DispatchSemaphore(value: 0)
+    queue.enqueue { gate.wait() }
+    let first = NSObject()
+    let second = NSObject()
+    let keys = [
+      PersistenceQueue.CoalescingKey(owner: first, name: "settings"),
+      PersistenceQueue.CoalescingKey(owner: second, name: "settings"),
+      PersistenceQueue.CoalescingKey(owner: first, name: "sidebar"),
+    ]
+    let writes = Mutex<[Int]>([])
+    for value in 0..<6 {
+      queue.save(coalescing: keys[value % 3], operation: { writes.withLock { $0.append(value) } }) { result in
+        #expect(throws: Never.self) { try result.get() }
+      }
+    }
+    gate.signal()
+    queue.flush()
+    #expect(writes.withLock { $0 } == [3, 4, 5])
+  }
+
+  @Test func coalescedFailureReachesEveryCallerAndDoesNotPoisonNextSave() {
+    enum WriteFailure: Error { case unavailable }
+    let queue = PersistenceQueue()
+    let gate = DispatchSemaphore(value: 0)
+    queue.enqueue { gate.wait() }
+    let owner = NSObject()
+    let key = PersistenceQueue.CoalescingKey(owner: owner, name: "settings")
+    let failures = Mutex<[Int]>([])
+    let attempts = Mutex(0)
+    for value in 1...3 {
+      queue.save(
+        coalescing: key,
+        operation: {
+          attempts.withLock { $0 += 1 }
+          throw WriteFailure.unavailable
+        }
+      ) { result in
+        #expect(throws: WriteFailure.self) { try result.get() }
+        failures.withLock { $0.append(value) }
+      }
+    }
+    gate.signal()
+    queue.flush()
+    #expect(attempts.withLock { $0 } == 1)
+    #expect(failures.withLock { $0 } == [1, 2, 3])
+    let recovered = Mutex(false)
+    queue.save(coalescing: key, operation: {}) { result in
+      #expect(throws: Never.self) { try result.get() }
+      recovered.withLock { $0 = true }
+    }
+    queue.flush()
+    #expect(recovered.withLock { $0 })
+  }
+
+  @Test func aRunningSaveCannotAbsorbLaterSnapshots() {
+    let queue = PersistenceQueue()
+    let started = DispatchSemaphore(value: 0)
+    let finish = DispatchSemaphore(value: 0)
+    let owner = NSObject()
+    let key = PersistenceQueue.CoalescingKey(owner: owner, name: "settings")
+    let writes = Mutex<[Int]>([])
+    queue.save(
+      coalescing: key,
+      operation: {
+        started.signal()
+        finish.wait()
+        writes.withLock { $0.append(1) }
+      }
+    ) { result in
+      #expect(throws: Never.self) { try result.get() }
+    }
+    #expect(started.wait(timeout: .now() + 5) == .success)
+    for value in 2...3 {
+      queue.save(coalescing: key, operation: { writes.withLock { $0.append(value) } }) { result in
+        #expect(throws: Never.self) { try result.get() }
+      }
+    }
+    finish.signal()
+    queue.flush()
+    #expect(writes.withLock { $0 } == [1, 3])
+  }
+
+  @Test func pendingAutomaticSavesKeepLatestValueAndCompleteEveryCaller() {
+    let queue = PersistenceQueue()
+    let gate = DispatchSemaphore(value: 0)
+    queue.enqueue { gate.wait() }
+    let owner = NSObject()
+    let key = PersistenceQueue.CoalescingKey(owner: owner, name: "settings")
+    let writes = Mutex<[Int]>([])
+    let completed = Mutex<[Int]>([])
+    for value in 1...3 {
+      queue.save(coalescing: key, operation: { writes.withLock { $0.append(value) } }) { result in
+        #expect(throws: Never.self) { try result.get() }
+        completed.withLock { $0.append(value) }
+      }
+    }
+    gate.signal()
+    queue.flush()
+    #expect(writes.withLock { $0 } == [3])
+    #expect(completed.withLock { $0 } == [1, 2, 3])
+  }
+
+  @Test func explicitSaveSeparatesAutomaticBatches() {
+    let queue = PersistenceQueue()
+    let gate = DispatchSemaphore(value: 0)
+    queue.enqueue { gate.wait() }
+    let owner = NSObject()
+    let key = PersistenceQueue.CoalescingKey(owner: owner, name: "settings")
+    let writes = Mutex<[Int]>([])
+    for (value, automatic) in [(1, true), (2, false), (3, true), (4, true)] {
+      queue.save(coalescing: automatic ? key : nil, operation: { writes.withLock { $0.append(value) } }) { result in
+        #expect(throws: Never.self) { try result.get() }
+      }
+    }
+    gate.signal()
+    queue.flush()
+    #expect(writes.withLock { $0 } == [1, 2, 4])
+  }
+}
+
 struct SettingsFilePersistenceTests {
+  @Test(.dependencies) @MainActor func reloadCannotPublishACacheOlderThanAnAcceptedWrite() async throws {
+    let backing = SettingsTestStorage().storage
+    let duringRead = Mutex<(@Sendable () -> Void)?>(nil)
+    defer { duringRead.withLock { $0 = nil } }
+    try await withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(
+        load: { url in
+          let data = try backing.load(url)
+          let callback = duringRead.withLock { callback in
+            defer { callback = nil }
+            return callback
+          }
+          callback?()
+          return data
+        }, save: backing.save)
+    } operation: {
+      @Dependency(\.settingsFileURLs) var urls
+      @Shared(.settingsFile) var settings
+      let original = settings
+      var changed = original
+      changed.global.appearanceMode = .light
+      let next = changed
+      let key = SettingsFileKey(urls: urls)
+      withEscapedDependencies { dependencies in
+        duringRead.withLock { callback in
+          callback = {
+            dependencies.yield {
+              key.save(
+                next, context: .didSet,
+                continuation: SaveContinuation { result in
+                  #expect(throws: Never.self) { try result.get() }
+                })
+            }
+            // An off-writer reload lets the newer write complete before its
+            // stale cache publication. A serialized reload finishes first.
+            PersistenceQueue.shared.flush()
+          }
+        }
+      }
+      try await $settings.load()
+      PersistenceQueue.shared.flush()
+      #expect(try JSONDecoder().decode(GlobalSettings.self, from: backing.load(urls.config)).appearanceMode == .light)
+      try await Self.automaticSave(original, key: key)
+      #expect(try JSONDecoder().decode(GlobalSettings.self, from: backing.load(urls.config)).appearanceMode == .dark)
+    }
+  }
+
+  @Test(.dependencies) @MainActor func rebindingStorageDoesNotReuseAnotherDestinationsCache() async throws {
+    let original = SettingsTestStorage().storage
+    let replacement = SettingsTestStorage().storage
+    try await withDependencies {
+      $0.settingsFileStorage = original
+    } operation: {
+      @Dependency(\.settingsFileURLs) var urls
+      @Shared(.settingsFile) var settings
+      var rebound = original
+      rebound.load = replacement.load
+      rebound.save = replacement.save
+      try await withDependencies {
+        $0.settingsFileStorage = rebound
+      } operation: {
+        try await Self.automaticSave(settings, key: SettingsFileKey(urls: urls))
+      }
+      #expect(try replacement.load(urls.config) == original.load(urls.config))
+      #expect(try replacement.load(urls.routes) == original.load(urls.routes))
+      #expect(try replacement.load(urls.repositories) == original.load(urls.repositories))
+    }
+  }
+
+  @Test(.dependencies, arguments: [false, true]) @MainActor
+  func partialFailureRetriesOnlyUnpersistedDomains(revertOnRetry: Bool) async throws {
+    let storage = SettingsTestStorage().storage
+    let writes = Mutex<[URL]>([])
+    let failedURL = Mutex<URL?>(nil)
+    enum WriteFailure: Error { case unavailable }
+    try await withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(
+        load: storage.load,
+        save: { data, url in
+          writes.withLock { $0.append(url) }
+          try storage.save(data, url)
+          if failedURL.withLock({ $0 == url }) { throw WriteFailure.unavailable }
+        })
+    } operation: {
+      @Dependency(\.settingsFileURLs) var urls
+      @Shared(.settingsFile) var settings
+      var changed = settings
+      changed.global.appearanceMode = .light
+      changed.repositoryRoots = ["/tmp/partial-write"]
+      changed.repositories["/tmp/partial-write"] = .default
+      let key = SettingsFileKey(urls: urls)
+      writes.withLock { $0.removeAll() }
+      failedURL.withLock { $0 = urls.routes }
+      await #expect(throws: WriteFailure.self) {
+        try await Self.automaticSave(changed, key: key)
+      }
+      #expect(writes.withLock { $0 } == [urls.config, urls.routes])
+      failedURL.withLock { $0 = nil }
+      writes.withLock { $0.removeAll() }
+      try await Self.automaticSave(revertOnRetry ? settings : changed, key: key)
+      if revertOnRetry {
+        #expect(writes.withLock { $0 } == [urls.config, urls.routes])
+        #expect(try JSONDecoder().decode(RoutesFile.self, from: storage.load(urls.routes)).local.isEmpty)
+        return
+      }
+      #expect(writes.withLock { $0 } == [urls.routes, urls.repositories])
+      #expect(
+        try JSONDecoder().decode(RoutesFile.self, from: storage.load(urls.routes)).local == ["/tmp/partial-write"])
+      #expect(
+        try JSONDecoder().decode([String: RepositorySettings].self, from: storage.load(urls.repositories))[
+          "/tmp/partial-write"] != nil)
+    }
+  }
+
+  private static func automaticSave(_ value: SettingsFile, key: SettingsFileKey) async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+      key.save(
+        value, context: .didSet,
+        continuation: SaveContinuation { result in
+          continuation.resume(with: result.map { _ in () })
+        })
+    }
+  }
+
+  @Test(.dependencies) @MainActor func loadedDomainsAreComparedByValueNotJSONFormatting() throws {
+    let storage = SettingsTestStorage().storage
+    @Dependency(\.settingsFileURLs) var urls
+    let encoder = JSONEncoder()
+    try storage.save(encoder.encode(GlobalSettings.default), urls.config)
+    try storage.save(Data("{\"remote\":[],\"local\":[]}".utf8), urls.routes)
+    try storage.save(Data("{}".utf8), urls.repositories)
+    let writes = Mutex<[URL]>([])
+    withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(
+        load: storage.load,
+        save: { data, url in
+          writes.withLock { $0.append(url) }
+          try storage.save(data, url)
+        })
+    } operation: {
+      @Shared(.settingsFile) var settings
+      $settings.withLock { $0.global.appearanceMode = .light }
+      PersistenceQueue.shared.flush()
+      #expect(writes.withLock { $0 } == [urls.config])
+    }
+  }
+
+  @Test(.dependencies, arguments: [false, true]) @MainActor
+  func automaticChangeWritesOnlyTheChangedDomain(routesChanged: Bool) throws {
+    let storage = SettingsTestStorage().storage
+    let writes = Mutex<[URL]>([])
+    try withDependencies {
+      $0.settingsFileStorage = SettingsFileStorage(
+        load: storage.load,
+        save: { data, url in
+          writes.withLock { $0.append(url) }
+          try storage.save(data, url)
+        })
+    } operation: {
+      @Dependency(\.settingsFileURLs) var urls
+      @Shared(.settingsFile) var settings
+      writes.withLock { $0.removeAll() }
+      $settings.withLock {
+        if routesChanged { $0.repositoryRoots = ["/tmp/performance-repo"] } else { $0.global.appearanceMode = .light }
+      }
+      PersistenceQueue.shared.flush()
+      #expect(writes.withLock { $0 } == [routesChanged ? urls.routes : urls.config])
+      if routesChanged {
+        let data = try storage.load(urls.routes)
+        #expect(try JSONDecoder().decode(RoutesFile.self, from: data).local == ["/tmp/performance-repo"])
+      } else {
+        let data = try storage.load(urls.config)
+        #expect(try JSONDecoder().decode(GlobalSettings.self, from: data).appearanceMode == .light)
+      }
+      writes.withLock { $0.removeAll() }
+      $settings.withLock { $0.pinnedWorktreeIDs = ["presentation-only"] }
+      PersistenceQueue.shared.flush()
+      #expect(writes.withLock { $0.isEmpty })
+    }
+  }
+
   @Test(.dependencies) @MainActor func queuedWriteUsesTheCallersDefaultDependencyInstance() async throws {
     // No storage override: a wrapper resolved on a dispatch queue loses the
     // test's dependency-cache identity and writes to a different in-memory store.

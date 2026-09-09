@@ -42,7 +42,9 @@ how much time belongs to surface construction, layout, or zmx replay.
   Superseded, not-yet-executed selection work is cancellable.
 - Sidebar/settings encoding and writes run on an ordered utility queue. Explicit
   save errors still propagate; reads and normal termination flush accepted writes.
-  The writer is FIFO, not coalesced, and does not eliminate synchronous reads.
+  Pending automatic snapshots coalesce per storage destination, without delaying
+  an idle writer. Explicit saves and reads fence earlier batches. Reads remain
+  synchronous to the caller.
 - Tab-strip geometry uses scroll metrics instead of an inner geometry reader.
   Delayed recentering is cancelled on a new selection, another tab change, or exit.
 
@@ -112,3 +114,23 @@ exercise all four-buffer ownership combinations and queued/displayed pin cleanup
 The installed application was not replaced or relaunched. An interactive
 before/after recording of this build remains necessary to validate perceived
 smoothness and establish switching latency percentiles.
+
+## Persistence follow-up
+
+Automatic settings saves compare decoded domain values, so changing global
+settings does not encode or rewrite unchanged routes and repositories. Explicit
+saves still force all domains and surface errors. Each attempted domain is marked
+unknown before writing and marked persisted only after success; a backend that
+changes a file and then throws cannot suppress a later corrective write.
+
+Hydration and persisted-value cache publication execute together on the serial
+writer. Rebinding either storage closure creates a new cache and coalescing
+identity. This avoids stale cache publication during reload and accidental
+coalescing across different storage backends.
+
+The focused persistence result contains 76 passing tests, zero failures and zero
+skips, verified from the test-result bundle. Regressions include latest-snapshot
+coalescing, explicit-save boundaries, destination separation, every caller's
+failure completion, in-flight isolation, partial-write recovery, backend
+rebinding, and reload/write ordering. These are functional guarantees, not a
+measured switching-latency improvement.

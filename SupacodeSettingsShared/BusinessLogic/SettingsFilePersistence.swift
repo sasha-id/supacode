@@ -1,10 +1,16 @@
 import Dependencies
 import Foundation
 import Sharing
+import Synchronization
 
 public nonisolated struct SettingsFileStorage: Sendable {
-  public var load: @Sendable (URL) throws -> Data
-  public var save: @Sendable (Data, URL) throws -> Void
+  fileprivate var persisted = PersistedSettingsCache()
+  public var load: @Sendable (URL) throws -> Data {
+    didSet { persisted = PersistedSettingsCache() }
+  }
+  public var save: @Sendable (Data, URL) throws -> Void {
+    didSet { persisted = PersistedSettingsCache() }
+  }
 
   public init(
     load: @escaping @Sendable (URL) throws -> Data,
@@ -13,6 +19,16 @@ public nonisolated struct SettingsFileStorage: Sendable {
     self.load = load
     self.save = save
   }
+}
+
+private nonisolated struct PersistedSettings: Sendable {
+  var global: GlobalSettings?
+  var routes: RoutesFile?
+  var repositories: [String: RepositorySettings]?
+}
+
+private nonisolated final class PersistedSettingsCache: Sendable {
+  let values = Mutex<[SettingsFileURLs: PersistedSettings]>([:])
 }
 
 public nonisolated enum SettingsFileStorageKey: DependencyKey {
@@ -214,9 +230,20 @@ public nonisolated struct SettingsFileKey: SharedKey {
   }
 
   public func load(context: LoadContext<SettingsFile>, continuation: LoadContinuation<SettingsFile>) {
-    PersistenceQueue.shared.flush()
     @Dependency(\.settingsFileStorage) var storage
     @Dependency(\.settingsStoreHealth) var health
+    let destination = storage
+    let storeHealth = health
+    PersistenceQueue.shared.read {
+      load(context: context, continuation: continuation, storage: destination, health: storeHealth)
+    }
+  }
+
+  private func load(
+    context: LoadContext<SettingsFile>, continuation: LoadContinuation<SettingsFile>,
+    storage: SettingsFileStorage, health: SettingsStoreHealth
+  ) {
+    storage.persisted.values.withLock { $0.removeValue(forKey: urls) }
     let decoder = JSONDecoder()
     // The value served when we can't hydrate real data from disk.
     let initialValue = context.initialValue ?? .default
@@ -291,11 +318,16 @@ public nonisolated struct SettingsFileKey: SharedKey {
 
     // A present-but-corrupt file is rotated aside (preserved) and its slice falls
     // back to a default, so one bad file never discards the other two.
-    let global = decodeOrRotate(configData, at: urls.config, as: GlobalSettings.self, decoder) ?? .default
-    let routes = decodeOrRotate(routesData, at: urls.routes, as: RoutesFile.self, decoder) ?? RoutesFile()
-    let repositories =
+    let loadedGlobal = decodeOrRotate(configData, at: urls.config, as: GlobalSettings.self, decoder)
+    let loadedRoutes = decodeOrRotate(routesData, at: urls.routes, as: RoutesFile.self, decoder)
+    let loadedRepositories =
       decodeOrRotate(repositoriesData, at: urls.repositories, as: [String: RepositorySettings].self, decoder)
-      ?? [:]
+    storage.persisted.values.withLock {
+      $0[urls] = PersistedSettings(global: loadedGlobal, routes: loadedRoutes, repositories: loadedRepositories)
+    }
+    let global = loadedGlobal ?? .default
+    let routes = loadedRoutes ?? RoutesFile()
+    let repositories = loadedRepositories ?? [:]
     // `pinnedWorktreeIDs` is sidebar curation now (in `SidebarState`), no longer
     // persisted here.
     let settings = SettingsFile(
@@ -347,24 +379,30 @@ public nonisolated struct SettingsFileKey: SharedKey {
     SharedSubscription {}
   }
 
-  public func save(_ value: SettingsFile, context _: SaveContext, continuation: SaveContinuation) {
+  public func save(_ value: SettingsFile, context: SaveContext, continuation: SaveContinuation) {
     @Dependency(\.settingsFileStorage) var storage
     @Dependency(\.settingsStoreHealth) var health
     // Resolve the values here: capturing the property wrappers would defer
     // dependency resolution until after leaving the caller's task context.
     let destination = storage
     let storeHealth = health
-    PersistenceQueue.shared.enqueue {
-      do {
-        try save(value, storage: destination, health: storeHealth)
-        continuation.resume()
-      } catch {
-        continuation.resume(throwing: error)
-      }
-    }
+    let key = PersistenceQueue.CoalescingKey(owner: destination.persisted, name: urls.config.absoluteString)
+    PersistenceQueue.shared.save(
+      coalescing: context == .didSet ? key : nil,
+      operation: {
+        try save(value, storage: destination, health: storeHealth, force: context == .userInitiated)
+      },
+      completion: { result in
+        switch result {
+        case .success: continuation.resume()
+        case .failure(let error): continuation.resume(throwing: error)
+        }
+      })
   }
 
-  private func save(_ value: SettingsFile, storage: SettingsFileStorage, health: SettingsStoreHealth) throws {
+  private func save(
+    _ value: SettingsFile, storage: SettingsFileStorage, health: SettingsStoreHealth, force: Bool = true
+  ) throws {
     // Refuse to persist over a store that loaded degraded (a slice was present but
     // unreadable): the in-memory value is default-derived, so writing it would
     // overwrite the real data. Cleared by a clean reload on the next launch.
@@ -373,10 +411,28 @@ public nonisolated struct SettingsFileKey: SharedKey {
       throw SettingsStoreError.degraded
     }
     let encoder = Self.makeEncoder()
-    try storage.save(try encoder.encode(value.global), urls.config)
     let routes = RoutesFile(local: value.repositoryRoots, remote: value.remoteRepositoryRoots)
-    try storage.save(try encoder.encode(routes), urls.routes)
-    try storage.save(try encoder.encode(value.repositories), urls.repositories)
+    // Update each domain only after its write succeeds. A partial failure must
+    // leave the remaining domains dirty for the next automatic save.
+    try storage.persisted.values.withLock { persisted in
+      var previous = persisted[urls] ?? PersistedSettings()
+      defer { persisted[urls] = previous }
+      if force || previous.global != value.global {
+        previous.global = nil
+        try storage.save(try encoder.encode(value.global), urls.config)
+        previous.global = value.global
+      }
+      if force || previous.routes != routes {
+        previous.routes = nil
+        try storage.save(try encoder.encode(routes), urls.routes)
+        previous.routes = routes
+      }
+      if force || previous.repositories != value.repositories {
+        previous.repositories = nil
+        try storage.save(try encoder.encode(value.repositories), urls.repositories)
+        previous.repositories = value.repositories
+      }
+    }
   }
 
   private static func makeEncoder() -> JSONEncoder {
