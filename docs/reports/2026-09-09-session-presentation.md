@@ -336,3 +336,26 @@ zero displays (`CVDisplayLinkCreateWithCGDisplays`, invalid display count), whic
 Ghostty surfaced as initialization failure. The unchanged native-frame test then
 passed in isolation and in the full rerun. No assertion was weakened or skipped
 to accommodate the transient display failure.
+
+## Native retained-frame reveal
+
+An opt-in Release workload creates disposable `/bin/cat` surfaces with bundled
+configuration, waits for real IOSurface content, and performs 100 hide/reveal
+cycles per configuration. Hide and reveal occur in the same main-actor turn;
+the views stay mounted. Each reveal checks that layer content matches the current
+backing dimensions and the presentation cover is absent synchronously. Settings
+are in memory and windows never take keyboard focus.
+
+| Panes | Translucent | Median native reveal | p95 | Maximum |
+| --- | --- | --- | --- | --- |
+| 1 | No | 0.0103 ms | 0.0230 ms | 0.0397 ms |
+| 1 | Yes | 0.0099 ms | 0.0249 ms | 0.0360 ms |
+| 4 | No | 0.0298 ms | 0.0420 ms | 0.0935 ms |
+| 4 | Yes | 0.0320 ms | 0.0610 ms | 0.0971 ms |
+
+All four parameterized runs passed. This measures native view visibility and
+presentation readiness, not SwiftUI selection, busy terminal replay, compositor
+scanout, or custom shaders. Samples and test output are retained as
+`retained-reveal-samples.log` and `retained-reveal-release.log`.
+The strengthened backing-dimension assertions also passed all four Release
+cases (`retained-reveal-verified-release.log`); the required app build passed.

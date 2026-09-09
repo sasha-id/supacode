@@ -1,8 +1,10 @@
 import AppKit
 import Darwin
+import DependenciesTestSupport
 import Foundation
 import GhosttyKit
 import IOSurface
+import Sharing
 import SupacodeSettingsShared
 import Testing
 
@@ -10,6 +12,80 @@ import Testing
 
 @MainActor
 struct GhosttySurfaceViewTests {
+  /// Measures native retained-frame reveal only, not SwiftUI selection or scan-out.
+  @Test(.dependencies, .serialized, .enabled(if: TerminalPerformance.enabled), arguments: [1, 4], [false, true])
+  func profileRetainedReveal(paneCount: Int, translucent: Bool) async throws {
+    @Shared(.settingsFile) var settings
+    $settings.withLock { $0.global.terminalTranslucencyEnabled = translucent }
+    let runtime = GhosttyRuntime(
+      configResolutionPlan: .init(loadUserDefaultFiles: false, loadSupacodeUserConfig: false))
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: .borderless, backing: .buffered, defer: false)
+    let container = NSView(frame: window.contentLayoutRect)
+    window.contentView = container
+    var views: [GhosttySurfaceView] = []
+    defer {
+      window.orderOut(nil)
+      window.contentView = nil
+      for view in views { view.closeSurface() }
+    }
+    let columns = paneCount == 1 ? 1 : 2
+    let size = CGSize(width: 800 / columns, height: 600 / columns)
+    let geometry = try #require(
+      ContentGeometry.candidate(pointSize: size, scale: window.backingScaleFactor))
+    for index in 0..<paneCount {
+      let view = GhosttySurfaceView(
+        id: UUID(), runtime: runtime, workingDirectory: nil,
+        command: "/bin/cat", disableShellIntegration: true,
+        initialGeometry: geometry, context: GHOSTTY_SURFACE_CONTEXT_WINDOW)
+      views.append(view)
+      _ = try #require(view.surface, "Native profiling requires an active display.")
+      let hosted = view.hostedView()
+      hosted.frame = NSRect(
+        x: CGFloat(index % columns) * size.width, y: CGFloat(index / columns) * size.height,
+        width: size.width, height: size.height)
+      container.addSubview(hosted)
+    }
+    window.orderFront(nil)
+    container.layoutSubtreeIfNeeded()
+    for view in views {
+      view.preparePresentation()
+      let surface = try #require(view.surface)
+      await withCheckedContinuation { continuation in
+        guard view.presentation.isCovered else {
+          continuation.resume()
+          return
+        }
+        let updateCover = view.presentation.onChange
+        view.presentation.onChange = {
+          updateCover?()
+          guard !view.presentation.isCovered else { return }
+          view.presentation.onChange = updateCover
+          continuation.resume()
+        }
+        ghostty_surface_draw(surface)
+      }
+    }
+    for iteration in 0..<100 {
+      container.isHidden = true
+      let started = ProcessInfo.processInfo.systemUptime
+      container.isHidden = false
+      for view in views { view.preparePresentation() }
+      let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+      for view in views {
+        let frame = try #require(view.layer?.contents as? IOSurface)
+        let backingSize = view.convertToBacking(view.bounds.size)
+        #expect(frame.width == Int(floor(backingSize.width)))
+        #expect(frame.height == Int(floor(backingSize.height)))
+        #expect(!view.presentation.isCovered)
+      }
+      SupaLogger("TerminalPerformance").info(
+        "Retained reveal: panes=\(paneCount) translucent=\(translucent) iteration=\(iteration) reveal_ms=\(elapsed)")
+      await Task.yield()
+    }
+  }
+
   /// Opt-in native construction workload. Disposable windows never take
   /// keyboard focus; this measures native creation, not zmx replay completion.
   @Test(.serialized, .enabled(if: TerminalPerformance.enabled), arguments: [1, 4], [false, true])
