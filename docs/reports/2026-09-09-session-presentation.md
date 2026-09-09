@@ -279,6 +279,39 @@ fixture also starts with an empty persisted sidebar section. A non-test-host
 measurement with representative populated buckets is required before using
 these timings to justify a production optimization.
 
+The follow-up standalone harness links the existing optimized app objects with
+an alternate entry point. It does not initialize the normal app, open terminals,
+or load the test runner. Settings and app storage are in memory. This preserves
+the actual reconciliation implementation while removing Swift Testing identity
+lookup. Twenty repeated samples per configuration gave these medians:
+
+| Rows | Persisted buckets | Item reconciliation | Grouping | Derived caches |
+| --- | --- | --- | --- | --- |
+| 100 | Empty | 3.61 ms | 0.22 ms | 1.25 ms |
+| 1,000 | Empty | 34.79 ms | 1.82 ms | 10.04 ms |
+| 100 | Populated | 3.64 ms | 0.26 ms | 1.44 ms |
+| 1,000 | Populated | 37.32 ms | 2.16 ms | 10.85 ms |
+
+Populated fixtures place one tenth of rows in the pinned bucket and the rest in
+unpinned. These remain synthetic roster timings, not end-to-end switching
+measurements. The harness, linker script, and samples are retained under the
+artifact directory as `SidebarProfile.swift`, `build-sidebar-profile.rb`, and
+`sidebar-standalone-samples.log`.
+
+The standalone sample then identified repeated per-row shared-sidebar reads and
+repository ownership scans. Reconciliation now snapshots sidebar state once and
+uses the enclosing repository's identity for pin/archive checks. Ordering helpers
+still perform their existing per-repository shared reads; no persistent cache or
+ownership index was added. The same twenty-sample optimized harness measured
+populated-row item reconciliation at 1.03 ms for 100 rows and 10.75 ms for 1,000
+rows, down from 3.64 ms and 37.32 ms respectively (about 72% and 71%). Empty-bucket
+fixtures measured 0.86 ms and 9.20 ms. Grouping and derived-cache timings remained
+roughly unchanged. Follow-up samples are in `sidebar-snapshot-samples.log`.
+The required app build passed, and the full standard suite against this change
+passed 3,531 tests with zero failures, 16 expected failures, and two opt-in skips
+(`Test-supacode-tests-2026.09.09_13-40-03-+0800.xcresult`). Focused review found no
+behavioral differences for the roster's unique-owner identity invariant.
+
 ## Bundled-theme verification isolation
 
 The two bundled-theme integration tests previously loaded user configuration,
@@ -295,3 +328,11 @@ a TCA generic reducer conformance in `CloneRepositoryFormFeatureTests`; that run
 does not establish a passing full suite. Logs are `theme-isolation-release.log`,
 `theme-isolation-build-app.log`, and `full-suite-release.log` under the same
 performance-investigation artifact directory.
+
+The standard full-suite rerun passed 3,531 tests with zero failures, 16 expected
+failures, and two opt-in profiling tests skipped (`Test-supacode-tests-2026.09.09_13-33-53-+0800.xcresult`).
+Its preceding attempt failed native surface creation while Core Video reported
+zero displays (`CVDisplayLinkCreateWithCGDisplays`, invalid display count), which
+Ghostty surfaced as initialization failure. The unchanged native-frame test then
+passed in isolation and in the full rerun. No assertion was weakened or skipped
+to accommodate the transient display failure.

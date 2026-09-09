@@ -19,14 +19,17 @@ extension RepositoriesFeature {
     // Seed `surfaceIDs` from persisted layout so the surface-to-row index is
     // populated before the lazy content host ever exists.
     let layouts = state.persistedLayouts
+    let sidebar = state.sidebar
     var seededSurfaces: Set<UUID> = []
 
     for repository in state.repositories {
       let kind: SidebarItemFeature.State.Kind = repository.isGitRepository ? .gitWorktree : .folder
-      for worktree in state.orderedWorktreesIncludingArchivedWithRunningDeleteScript(in: repository) {
+      for worktree in state.orderedWorktreesIncludingArchivedWithRunningDeleteScript(
+        in: repository, sidebar: sidebar)
+      {
         let id = worktree.id
         let existing = previousByID[id: id]
-        let isPinned = state.isWorktreePinned(worktree)
+        let isPinned = sidebar.sections[repository.id]?.buckets[.pinned]?.items[id] != nil
         let isMain = state.isMainWorktree(worktree)
 
         var item =
@@ -72,7 +75,7 @@ extension RepositoriesFeature {
         // Mirror per-worktree customization from `@Shared(.sidebar)`. Reading
         // through the currently-owning bucket survives pin / unpin / archive
         // transitions because the bucket-flow `move` carries the `Item` over.
-        let customization = storedCustomization(for: id, in: repository.id, sidebar: state.sidebar)
+        let customization = storedCustomization(for: id, in: repository.id, sidebar: sidebar)
         item.customTitle = customization.title
         item.customTint = customization.color
         // Clear the PR query branch when the worktree was renamed.
@@ -81,7 +84,9 @@ extension RepositoriesFeature {
         }
         // Stale leftover scripts would render as misleading running-state dots
         // in the archived bucket (see `stripsArchivedRunningScripts`).
-        if state.stripsArchivedRunningScripts(for: id, lifecycle: item.lifecycle), !item.runningScripts.isEmpty {
+        if sidebar.isArchived(id, in: repository.id), item.lifecycle != .deletingScript,
+          !item.runningScripts.isEmpty
+        {
           item.runningScripts.removeAll()
         }
         rebuilt.append(item)
@@ -224,12 +229,13 @@ extension RepositoriesFeature.State {
   /// running-script data survives across archive transitions for views and for
   /// the eventual unarchive.
   fileprivate func orderedWorktreesIncludingArchivedWithRunningDeleteScript(
-    in repository: Repository
+    in repository: Repository,
+    sidebar: SidebarState
   ) -> [Worktree] {
     var ordered: [Worktree] = []
     var seen: Set<Worktree.ID> = []
     if let mainWorktree = repository.worktrees.first(where: { isMainWorktree($0) }),
-      !isWorktreeArchived(mainWorktree.id),
+      !sidebar.isArchived(mainWorktree.id, in: repository.id),
       seen.insert(mainWorktree.id).inserted
     {
       ordered.append(mainWorktree)
@@ -241,7 +247,7 @@ extension RepositoriesFeature.State {
       ordered.append(worktree)
     }
     for worktree in repository.worktrees
-    where isWorktreeArchived(worktree.id) && seen.insert(worktree.id).inserted {
+    where sidebar.isArchived(worktree.id, in: repository.id) && seen.insert(worktree.id).inserted {
       ordered.append(worktree)
     }
     return ordered

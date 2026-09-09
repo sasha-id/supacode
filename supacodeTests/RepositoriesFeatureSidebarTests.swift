@@ -11,6 +11,38 @@ import Testing
 
 @MainActor
 struct RepositoriesFeatureSidebarTests {
+  // Diagnostic only: dependency lookups include Swift Testing identity lookup
+  // in this host. Use standalone Release measurements for production latency.
+  @Test(.dependencies, .enabled(if: TerminalPerformance.enabled), arguments: [100, 1_000])
+  func profileSidebarReconciliation(worktreeCount: Int) {
+    let root = URL(filePath: "/tmp/sidebar-profile")
+    let worktrees = (0..<worktreeCount).map { index in
+      Worktree(
+        id: Worktree.ID("/tmp/sidebar-profile/wt-\(index)"), name: "feature-\(index)", detail: "",
+        workingDirectory: root.appending(path: "wt-\(index)"), repositoryRootURL: root)
+    }
+    var state = makeState(repository: Repository(
+      id: Repository.ID(root.path()), rootURL: root, name: "profile",
+      worktrees: IdentifiedArray(uniqueElements: worktrees)))
+    state.isInitialLoadComplete = true
+    RepositoriesFeature.syncSidebar(&state)
+    state.applyCacheRecomputes(.allSidebar)
+    let logger = SupaLogger("TerminalPerformance")
+    for iteration in 0..<20 {
+      let start = ProcessInfo.processInfo.systemUptime
+      RepositoriesFeature.reconcileSidebarItems(&state)
+      let reconciled = ProcessInfo.processInfo.systemUptime
+      RepositoriesFeature.rebuildSidebarGrouping(&state)
+      let grouped = ProcessInfo.processInfo.systemUptime
+      state.applyCacheRecomputes(.allSidebar)
+      let cached = ProcessInfo.processInfo.systemUptime
+      logger.info(
+        "Sidebar reconciliation: rows=\(worktreeCount) iteration=\(iteration) items_ms=\((reconciled - start) * 1_000) grouping_ms=\((grouped - reconciled) * 1_000) caches_ms=\((cached - grouped) * 1_000)"
+      )
+    }
+    #expect(state.sidebarItems.count == worktreeCount)
+  }
+
   @Test func reconcileClearsPullRequestWatermarkOnBranchRename() {
     let worktreeID: Worktree.ID = "/tmp/repo/wt-feature"
     let repoID: Repository.ID = "/tmp/repo/"
