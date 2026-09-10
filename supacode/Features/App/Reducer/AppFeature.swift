@@ -3599,9 +3599,11 @@ struct AppFeature {
     analyticsClient.capture(event.rawValue, nil)
   }
 
-  /// Captures only alerts raised by the current socket command. A pre-existing
-  /// alert is restored on success so repeated identical failures cannot be
-  /// mistaken for successful acknowledgements.
+  /// Captures alerts raised by the current socket command and converts them into
+  /// the command's error, never a dialog: the CLI is the error channel for a CLI
+  /// command, and a modal would interrupt whatever the user is doing in the app
+  /// for a failure they already see on stderr. The alert in place before the
+  /// command is always put back, so a command never displaces or inherits one.
   private func isolateSocketCommandAlert(
     responseFD: Int32?,
     state: inout State,
@@ -3612,9 +3614,7 @@ struct AppFeature {
     state.alert = nil
     let effect = operation(&state)
     let error = state.alert.map(extractAlertMessage)
-    if error == nil {
-      state.alert = previousAlert
-    }
+    state.alert = previousAlert
     return (effect, error)
   }
 

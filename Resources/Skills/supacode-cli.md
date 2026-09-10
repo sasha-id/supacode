@@ -213,6 +213,10 @@ action that would otherwise focus its target (`tab new`, `tab move`,
 `archive`/`unarchive`/`delete`/`pin`/`unpin`, and `tab close`); the `focus`,
 `zoom`, `equalize`, and `window` commands do not accept it.
 
+`worktree archive` and `worktree delete` never select their target either way —
+a worktree on its way out of the sidebar does not take your selection with it.
+For those two the flag governs only the script tab they may open.
+
 ## Flag Reference
 
 | Flag | Short | Default | Description |

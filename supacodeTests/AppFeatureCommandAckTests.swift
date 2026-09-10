@@ -465,7 +465,7 @@ struct AppFeatureCommandAckTests {
         source: .socket, responseFD: writeFD, timeoutSeconds: 0))
     await store.finish()
 
-    #expect(store.state.alert != nil)
+    #expect(store.state.alert == nil)
     #expect(store.state.pendingCommandAcks[id: writeFD] == nil)
     #expect(readPipeJSON(readFD)?["ok"] as? Bool == false)
   }
@@ -653,7 +653,7 @@ struct AppFeatureCommandAckTests {
       #expect(response?["ok"] as? Bool == false)
       #expect((response?["error"] as? String)?.localizedCaseInsensitiveContains("locked") == true)
     }
-    #expect(store.state.alert != nil)
+    #expect(store.state.alert == nil)
     #expect(sent.value.isEmpty)
   }
 
@@ -730,18 +730,9 @@ struct AppFeatureCommandAckTests {
     let store = makeStore(worktree: worktree, tabExists: true) {
       $0.terminalClient.tabCanRename = { _, _ in true }
     }
-    let (failReadFD, failWriteFD) = makePipe()
-    defer { close(failReadFD) }
-    await store.send(
-      .deeplink(
-        .worktree(id: "/tmp/gone/", action: .select),
-        source: .socket,
-        responseFD: failWriteFD,
-        timeoutSeconds: 0
-      )
-    )
+    // The alert is raised in-app: a socket command no longer opens one of its own.
+    await store.send(.deeplink(.worktree(id: "/tmp/gone/", action: .select)))
     await store.finish()
-    #expect(readPipeJSON(failReadFD)?["ok"] as? Bool == false)
     let raisedAlert = store.state.alert
     #expect(raisedAlert != nil)
 
@@ -764,6 +755,23 @@ struct AppFeatureCommandAckTests {
 
     #expect(readPipeJSON(readFD)?["ok"] as? Bool == true)
     // The command raised no alert of its own, so the one on screen survives.
+    #expect(store.state.alert == raisedAlert)
+
+    // A failing command reports on its fd and leaves that same alert in place,
+    // rather than displacing it with one of its own.
+    let (failReadFD, failWriteFD) = makePipe()
+    defer { close(failReadFD) }
+    await store.send(
+      .deeplink(
+        .worktree(id: "/tmp/gone/", action: .select),
+        source: .socket,
+        responseFD: failWriteFD,
+        timeoutSeconds: 0
+      )
+    )
+    await store.finish()
+
+    #expect(readPipeJSON(failReadFD)?["ok"] as? Bool == false)
     #expect(store.state.alert == raisedAlert)
   }
 
@@ -1016,7 +1024,7 @@ struct AppFeatureCommandAckTests {
     #expect(store.state.pendingCommandAcks.isEmpty)
   }
 
-  @Test(.dependencies) func confirmedTabCloseFailsWhenTabVanishesWithMatchingAlert() async {
+  @Test(.dependencies) func confirmedTabCloseFailsWhenTabVanishesWithMatchingError() async {
     let worktree = makeWorktree()
     let tabID = UUID()
     let tabExists = LockIsolated(false)
@@ -1050,7 +1058,7 @@ struct AppFeatureCommandAckTests {
     )
     await store.finish()
     #expect(readPipeJSON(priorReadFD)?["ok"] as? Bool == false)
-    #expect(store.state.alert != nil)
+    #expect(store.state.alert == nil)
 
     tabExists.withValue { $0 = true }
     let (closeReadFD, closeWriteFD) = makePipe()
@@ -1119,6 +1127,51 @@ struct AppFeatureCommandAckTests {
     #expect(readPipeJSON(readFD)?["ok"] as? Bool == true)
   }
 
+  @Test(.dependencies) func deleteSocketDeeplinkKeepsTheCurrentSelection() async {
+    let target = makeWorktree()
+    let other = Worktree(
+      id: WorktreeID("/tmp/repo/wt-2"),
+      name: "wt-2",
+      detail: "detail",
+      workingDirectory: URL(fileURLWithPath: "/tmp/repo/wt-2"),
+      repositoryRootURL: URL(fileURLWithPath: "/tmp/repo"),
+    )
+    var repositories = RepositoriesFeature.State()
+    repositories.repositories = [
+      Repository(
+        id: "/tmp/repo",
+        rootURL: URL(fileURLWithPath: "/tmp/repo"),
+        name: "repo",
+        worktrees: [target, other],
+      )
+    ]
+    repositories.selection = .worktree(other.id)
+    repositories.isInitialLoadComplete = true
+    let store = TestStore(
+      initialState: AppFeature.State(repositories: repositories, settings: SettingsFeature.State())
+    ) {
+      AppFeature()
+    } withDependencies: {
+      $0.terminalClient.send = { _ in }
+    }
+    store.exhaustivity = .off
+    let (readFD, writeFD) = makePipe()
+    defer { close(readFD) }
+
+    // Deleting a worktree must not pull selection or terminal focus onto the row
+    // that is on its way out of the sidebar.
+    await store.send(
+      .deeplink(
+        .worktree(id: target.id, action: .delete),
+        source: .socket,
+        responseFD: writeFD,
+        timeoutSeconds: 0
+      )
+    )
+
+    #expect(store.state.repositories.selectedWorktreeID == other.id)
+  }
+
   @Test(.dependencies) func deleteSocketDeeplinkFailsOnScriptCancellation() async {
     let worktree = makeWorktree()
     let (readFD, writeFD) = makePipe()
@@ -1176,8 +1229,12 @@ struct AppFeatureCommandAckTests {
     await store.finish()
 
     #expect(store.state.pendingCommandAcks.isEmpty)
-    #expect(store.state.alert != nil)
-    #expect(readPipeJSON(readFD)?["ok"] as? Bool == false)
+    // The rejection reaches the CLI, not the screen: a socket command never
+    // raises a dialog over whatever the user is doing in the app.
+    #expect(store.state.alert == nil)
+    let response = readPipeJSON(readFD)
+    #expect(response?["ok"] as? Bool == false)
+    #expect((response?["error"] as? String)?.contains("another operation is in progress") == true)
   }
 
   // MARK: - worktree archive.
@@ -1701,8 +1758,10 @@ struct AppFeatureCommandAckTests {
     await store.finish()
 
     #expect(store.state.pendingCommandAcks.isEmpty)
-    #expect(store.state.alert != nil)
-    #expect(readPipeJSON(readFD)?["ok"] as? Bool == false)
+    #expect(store.state.alert == nil)
+    let response = readPipeJSON(readFD)
+    #expect(response?["ok"] as? Bool == false)
+    #expect((response?["error"] as? String)?.contains("another operation is in progress") == true)
   }
 
   @Test(.dependencies) func archiveConfirmedRemovingRepoDrainsFailure() async {
