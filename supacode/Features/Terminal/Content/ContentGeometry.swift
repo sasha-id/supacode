@@ -53,8 +53,9 @@ nonisolated struct FrozenGrid: Equatable, Codable, Sendable {
 
 /// Deliberate initial geometry for content whose renderer is not yet in a window.
 ///
-/// Off-window views convert to backing at 1x and read their point frame as pixels,
-/// so the first PTY grid is honest only when pixels and scale are chosen explicitly.
+/// An off-window view has no honest size of its own — `convertToBacking` there
+/// falls back to the main screen's scale, not its eventual window's — so the first
+/// PTY grid is honest only when pixels and scale are chosen explicitly.
 nonisolated struct ContentGeometry: Equatable, Sendable {
   /// Backing pixels the renderer assumes until real layout lands.
   let pixelSize: CGSize

@@ -1484,7 +1484,7 @@ struct LayoutFeatureTests {
     #expect(mock.renderer != nil)
   }
 
-  @Test func wakeTabWithoutAFrozenGridFallsBack() async throws {
+  @Test func wakeTabWithoutAFrozenGridResolvesLiveGeometry() async throws {
     let harness = await makeHarness()
     let custom = try #require(ContentGeometry.candidate(pointSize: CGSize(width: 800, height: 600), scale: 2))
     let tabID = TabID()
@@ -1514,7 +1514,10 @@ struct LayoutFeatureTests {
       $0.wakingTabs = []
       $0.renderEpoch = 3
     }
-    #expect(mock.startGeometries == [custom, .fallback])
+    // With no grid to reproduce, the wake measures what a spawn would: no mock
+    // renderer is ever in a window, so resolution lands on the same window/screen
+    // chain rather than the blind last-resort fallback.
+    #expect(mock.startGeometries == [custom, ContentGeometry.resolve(anchors: [])])
     #expect(harness.store.state.layout.isConsistent)
   }
 

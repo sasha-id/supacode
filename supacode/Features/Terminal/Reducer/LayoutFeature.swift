@@ -777,7 +777,12 @@ extension LayoutFeature {
     // A live renderer needs nothing; the wake senders fire on every tab
     // selection, so this is the common case.
     guard contentRuntime.content(for: snapshot.id)?.renderer == nil else { return .none }
-    let geometry = Self.wakeGeometry(for: snapshot)
+    // Without a frozen grid to reproduce, measure a live sibling rather than
+    // taking the deliberate fallback: waking at a size no window has reflows the
+    // replayed scrollback once at that size and again at first layout.
+    let geometry =
+      Self.wakeGeometry(for: snapshot)
+      ?? contentRuntime.spawnGeometry(near: focusedContentID(in: state))
     let worktreeID = state.id
     state.wakingTabs.insert(tabID)
     // A retry clears the previous verdict; the pane holds the background again
@@ -829,12 +834,11 @@ extension LayoutFeature {
     state.layout.panes[id: paneID]?.tabs[id: tabID]?.content = content.snapshot()
   }
 
-  /// The geometry that reproduces the frozen grid, else the deliberate fallback.
-  private static func wakeGeometry(for snapshot: ContentSnapshot) -> ContentGeometry {
-    guard let grid = snapshot.state.terminalState?.frozenGrid, let restored = ContentGeometry.restored(grid) else {
-      return .fallback
-    }
-    return restored
+  /// The geometry that reproduces the frozen grid; nil when there is none to
+  /// reproduce, so the caller can measure a live sibling instead.
+  private static func wakeGeometry(for snapshot: ContentSnapshot) -> ContentGeometry? {
+    guard let grid = snapshot.state.terminalState?.frozenGrid else { return nil }
+    return ContentGeometry.restored(grid)
   }
 }
 

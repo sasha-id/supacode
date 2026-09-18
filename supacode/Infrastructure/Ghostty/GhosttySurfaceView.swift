@@ -101,8 +101,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
   private var appliedContentScale: CGFloat
   private let context: ghostty_surface_context_e
   private var trackingArea: NSTrackingArea?
-  // Only ever holds sizes actually pushed to ghostty_surface_set_size; a rejected
-  // degenerate size must be re-evaluated on the next layout pass.
+  // Only ever holds sizes the core is actually running at: the creation size
+  // `createSurface()` built it with, then whatever `ghostty_surface_set_size`
+  // accepted. A rejected degenerate size must be re-evaluated on the next
+  // layout pass, so it is never recorded here.
   private var lastAppliedBackingSize: CGSize = .zero
   // A size that arrived while this view was hidden, deferred to the reveal.
   private var needsSizeSyncOnReveal = false
@@ -276,11 +278,11 @@ final class GhosttySurfaceView: NSView, Identifiable {
     } else {
       initialInputCString = nil
     }
-    // Off-window backing conversion is 1x, so a point frame equal to the intended
-    // pixel size makes the first `updateSurfaceSize()` measure the honest backing
-    // size before the view joins a window. The pty's own grid comes from
-    // `config.initial_width/height` in `createSurface()`, not from this frame —
-    // Ghostty never reads the nsview's bounds when it builds the surface.
+    // Placeholder geometry only: the pty's grid comes from
+    // `config.initial_width/height` in `createSurface()` — Ghostty never reads the
+    // nsview's bounds when it builds the surface — and no size is ever measured
+    // off-window. The wrapper sets the real point frame before this view joins a
+    // window, so nothing downstream sees these numbers.
     super.init(frame: NSRect(origin: .zero, size: initialGeometry.pixelSize))
     wantsLayer = true
     bridge.surfaceView = self
@@ -1076,14 +1078,16 @@ final class GhosttySurfaceView: NSView, Identifiable {
 
   func updateSurfaceSize(contentSize: CGSize? = nil) {
     guard let surface else { return }
-    // Off-window backing conversion is 1x; re-measuring a detached view would
-    // halve the applied size and poison the hibernation freeze.
-    guard window != nil || !hasBeenInWindow else { return }
+    // A detached view converts to backing with the main screen's scale, not its
+    // eventual window's, so measuring one pushes a size the pty never wanted.
+    // `createSurface()` records the creation size; every other push waits for a
+    // window.
+    guard window != nil else { return }
     // A deselected worktree keeps its tree mounted and AppKit lays hidden
     // subtrees out anyway, so a window resize would otherwise reflow every
-    // off-screen grid per drag frame. The very first size still applies: the
-    // PTY must never run at the placeholder grid.
-    if isHiddenOrHasHiddenAncestor, lastAppliedBackingSize != .zero {
+    // off-screen grid per drag frame. Deferring costs nothing even for the first
+    // size: the PTY was born at the creation geometry, not at a placeholder.
+    if isHiddenOrHasHiddenAncestor {
       needsSizeSyncOnReveal = true
       return
     }
@@ -1262,7 +1266,13 @@ final class GhosttySurfaceView: NSView, Identifiable {
     // leaving every restored pane's cursor solid. Start unfocused to agree with
     // `focused`; the focus flow sets the truly focused pane solid.
     setSurfaceFocus(false)
-    updateSurfaceSize()
+    // The core was built at `initialPixelSize` via `config.initial_width/height`,
+    // so record that as the applied size rather than measuring it. A detached
+    // view converts to backing with the main screen's scale rather than its
+    // eventual window's, so measuring here pushes a doubled size: one
+    // SIGWINCH at 2x, then another back at first layout. That round trip
+    // reflows the grid to double width and back, and the reflow is lossy.
+    lastAppliedBackingSize = initialPixelSize
   }
 
   private func updateContentScale() {
