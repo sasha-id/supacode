@@ -919,6 +919,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
       super.rightMouseDown(with: event)
       return
     }
+    sendMousePosition(event)
     let mods = ghosttyMods(event.modifierFlags)
     if ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT, mods) {
       return
@@ -931,6 +932,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
       super.rightMouseUp(with: event)
       return
     }
+    sendMousePosition(event)
     let mods = ghosttyMods(event.modifierFlags)
     if ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT, mods) {
       return
@@ -1982,6 +1984,12 @@ final class GhosttySurfaceView: NSView, Identifiable {
     button: ghostty_input_mouse_button_e
   ) {
     guard let surface else { return }
+    // The core anchors a click on the last position we pushed, never on the button
+    // event's own. Hover updates dry up whenever AppKit withholds `mouseMoved` — a
+    // button latched down by a remapper, or a pane that moves under a still pointer
+    // during a resize — so without this the press lands wherever the pointer was
+    // last seen and a double-click selects the word from that stale cell.
+    sendMousePosition(event)
     let mods = ghosttyMods(event.modifierFlags)
     ghostty_surface_mouse_button(surface, state, button, mods)
   }

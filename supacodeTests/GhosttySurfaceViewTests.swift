@@ -432,6 +432,142 @@ struct GhosttySurfaceViewTests {
     window.contentView = nil
   }
 
+  /// The core anchors a click on the last cursor position the app pushed, so a press
+  /// that arrives while hover updates are stale must carry its own position or the
+  /// double-click selects the word under wherever the pointer was last seen.
+  @Test func doubleClickSelectsTheWordUnderThePressNotTheStaleHover() async throws {
+    let runtime = GhosttyRuntime()
+    let geometry = try #require(
+      ContentGeometry.candidate(pointSize: CGSize(width: 800, height: 600), scale: 2))
+    let view = GhosttySurfaceView(
+      id: UUID(), runtime: runtime, workingDirectory: nil,
+      command: "/bin/cat", initialInput: "alpha\rbravo\r",
+      disableShellIntegration: true,
+      initialGeometry: geometry, context: GHOSTTY_SURFACE_CONTEXT_WINDOW)
+    defer { view.closeSurface() }
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+      styleMask: .borderless, backing: .buffered, defer: false)
+    window.contentView = view.hostedView()
+    window.contentView?.layoutSubtreeIfNeeded()
+    defer { window.contentView = nil }
+    let surface = try #require(view.surface)
+
+    _ = try #require(
+      await Self.screenLines(surface, containingAll: ["alpha", "bravo"]),
+      "the PTY never echoed the seeded input")
+
+    // Window padding offsets the grid within the view, so find each word by
+    // double-clicking candidate rows the honest way instead of deriving a point.
+    var located: [String: NSPoint] = [:]
+    for row in 0..<6 {
+      let point = try Self.cellCenter(on: view, column: 4, row: row)
+      try Self.doubleClick(on: view, at: point)
+      let word = Self.selectedText(surface)
+      if located[word] == nil { located[word] = point }
+    }
+    let hover = try #require(located["alpha"], "no view point resolves to the hover word")
+    let press = try #require(located["bravo"], "no view point resolves to the press word")
+
+    // Leave the click anchor on the hover word, then press the other word with no
+    // intervening move: the shape AppKit produces whenever it withholds `mouseMoved`.
+    try Self.doubleClick(on: view, at: hover)
+    view.mouseMoved(with: try Self.mouseEvent(.mouseMoved, on: view, at: hover))
+    for clickCount in 1...2 {
+      view.mouseDown(
+        with: try Self.mouseEvent(.leftMouseDown, on: view, at: press, clickCount: clickCount))
+      view.mouseUp(
+        with: try Self.mouseEvent(.leftMouseUp, on: view, at: press, clickCount: clickCount))
+    }
+
+    #expect(Self.selectedText(surface) == "bravo")
+  }
+
+  /// Drives a double-click the way AppKit does when hover tracking is healthy.
+  private static func doubleClick(on view: GhosttySurfaceView, at point: NSPoint) throws {
+    view.mouseMoved(with: try mouseEvent(.mouseMoved, on: view, at: point))
+    for clickCount in 1...2 {
+      view.mouseDown(with: try mouseEvent(.leftMouseDown, on: view, at: point, clickCount: clickCount))
+      view.mouseUp(with: try mouseEvent(.leftMouseUp, on: view, at: point, clickCount: clickCount))
+    }
+  }
+
+  /// Polls the screen until every needle has been echoed, then returns its rows.
+  private static func screenLines(
+    _ surface: ghostty_surface_t,
+    containingAll needles: [String],
+    timeout: Duration = .seconds(10)
+  ) async -> [String]? {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+      let contents = readText(surface, tag: GHOSTTY_POINT_SCREEN)
+      if needles.allSatisfy(contents.contains) {
+        return contents.components(separatedBy: "\n")
+      }
+      await Task.yield()
+    }
+    return nil
+  }
+
+  private static func selectedText(_ surface: ghostty_surface_t) -> String {
+    var text = ghostty_text_s()
+    guard ghostty_surface_read_selection(surface, &text) else { return "" }
+    defer { ghostty_surface_free_text(surface, &text) }
+    return String(cString: text.text)
+  }
+
+  private static func readText(
+    _ surface: ghostty_surface_t,
+    tag: ghostty_point_tag_e
+  ) -> String {
+    var text = ghostty_text_s()
+    let selection = ghostty_selection_s(
+      top_left: ghostty_point_s(tag: tag, coord: GHOSTTY_POINT_COORD_TOP_LEFT, x: 0, y: 0),
+      bottom_right: ghostty_point_s(tag: tag, coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT, x: 0, y: 0),
+      rectangle: false
+    )
+    guard ghostty_surface_read_text(surface, selection, &text) else { return "" }
+    defer { ghostty_surface_free_text(surface, &text) }
+    return String(cString: text.text)
+  }
+
+  /// The middle of a cell counted from the view's top-left, which is the grid's
+  /// origin only when the surface carries no window padding.
+  private static func cellCenter(
+    on view: GhosttySurfaceView,
+    column: Int,
+    row: Int
+  ) throws -> NSPoint {
+    let surface = try #require(view.surface)
+    let size = ghostty_surface_size(surface)
+    try #require(size.cell_width_px > 0 && size.cell_height_px > 0)
+    let scale = view.window?.backingScaleFactor ?? 1
+    return NSPoint(
+      x: (Double(column) + 0.5) * Double(size.cell_width_px) / scale,
+      y: view.bounds.height - (Double(row) + 0.5) * Double(size.cell_height_px) / scale
+    )
+  }
+
+  private static func mouseEvent(
+    _ type: NSEvent.EventType,
+    on view: GhosttySurfaceView,
+    at pointInView: NSPoint,
+    clickCount: Int = 0
+  ) throws -> NSEvent {
+    try #require(
+      NSEvent.mouseEvent(
+        with: type,
+        location: view.convert(pointInView, to: nil),
+        modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: view.window?.windowNumber ?? 0,
+        context: nil,
+        eventNumber: 0,
+        clickCount: clickCount,
+        pressure: type == .leftMouseDown ? 1 : 0
+      ))
+  }
+
   @Test func normalizedWorkingDirectoryPathRemovesTrailingSlashForNonRootPath() {
     #expect(
       GhosttySurfaceView.normalizedWorkingDirectoryPath("/Users/onevcat/Sync/github/supacode/")
