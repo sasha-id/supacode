@@ -5,10 +5,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
 srcroot="${SRCROOT:-$(cd "${script_dir}/.." && pwd)}"
 
-# Pin a Zig-linkable Xcode for `zig build`'s SDK lookups (see select-developer-dir.sh).
+# zmx builds with its own Zig, ahead of the repo-wide pin: zmx v0.8.x declares
+# `minimum_zig_version = "0.16.0"` while ghostty still requires 0.15.2, so the two
+# vendored builds cannot share one toolchain. They never need to: each runs its own
+# `zig build`, and `mise exec zig@…` selects per invocation.
+zmx_zig_version="0.16.0"
+
+# Pin an Xcode for `zig build`'s SDK lookups (see select-developer-dir.sh). That
+# selector exists only because Zig 0.15.2 cannot link the macOS 26.4+ SDK
+# (ziglang/zig#31658); 0.16 carries the fix, so this build needs no SDK gate and
+# takes the selector's already-has-the-fix path instead of pinning Xcode 26.3.
 # Always delegate so an inherited DEVELOPER_DIR is validated, not trusted blindly.
 # Plain assignment, separate export, so a selector failure aborts under set -e.
-DEVELOPER_DIR="$("${script_dir}/select-developer-dir.sh")"
+DEVELOPER_DIR="$(SUPACODE_ZIG_HAS_TBD_FIX=1 "${script_dir}/select-developer-dir.sh")"
 export DEVELOPER_DIR
 repo_root="${srcroot}"
 zmx_dir="${srcroot}/ThirdParty/zmx"
@@ -17,8 +26,10 @@ zmx_build_root="${srcroot}/.build/zmx"
 zmx_global_cache_dir="${zmx_build_root}/.zig-global-cache"
 zmx_fingerprint_path="${zmx_build_root}/fingerprint"
 zmx_binary_path="${zmx_build_root}/bin/zmx"
-# Out-of-tree patches applied to the pinned zmx submodule at build time.
-# The submodule pointer stays on the fork's SHA; we never commit into it.
+# Out-of-tree patches applied to the pinned zmx submodule at build time, in glob
+# order: the numeric prefix is load-bearing, since 02 diffs against a tree that
+# already has 01 applied. The submodule pointer stays on upstream's tag; we never
+# commit into it.
 zmx_patches_dir="${srcroot}/patches/zmx"
 
 # Mirror Xcode's ARCHS_STANDARD for macOS (arm64, x86_64); resync if Configurations/Project.xcconfig pins ARCHS.
@@ -169,7 +180,7 @@ for target in "${zmx_targets[@]}"; do
   slice_prefix="${zmx_build_root}/slices/${target}"
   slice_cache="${slice_prefix}/.zig-cache"
   slice_binary="${slice_prefix}/bin/zmx"
-  mise exec -- zig build \
+  mise exec "zig@${zmx_zig_version}" -- zig build \
     -Doptimize=ReleaseSafe \
     -Dtarget="${target}" \
     --prefix "${slice_prefix}" \
