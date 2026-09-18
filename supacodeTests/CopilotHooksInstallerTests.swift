@@ -192,20 +192,39 @@ struct CopilotHooksInstallerTests {
     #expect(try CopilotHookSettings.source().contains(CopilotHookSettings.ownershipMarker))
   }
 
-  @Test func sourceEmbedsCopilotScopedOSCForEveryState() throws {
-    let source = try CopilotHookSettings.source()
-    #expect(source.contains("start=copilot;event=session_start"))
-    #expect(source.contains("start=copilot;event=busy"))
-    #expect(source.contains("start=copilot;event=idle"))
-    #expect(source.contains("end=copilot;event=session_end"))
+  @Test func sourceEmbedsCopilotScopedPresenceForEveryState() throws {
+    // Both transports carry the same `$__md`, so the pairing that matters is
+    // (hook -> metadata); the OSC leg additionally scopes the agent in its
+    // action byte, and only session_end may use the `end=` form.
+    let commands = try Self.installedCommands()
+    #expect(try Self.command(commands, "sessionStart").contains(#"__md="event=session_start""#))
+    #expect(try Self.command(commands, "preToolUse").contains(#"__md="event=busy""#))
+    #expect(try Self.command(commands, "agentStop").contains(#"__md="event=idle""#))
+    #expect(try Self.command(commands, "sessionEnd").contains(#"__md="event=session_end""#))
+    #expect(try Self.command(commands, "sessionEnd").contains("]3008;end=copilot;%s"))
+    #expect(try Self.command(commands, "sessionStart").contains("]3008;start=copilot;%s"))
   }
 
   @Test func sourceForwardsNotificationsAndFlagsAwaitingInput() throws {
-    let source = try CopilotHookSettings.source()
-    #expect(source.contains("kind=notify"))
-    #expect(source.contains("start=copilot;event=awaiting_input"))
-    #expect(source.contains("permission_prompt"))
-    #expect(source.contains("elicitation_dialog"))
+    let commands = try Self.installedCommands()
+    let notification = try Self.command(commands, "notification")
+    #expect(notification.contains(#"__md="kind=notify;"#))
+    #expect(notification.contains(#"__md="event=awaiting_input""#))
+    #expect(notification.contains("permission_prompt"))
+    #expect(notification.contains("elicitation_dialog"))
+  }
+
+  /// The installed shell command per Copilot hook name, unescaped out of the
+  /// settings JSON so assertions can quote the shell verbatim.
+  private static func installedCommands() throws -> [String: String] {
+    let data = Data(try CopilotHookSettings.source().utf8)
+    let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let hooks = try #require(root["hooks"] as? [String: [[String: Any]]])
+    return hooks.compactMapValues { $0.first?["bash"] as? String }
+  }
+
+  private static func command(_ commands: [String: String], _ hook: String) throws -> String {
+    try #require(commands[hook], "No installed command for \(hook)")
   }
 
   /// Guards the hand-composed notification shell: the awaiting-input + notify

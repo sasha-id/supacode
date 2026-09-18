@@ -233,6 +233,16 @@ final class WorktreeTerminalManager {
       }
       handler(resource, params, clientFD)
     }
+    // The socket carries no worktree scope, so the owning host is the one that
+    // knows the surface. Attribution stays with the surface id either way: the
+    // OSC leg gets it from the receiving surface, this one from the envelope.
+    server.onContextSignal = { [weak self] id, metadata, surfaceID in
+      guard let host = self?.hosts.values.first(where: { $0.isKnownSurface(surfaceID) }) else {
+        terminalLogger.debug("Dropped socket context signal for unknown surface \(surfaceID)")
+        return
+      }
+      host.handleContextSignal(surfaceID: surfaceID, id: id, metadata: metadata)
+    }
   }
 
   /// Holds `.idle` for a debounce window so PostToolUse / PreToolUse storms don't flap downstream UI.

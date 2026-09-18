@@ -1,30 +1,46 @@
 import Foundation
 
-/// OSC 3008 (UAPI hierarchical context signal) wire format that carries the
-/// agent-presence event lifecycle over the terminal stream, so the badge tracks
-/// state over SSH where the local Unix socket can't be reached. The sequence is
-/// inert in any terminal that doesn't handle OSC 3008 (no toast, no side effect).
+/// Agent-presence wire format, carried over one of two transports.
 ///
-/// Emit shape: `OSC 3008 ; <action>=<agent> ; event=<event>[ ; pid=<pid>] ST`.
-/// libghostty splits that into `id = <agent>` (the context id, up to the first
-/// `;`) and `metadata = "event=<event>[;pid=<pid>]"`, which is what `parse`
-/// receives. `parse` derives the event solely from the `event=` field and ignores
-/// the start/end action byte.
-/// - attribution is by the receiving surface, so no surface id is carried;
+/// The metadata is identical on both, so `parse` / `parseNotify` are the single
+/// ingest for either:
+/// - **Unix socket** (local): a one-line JSON object
+///   `{"signal":"<agent>","metadata":"<metadata>","surface_id":"<uuid>"}` piped to
+///   the app's control socket. Preferred whenever `SUPACODE_SOCKET_PATH` is set,
+///   because it never touches the agent's terminal.
+/// - **OSC 3008** (UAPI hierarchical context signal): `OSC 3008 ; <action>=<agent>
+///   ; <metadata> ST` written to the agent's tty. libghostty splits that into
+///   `id = <agent>` (the context id, up to the first `;`) and the metadata that
+///   `parse` receives. Inert in any terminal that doesn't handle OSC 3008 (no
+///   toast, no side effect). The fallback for SSH, where the socket can't be
+///   reached, and for a stale socket path (an app restart under a surviving zmx
+///   session).
+///
+/// The tty is a shared resource: the agent is writing its own frames to it, and a
+/// hook's bytes land between the chunks the kernel splits a large write into,
+/// i.e. mid-escape-sequence. That corrupts the agent's rendering, and no amount
+/// of shrinking the payload closes the window — only not writing does. Hence the
+/// socket is the default and OSC is the fallback (#390 made OSC unconditional and
+/// shipped that corruption to every local session).
+///
+/// Presence metadata is `event=<event>[;pid=<pid>]`, and `parse` derives the event
+/// solely from the `event=` field, ignoring the start/end action byte:
+/// - attribution is by the receiving surface for OSC, by `surface_id` for the
+///   socket, so presence metadata carries no surface id;
 /// - `event` is the `HookEvent` rawValue;
 /// - `pid` is the agent's LOCAL process id, present only when the hook ran on the
 ///   same host (gated on `SUPACODE_SOCKET_PATH`); it feeds the app's liveness
 ///   sweep so a crashed local agent is reaped. Omitted over SSH.
 ///
-/// The same transport also carries the rich notification leg
+/// Both transports also carry the rich notification leg
 /// (`kind=notify;title=<base64>;body=<base64>`); the emitter extracts the display
 /// title/body so the wire stays small and the app carries no agent-specific JSON
 /// shape. Presence and notify are disjoint metadata shapes.
 ///
-/// Signals are unauthenticated: anything that can write to the terminal can emit
-/// one, and the worst case is a spurious badge or notification (text is
-/// control-char-sanitized and length-capped app-side). Emission is gated on
-/// `SUPACODE_SURFACE_ID` so it no-ops outside a Supacode surface.
+/// Signals are unauthenticated: anything that can write to the terminal or the
+/// socket can emit one, and the worst case is a spurious badge or notification
+/// (text is control-char-sanitized and length-capped app-side). Emission is gated
+/// on `SUPACODE_SURFACE_ID` so it no-ops outside a Supacode surface.
 ///
 /// Single source of truth for both the emit side (the agent hook) and the parse
 /// side (the app), so the field names can't drift.
@@ -32,6 +48,26 @@ public nonisolated enum AgentPresenceOSC {
   /// Env var present only on Supacode surfaces, so its presence is the
   /// no-op-outside-Supacode emit gate.
   public static let surfaceEnvVar = "SUPACODE_SURFACE_ID"
+
+  /// Env var carrying the app's control-socket path. Exported on every local
+  /// surface and never over SSH, so its presence is the transport discriminator
+  /// AND the local-host check the `pid=` field needs.
+  public static let socketEnvVar = "SUPACODE_SOCKET_PATH"
+
+  /// Field names of the socket envelope. `signal` carries what OSC puts in the
+  /// context id, `metadata` the identical key=value string, and `surface_id` the
+  /// attribution the terminal stream gets for free from the receiving surface.
+  public static let signalField = "signal"
+  public static let metadataField = "metadata"
+  public static let surfaceIDField = "surface_id"
+
+  /// Absolute path: the hook may run with a PATH that can't reach `nc` (Grok
+  /// rewrites the environment, and a stripped PATH is a supported shape).
+  static let netcatPath = "/usr/bin/nc"
+
+  /// Seconds `nc` waits on the socket. The app acks and half-closes immediately,
+  /// so this only bounds a wedged app; the hook's own deadline is 2s.
+  static let socketTimeoutSeconds = 1
 
   static let eventField = "event"
   static let pidField = "pid"
@@ -182,48 +218,70 @@ public nonisolated enum AgentPresenceOSC {
 
   /// The `key=value` metadata a PRESENCE signal carries (everything after the
   /// context id). `parse` recovers the event from this exact shape. `pidSuffix`
-  /// is appended verbatim (e.g. `;pid=123`) so the emit can splice in a
-  /// shell-built, conditionally-empty suffix. See `notifyMetadata` for the
-  /// notify counterpart.
+  /// is appended verbatim (e.g. `;pid=123`); the emit appends its own in shell,
+  /// since the field is conditional. See `notifyMetadata` for the notify
+  /// counterpart.
   static func metadata(event: HookEvent, pidSuffix: String = "") -> String {
     "\(eventField)=\(event.rawValue)\(pidSuffix)"
   }
 
-  /// Shell that resolves `$__ppid` (the hook's parent agent) and its `$__tty`, since
-  /// hooks run with no controlling terminal and `ps` reports a bare tty name (`??`
-  /// falls back to `/dev/tty`). `set -f` is load-bearing: that `??` is a glob.
+  /// Shell prelude every emitting hook runs once: resolves `$__ppid` (the hook's
+  /// parent agent) and clears `$__tty`, the lazily-resolved OSC sink.
   ///
   /// Neither `ps -o ppid= -p $$` (Grok collapses `$$` to a bare `$` when it rewrites
   /// the command) nor a bare `$PPID` (Grok preflights it as required env and skips
   /// the hook, #704) works; only the `:-` form survives to the runtime shell.
   /// A ppid of 0 or 1 is dropped: `kill(1, 0)`'s `EPERM` reads as alive to the
   /// liveness sweep and would pin the badge until surface close.
-  static let ttyResolveSnippet =
-    #"__ppid=${PPID:-}; "#
-    + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
-    + #"case "$__ppid" in 0|1) __ppid="";; esac; "#
-    + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac"#
+  static let preludeSnippet =
+    #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; __tty="""#
 
-  /// Shell `printf` that emits the OSC 3008 presence sequence for `event`. Written
-  /// to the `$__tty` device resolved by `ttyResolveSnippet` so it reaches the
-  /// terminal even though the hook has no controlling terminal and captured
-  /// stdout. The caller guards emission on `SUPACODE_SURFACE_ID` and runs
-  /// `ttyResolveSnippet` first.
+  /// Resolves the parent agent's terminal, since hooks run with no controlling
+  /// terminal of their own and `ps` reports a bare tty name (`??` falls back to
+  /// `/dev/tty`). `set -f` is load-bearing: that `??` is a glob.
+  ///
+  /// Idempotent and lazy — it runs only inside the OSC fallback arm, so a local
+  /// hook never pays the `ps` fork, and a composite that falls back twice resolves
+  /// once. The resolve always lands on a non-empty path, so `$__tty` doubles as
+  /// the already-resolved flag.
+  static let ttyResolveSnippet =
+    #"[ -n "$__tty" ] || { "#
+    + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
+    + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }"#
+
+  /// Ships the signal already built into `$__md`: over the socket when one is
+  /// reachable, else as OSC 3008 on the parent agent's tty.
+  ///
+  /// The socket arm's exit status is the fallback condition, so a stale
+  /// `SUPACODE_SOCKET_PATH` (an app restart under a surviving zmx session) still
+  /// lands the signal instead of silently dropping it. Everything on the wire is
+  /// JSON-safe by construction: the metadata is `key=value` pairs whose values are
+  /// event names, digits, or standard base64.
+  private static func sendShell(agent: SkillAgent, action: String) -> String {
+    let envelope =
+      #"{"\#(signalField)":"\#(agent.rawValue)","\#(metadataField)":"%s","\#(surfaceIDField)":"%s"}"#
+    let osc = #"\033]3008;\#(action)=\#(agent.rawValue);%s\033\\"#
+    return #"{ [ -n "${\#(socketEnvVar):-}" ] "#
+      + #"&& printf '\#(envelope)' "$__md" "${\#(surfaceEnvVar):-}" "#
+      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "${\#(socketEnvVar):-}"; } "#
+      + #"|| { \#(ttyResolveSnippet); printf '\#(osc)' "$__md" > "$__tty"; }"#
+  }
+
+  /// Shell that emits the presence signal for `event` over the available
+  /// transport. The caller guards emission on `SUPACODE_SURFACE_ID` and runs
+  /// `preludeSnippet` first.
   ///
   /// The pid suffix is gated on `SUPACODE_SOCKET_PATH` (set only on the local host)
   /// and on `$__ppid` having resolved, so a remote hook or a reparented shell leaves
   /// the field off the wire instead of sending a dangling `pid=`. Both shapes parse to
   /// `pid: nil` today, so this is wire hygiene, not a behavior fix: a local agent
   /// with no resolvable parent stays untracked by the liveness sweep either way. A
-  /// forged positive pid at worst pins a live-looking badge until surface close. The
-  /// suffix is built in shell and filled into a trailing `%s`.
+  /// forged positive pid at worst pins a live-looking badge until surface close.
   static func emitShell(event: HookEvent, agent: SkillAgent) -> String {
-    // Trailing %s for the shell-built, conditionally-empty pid suffix.
-    let meta = metadata(event: event, pidSuffix: "%s")
-    let payload = #"\033]3008;\#(action(for: event))=\#(agent.rawValue);\#(meta)\033\\"#
-    return #"__sp=""; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
-      + #"&& __sp=";\#(pidField)=$__ppid"; "#
-      + #"printf '\#(payload)' "$__sp" > "$__tty""#
+    #"__md="\#(metadata(event: event))"; "#
+      + #"[ -n "${\#(socketEnvVar):-}" ] && [ -n "$__ppid" ] "#
+      + #"&& __md="$__md;\#(pidField)=$__ppid"; "#
+      + sendShell(agent: agent, action: action(for: event))
   }
 
   /// The `key=value` metadata a notify signal carries; `title` / `body` are base64.
@@ -231,15 +289,14 @@ public nonisolated enum AgentPresenceOSC {
     "\(kindField)=\(notifyKind);\(titleField)=\(title);\(bodyField)=\(body)"
   }
 
-  /// Notify OSC whose `title` / `body` are base64-encoded when the command is
+  /// Notify signal whose `title` / `body` are base64-encoded when the command is
   /// composed, so the hook needs no runtime `base64` / `awk`. Standard base64
-  /// carries no `;` or `%`, so it is framing- and `printf`-safe with no format args.
+  /// carries no `;`, `%` or `"`, so it is framing-, `printf`- and JSON-safe.
   static func emitFixedNotifyShell(agent: SkillAgent, title: String, body: String) -> String {
     let encodedTitle = Data(title.utf8).base64EncodedString()
     let encodedBody = Data(body.utf8).base64EncodedString()
-    let payload =
-      #"\033]3008;start=\#(agent.rawValue);\#(notifyMetadata(title: encodedTitle, body: encodedBody))\033\\"#
-    return #"printf '\#(payload)' > "$__tty""#
+    return #"__md="\#(notifyMetadata(title: encodedTitle, body: encodedBody))"; "#
+      + sendShell(agent: agent, action: "start")
   }
 
   /// Portable awk that extracts one JSON string value from the agent's hook JSON
@@ -275,7 +332,7 @@ public nonisolated enum AgentPresenceOSC {
 
   /// Reads the hook JSON from stdin once, extracts a bounded title/body via a
   /// portable `awk` pass (no `jq`/`python`, so it works over SSH), base64s each,
-  /// and emits the OSC 3008 notify. Sending only the display fields keeps the wire
+  /// and emits the notify signal. Sending only the display fields keeps the wire
   /// under libghostty's 2048-byte OSC ceiling. Locked to STANDARD base64.
   /// `readsStdin: false` skips the capture when the caller already set `$__in`.
   ///
@@ -283,14 +340,14 @@ public nonisolated enum AgentPresenceOSC {
   /// displays (the app falls back to the agent name for a missing title) and
   /// supersedes the agent's own OSC 9, so it is worse than sending nothing.
   static func emitNotifyShell(agent: SkillAgent, readsStdin: Bool = true) -> String {
-    let payload = #"\033]3008;start=\#(agent.rawValue);\#(notifyMetadata(title: "%s", body: "%s"))\033\\"#
     let bodyKeys = notifyBodyKeys.joined(separator: ",")
     return (readsStdin ? "\(readStdinSnippet); " : "")
       + #"__t=$(printf '%s' "$__in" | LC_ALL=C awk -v keys="\#(titleField)" "#
       + #"-v budget=\#(notifyTitleByteBudget) '\#(notifyExtractAwk)' | base64 | tr -d '\n'); "#
       + #"__b=$(printf '%s' "$__in" | LC_ALL=C awk -v keys="\#(bodyKeys)" "#
       + #"-v budget=\#(notifyBodyByteBudget) '\#(notifyExtractAwk)' | base64 | tr -d '\n'); "#
-      + #"[ -n "$__t$__b" ] && printf '\#(payload)' "$__t" "$__b" > "$__tty""#
+      + #"if [ -n "$__t$__b" ]; then __md="\#(notifyMetadata(title: "$__t", body: "$__b"))"; "#
+      + #"\#(sendShell(agent: agent, action: "start")); fi"#
   }
 
   // MARK: - Stop-hook API-error probe.

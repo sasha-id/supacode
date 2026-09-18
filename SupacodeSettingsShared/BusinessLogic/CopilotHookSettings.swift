@@ -33,7 +33,7 @@ nonisolated enum CopilotHookSettings {
   private static var notificationCommand: String {
     let surfaceGuard = #"[ -n "${\#(AgentPresenceOSC.surfaceEnvVar):-}" ]"#
     let needsYou =
-      #"\#(AgentPresenceOSC.ttyResolveSnippet); "#
+      #"\#(AgentPresenceOSC.preludeSnippet); "#
       + AgentPresenceOSC.emitShell(event: .awaitingInput, agent: .copilot) + "; "
       + AgentPresenceOSC.emitNotifyShell(agent: .copilot, readsStdin: false)
     let steps =

@@ -5,16 +5,17 @@ import SupacodeSettingsShared
 
 private nonisolated let socketLogger = SupaLogger("AgentHookSocket")
 
-/// Lightweight Unix domain socket server for the Supacode CLI control protocol.
+/// Lightweight Unix domain socket server for the Supacode CLI control protocol
+/// and local agent presence.
 ///
-/// Two message formats are supported, both JSON objects:
+/// Three message formats are supported, all JSON objects:
 /// - **Command**: a `"deeplink"` key wrapping a `supacode://` URL.
 /// - **Query**: a `"query"` key and optional parameters.
-///
-/// Agent presence and notifications no longer travel over the socket. Hooks emit
-/// them as OSC 3008 to the terminal (see `AgentPresenceOSC`), which also works
-/// over SSH where this socket can't be reached; the socket carries only the CLI
-/// control protocol.
+/// - **Context signal**: a `"signal"` key with `"metadata"` and `"surface_id"` —
+///   the agent presence / notify wire (see `AgentPresenceOSC`), sent by hooks
+///   running on this host. It is the preferred transport precisely because it
+///   leaves the agent's terminal alone; hooks fall back to OSC 3008 on the tty
+///   only over SSH, or when this socket turns out to be unreachable.
 @MainActor
 final class AgentHookSocketServer {
   private(set) var socketPath: String?
@@ -26,6 +27,10 @@ final class AgentHookSocketServer {
   var onCommand: ((URL, Int32) -> Void)?
   /// Query received from the CLI. Parameters: resource name, extra params, client FD for response.
   var onQuery: ((String, [String: String], Int32) -> Void)?
+  /// Presence / notify signal from a local agent hook. Parameters: context id,
+  /// raw `key=value` metadata, attributed surface. Fire-and-forget — the client
+  /// is already acked by the time this fires, so handlers must not block.
+  var onContextSignal: ((String, String, UUID) -> Void)?
 
   /// `socketPathOverride` lets tests bind a unique path; the default is the
   /// pid-derived path the CLI discovers.
@@ -99,6 +104,7 @@ final class AgentHookSocketServer {
     // instead of running against state the owner is tearing down.
     onCommand = nil
     onQuery = nil
+    onContextSignal = nil
     if let socketPath {
       unlink(socketPath)
     }
@@ -170,6 +176,8 @@ final class AgentHookSocketServer {
         return
       }
       handler(resource, params, clientFD)
+    case .contextSignal(let id, let metadata, let surfaceID):
+      server?.onContextSignal?(id, metadata, surfaceID)
     }
   }
 
@@ -290,6 +298,10 @@ final class AgentHookSocketServer {
     case command(deeplinkURL: URL, clientFD: Int32)
     /// CLI query with the client FD kept open for writing data back.
     case query(resource: String, params: [String: String], clientFD: Int32)
+    /// Presence / notify signal from a local agent hook. Acked before dispatch,
+    /// so the FD is already closed by the time the handler runs: a hook must
+    /// never block on app state.
+    case contextSignal(id: String, metadata: String, surfaceID: UUID)
   }
 
   /// Writes a JSON response with data to a client and closes the FD.
@@ -372,11 +384,16 @@ final class AgentHookSocketServer {
     }
 
     // Command/query messages keep the FD open so the handler can write a response.
+    // A context signal is acked here instead: the hook that sent it is holding up
+    // an agent turn, so it must never wait on app state.
     switch message {
     case .command(let url, _):
       return .command(deeplinkURL: url, clientFD: clientFD)
     case .query(let resource, let params, _):
       return .query(resource: resource, params: params, clientFD: clientFD)
+    case .contextSignal:
+      sendCommandResponse(clientFD: clientFD, ok: true)
+      return message
     }
   }
 
@@ -417,7 +434,7 @@ final class AgentHookSocketServer {
       socketLogger.debug("Dropped empty CLI payload")
       return nil
     }
-    // The CLI control protocol is always a JSON object (command or query).
+    // Every message on this socket is a JSON object (command, query or signal).
     guard raw.hasPrefix("{") else {
       socketLogger.debug("Dropped non-JSON socket payload")
       return nil
@@ -425,7 +442,7 @@ final class AgentHookSocketServer {
     return parseJSONMessage(data: data)
   }
 
-  /// Parses a CLI JSON message into a query or command. The placeholder
+  /// Parses a JSON message into a signal, query or command. The placeholder
   /// `clientFD` of `-1` is replaced with the real FD in `acceptAndParse`.
   private nonisolated static func parseJSONMessage(data: Data) -> Message? {
     guard let request = SocketCommandRequest(data: data) else {
@@ -433,6 +450,8 @@ final class AgentHookSocketServer {
       return nil
     }
     switch request {
+    case .contextSignal(let id, let metadata, let surfaceID):
+      return .contextSignal(id: id, metadata: metadata, surfaceID: surfaceID)
     case .query(let resource, let params):
       return .query(resource: resource, params: params, clientFD: -1)
     case .command(let deeplink, _):
@@ -592,14 +611,28 @@ nonisolated struct AgentHookEvent: Equatable, Sendable, Decodable {
   }
 }
 
-/// Parsed CLI request payload: either a deeplink command or a query with params.
+/// Parsed socket payload: an agent context signal, a deeplink command, or a
+/// query with params.
 private nonisolated enum SocketCommandRequest {
   case command(deeplink: String, params: [String: String])
   case query(resource: String, params: [String: String])
+  case contextSignal(id: String, metadata: String, surfaceID: UUID)
 
   init?(data: Data) {
     guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
       return nil
+    }
+    // A `signal` key routes to the presence parser exclusively: a malformed
+    // signal must not fall through to query/command and log two misleading
+    // warnings instead of one.
+    if let id = dict[AgentPresenceOSC.signalField] as? String {
+      guard !id.isEmpty,
+        let metadata = dict[AgentPresenceOSC.metadataField] as? String,
+        let rawSurfaceID = dict[AgentPresenceOSC.surfaceIDField] as? String,
+        let surfaceID = UUID(uuidString: rawSurfaceID)
+      else { return nil }
+      self = .contextSignal(id: id, metadata: metadata, surfaceID: surfaceID)
+      return
     }
     var extracted: [String: String] = [:]
     for (key, value) in dict where key != "deeplink" && key != "query" {

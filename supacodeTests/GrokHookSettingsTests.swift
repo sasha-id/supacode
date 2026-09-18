@@ -110,12 +110,14 @@ struct GrokHookSettingsTests {
   /// Parse every OSC 3008 presence signal a composite command emits, mirroring
   /// libghostty's `id;metadata` split. The `%s` pid placeholder is dropped to
   /// match the no-pid remote wire the parser receives over SSH.
+  /// Pulls every metadata literal the command builds (`__md="…"`) and runs it
+  /// through the real parser. Both transports carry that one string, so this
+  /// covers the socket and the OSC leg at once; the pid append and the notify
+  /// leg parse as nil and drop out.
   private static func parsedPresenceSignals(in command: String) -> [AgentPresenceOSC.Signal] {
-    command.components(separatedBy: "]3008;").dropFirst().compactMap { chunk in
-      guard let stEnd = chunk.range(of: #"\033"#) else { return nil }
-      let sequence = chunk[..<stEnd.lowerBound].replacing("%s", with: "")
-      guard let idEnd = sequence.firstIndex(of: ";") else { return nil }
-      return AgentPresenceOSC.parse(id: "grok", metadata: String(sequence[sequence.index(after: idEnd)...]))
+    command.components(separatedBy: #"__md=""#).dropFirst().compactMap { chunk in
+      guard let end = chunk.firstIndex(of: "\"") else { return nil }
+      return AgentPresenceOSC.parse(id: "grok", metadata: String(chunk[..<end]))
     }
   }
 

@@ -1,6 +1,7 @@
 import ConcurrencyExtras
 import Darwin
 import Foundation
+import SupacodeSettingsShared
 import Testing
 
 @testable import supacode
@@ -88,6 +89,59 @@ struct AgentHookSocketServerTests {
   @Test func rejectsJSONWithNeitherQueryNorDeeplink() {
     let json = #"{"foo":"bar"}"#
     #expect(AgentHookSocketServer.parse(data: Data(json.utf8)) == nil)
+  }
+
+  // MARK: - Context signal parsing.
+
+  @Test func parsesValidContextSignalMessage() throws {
+    let surfaceID = UUID()
+    let json = """
+      {"signal":"claude","metadata":"event=busy;pid=42","surface_id":"\(surfaceID.uuidString)"}
+      """
+    let message = AgentHookSocketServer.parse(data: Data(json.utf8))
+
+    guard case .contextSignal(let id, let metadata, let parsedSurfaceID) = message else {
+      Issue.record("Expected context signal, got \(String(describing: message))")
+      return
+    }
+    #expect(id == "claude")
+    #expect(parsedSurfaceID == surfaceID)
+    // The metadata must reach the app byte-identical to the OSC leg's, since
+    // both share one parser.
+    let signal = try #require(AgentPresenceOSC.parse(id: id, metadata: metadata))
+    #expect(signal.eventRawValue == "busy")
+    #expect(signal.pid == 42)
+  }
+
+  @Test func rejectsContextSignalWithEmptyID() {
+    let json = #"{"signal":"","metadata":"event=busy","surface_id":"\#(UUID().uuidString)"}"#
+    #expect(AgentHookSocketServer.parse(data: Data(json.utf8)) == nil)
+  }
+
+  @Test func rejectsContextSignalWithoutMetadata() {
+    let json = #"{"signal":"claude","surface_id":"\#(UUID().uuidString)"}"#
+    #expect(AgentHookSocketServer.parse(data: Data(json.utf8)) == nil)
+  }
+
+  @Test func rejectsContextSignalWithUnparsableSurfaceID() {
+    // Attribution is the whole point of the envelope: without a usable surface
+    // the app has nowhere to route the badge, so the message is dropped, not
+    // guessed at.
+    let json = #"{"signal":"claude","metadata":"event=busy","surface_id":"not-a-uuid"}"#
+    #expect(AgentHookSocketServer.parse(data: Data(json.utf8)) == nil)
+  }
+
+  @Test func contextSignalTakesPrecedenceOverQueryAndDeeplink() {
+    let json = """
+      {"signal":"claude","metadata":"event=busy","surface_id":"\(UUID().uuidString)",\
+      "query":"repos","deeplink":"supacode://worktree/test"}
+      """
+    let message = AgentHookSocketServer.parse(data: Data(json.utf8))
+
+    guard case .contextSignal = message else {
+      Issue.record("Expected context signal, got \(String(describing: message))")
+      return
+    }
   }
 
   // MARK: - readPayload.

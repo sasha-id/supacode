@@ -1,3 +1,4 @@
+import ConcurrencyExtras
 import Foundation
 import Testing
 
@@ -170,7 +171,11 @@ struct AgentHookCommandTests {
       AgentHookSettingsCommand.claudeStopCommand(agent: .claude),
     ]
     for command in commands {
-      #expect(command.ranges(of: "ps -o").count == 1)
+      // The resolve text repeats once per emit, since each emit carries its own
+      // OSC fallback arm, but every copy is gated on `$__tty` still being empty.
+      // Runtime coverage that this really forks once lives in
+      // `theTTYResolveForksPSOnceAcrossEveryEmit`.
+      #expect(command.ranges(of: "ps -o").count == command.ranges(of: #"[ -n "$__tty" ] || {"#).count)
       #expect(command.ranges(of: "IFS= read -r __in").count == 1)
       #expect(!command.contains("| tr -d '[:space:]'"))
       #expect(command.contains("__ppid=${PPID:-}"))
@@ -328,16 +333,18 @@ struct AgentHookCommandTests {
 
   // MARK: - Shared constants consistency.
 
-  @Test func socketPathGatesThePresencePidSuffixOnly() {
-    // `SUPACODE_SOCKET_PATH` survives in the command solely as the local-host
-    // gate for the pid suffix on presence; the notify-only command (no pid)
-    // never references it.
+  @Test func socketPathSelectsTheTransportAndGatesThePidSuffix() {
+    // `SUPACODE_SOCKET_PATH` does two jobs: it picks the transport (so every
+    // command references it) and marks the hook as local, which is the only
+    // condition under which presence may carry a pid. Notify never carries one.
     let presence = AgentHookSettingsCommand.compositeCommand(
       events: [.busy], forwardStdinAsNotification: false, agent: .claude)
     let notifyOnly = AgentHookSettingsCommand.compositeCommand(
       events: [], forwardStdinAsNotification: true, agent: .claude)
     #expect(presence.contains(AgentHookSettingsCommand.socketPathEnvVar))
-    #expect(!notifyOnly.contains(AgentHookSettingsCommand.socketPathEnvVar))
+    #expect(notifyOnly.contains(AgentHookSettingsCommand.socketPathEnvVar))
+    #expect(presence.contains(#"__md="$__md;\#(AgentPresenceOSC.pidField)=$__ppid""#))
+    #expect(!notifyOnly.contains(";pid="))
   }
 
   // MARK: - compositeCommand branches.
@@ -444,65 +451,97 @@ struct AgentHookCommandTests {
     )
     let expected =
       #"[ -n "${SUPACODE_SURFACE_ID:-}" ] && { "#
-      + #"__ppid=${PPID:-}; "#
+      + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; __tty=""; "#
+      + #"__md="event=busy"; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
+      + #"&& __md="$__md;pid=$__ppid"; "#
+      + #"{ [ -n "${SUPACODE_SOCKET_PATH:-}" ] "#
+      + #"&& printf '{"signal":"claude","metadata":"%s","surface_id":"%s"}' "$__md" "${SUPACODE_SURFACE_ID:-}" "#
+      + #"| /usr/bin/nc -U -w1 "${SUPACODE_SOCKET_PATH:-}"; } "#
+      + #"|| { [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
-      + #"case "$__ppid" in 0|1) __ppid="";; esac; "#
-      + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; "#
-      + #"__sp=""; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
-      + #"&& __sp=";pid=$__ppid"; "#
-      + #"printf '\033]3008;start=claude;event=busy%s\033\\' "$__sp" > "$__tty"; "#
+      + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
+      + #"printf '\033]3008;start=claude;%s\033\\' "$__md" > "$__tty"; }; "#
       + #"} >/dev/null 2>&1 || true # supacode-managed-hook"#
     #expect(composite == expected)
   }
 
   // MARK: - OSC presence emission.
 
-  @Test func compositeEmitsOSCPresenceGuardedBySurface() {
+  @Test func compositeEmitsPresenceGuardedBySurfaceOverBothTransports() {
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.busy], forwardStdinAsNotification: false, agent: .claude)
-    // OSC is the sole transport, gated only by the surface id (no-op outside
-    // Supacode). It fires local and remote alike, and carries no token.
-    #expect(command.contains("]3008;start=claude;event=busy"))
+    // Emission is gated only by the surface id (no-op outside Supacode) and
+    // carries no token. The socket leg leads; the OSC leg is its fallback.
     #expect(command.contains(#"[ -n "${SUPACODE_SURFACE_ID:-}" ]"#))
     #expect(!command.contains("token="))
+    #expect(command.contains(#""signal":"claude""#))
+    #expect(command.contains(#"/usr/bin/nc -U -w1 "${SUPACODE_SOCKET_PATH:-}""#))
+    #expect(command.contains("]3008;start=claude;"))
     #expect(command.contains(#"> "$__tty""#))
     #expect(command.contains("ps -o tty= -p \"$__ppid\""))
-    #expect(!command.contains(#"[ -z "${SUPACODE_SOCKET_PATH:-}" ]"#))
   }
 
-  @Test func sessionStartComposesOSCPresenceForOSCAgents() {
+  @Test func presenceOSCLegIsTheFallbackArmOfTheSocketLeg() throws {
+    // The ordering is the whole fix: writing to the agent's tty must happen only
+    // when the socket leg has already failed, never alongside it. `ps` sits in
+    // the same arm, so a local session never pays that fork either — and hooks
+    // fire on every tool call.
+    let command = AgentHookSettingsCommand.compositeCommand(
+      events: [.busy], forwardStdinAsNotification: false, agent: .claude)
+    let socket = try #require(command.range(of: "/usr/bin/nc -U")).lowerBound
+    let fallback = try #require(command.range(of: #"|| { [ -n "$__tty" ] ||"#)).lowerBound
+    let resolve = try #require(command.range(of: "ps -o tty=")).lowerBound
+    let osc = try #require(command.range(of: "]3008;start=claude;")).lowerBound
+    #expect(socket < fallback)
+    #expect(fallback < resolve)
+    #expect(resolve < osc)
+  }
+
+  @Test func sessionStartComposesPresenceForOSCAgents() {
+    // The metadata is built once into `$__md` and handed to both transports, so
+    // the agent name has to be right in the socket envelope AND the OSC action.
     for agent in [SkillAgent.claude, .codex, .grok, .opencode] {
       let command = AgentHookSettingsCommand.compositeCommand(
         events: [.sessionStart], forwardStdinAsNotification: false, agent: agent)
-      #expect(command.contains("]3008;start=\(agent.rawValue);event=session_start"))
+      #expect(command.contains(#"__md="event=session_start""#))
+      #expect(command.contains(#""signal":"\#(agent.rawValue)""#))
+      #expect(command.contains("]3008;start=\(agent.rawValue);%s"))
     }
   }
 
-  @Test func sessionEndUsesOSCEndAction() {
-    let command = AgentHookSettingsCommand.compositeCommand(
-      events: [.sessionEnd, .idle], forwardStdinAsNotification: false, agent: .claude)
-    #expect(command.contains("]3008;end=claude;event=session_end"))
+  @Test func sessionEndUsesOSCEndActionAndIdleTheStartAction() {
+    // The action byte is the OSC leg's only teardown marker, so it must pair
+    // with the session_end emit and not leak into the idle one.
+    let sessionEnd = AgentHookSettingsCommand.compositeCommand(
+      events: [.sessionEnd], forwardStdinAsNotification: false, agent: .claude)
+    #expect(sessionEnd.contains(#"__md="event=session_end""#))
+    #expect(sessionEnd.contains("]3008;end=claude;%s"))
+
+    let idle = AgentHookSettingsCommand.compositeCommand(
+      events: [.idle], forwardStdinAsNotification: false, agent: .claude)
+    #expect(idle.contains("]3008;start=claude;%s"))
+    #expect(!idle.contains("end=claude"))
   }
 
-  @Test func awaitingInputComposesOSCPresence() {
-    // awaiting_input is the badge-critical "needs you" state; assert it rides OSC too.
+  @Test func awaitingInputComposesPresence() {
+    // awaiting_input is the badge-critical "needs you" state; assert it is emitted.
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.awaitingInput], forwardStdinAsNotification: false, agent: .claude)
-    #expect(command.contains("]3008;start=claude;event=awaiting_input"))
+    #expect(command.contains(#"__md="event=awaiting_input""#))
   }
 
-  @Test func notifyOnlyComposesNotifyOSCButNoPresenceOSC() {
-    // Notify-only (no events) emits the notify OSC but no presence OSC.
+  @Test func notifyOnlyComposesNotifyButNoPresence() {
+    // Notify-only (no events) emits the notify metadata but no presence metadata.
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [], forwardStdinAsNotification: true, agent: .claude)
-    #expect(command.contains("]3008;start=claude;kind=notify;"))
+    #expect(command.contains(#"__md="kind=notify;"#))
     #expect(!command.contains(";event="))
   }
 
-  @Test func notifyComposesOSCNotify() {
+  @Test func notifyComposesNotifyMetadata() {
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.idle], forwardStdinAsNotification: true, agent: .claude)
-    #expect(command.contains("]3008;start=claude;kind=notify;title=%s;body=%s"))
+    #expect(command.contains(#"__md="kind=notify;title=$__t;body=$__b""#))
     #expect(command.contains("base64 | tr -d"))
   }
 
@@ -518,11 +557,13 @@ struct AgentHookCommandTests {
     // The pid suffix is the local/remote discriminator: present when
     // SUPACODE_SOCKET_PATH is set (local host), absent over SSH. A regression
     // that always or never emitted it would silently break the liveness sweep.
+    // Both legs are read off the tty: the local one takes the fallback because
+    // the socket path points nowhere, which is exactly how the pid reaches OSC.
     let base: [String: String] = ["SUPACODE_SURFACE_ID": UUID().uuidString]
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.busy], forwardStdinAsNotification: false, agent: .claude)
 
-    // Local (socket present): the presence OSC carries a positive pid.
+    // Local (socket path present): the presence signal carries a positive pid.
     let local = try await runHookCommandCapturingTTY(
       command, env: base.merging(["SUPACODE_SOCKET_PATH": "/tmp/sock-\(UUID().uuidString)"]) { $1 })
     let localSignal = try #require(Self.parsePresence(fromTTY: local))
@@ -534,6 +575,99 @@ struct AgentHookCommandTests {
     let remoteSignal = try #require(Self.parsePresence(fromTTY: remote))
     #expect(remoteSignal.eventRawValue == "busy")
     #expect(remoteSignal.pid == nil)
+  }
+
+  // MARK: - Socket transport (real shell, real socket).
+
+  @MainActor
+  @Test func presenceRidesTheSocketAndLeavesTheAgentTTYAlone() async throws {
+    // The regression this exists for: a hook firing mid-turn wrote OSC into the
+    // agent's own tty, landing between the chunks of the agent's frame and
+    // corrupting its rendering. With the app reachable, NOTHING may reach the tty.
+    let surfaceID = UUID()
+    let run = try await runHookCommandAgainstSocket(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.busy], forwardStdinAsNotification: false, agent: .claude),
+      surfaceID: surfaceID
+    )
+    #expect(run.tty.isEmpty)
+    let signal = try #require(run.signals.first)
+    #expect(signal.surfaceID == surfaceID)
+    let presence = try #require(AgentPresenceOSC.parse(id: signal.id, metadata: signal.metadata))
+    #expect(presence.agent == "claude")
+    #expect(presence.eventRawValue == "busy")
+    #expect(presence.pid == ProcessInfo.processInfo.processIdentifier)
+  }
+
+  @MainActor
+  @Test func notifyRidesTheSocketAndLeavesTheAgentTTYAlone() async throws {
+    let run = try await runHookCommandAgainstSocket(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [], forwardStdinAsNotification: true, agent: .claude),
+      surfaceID: UUID(),
+      stdin: #"{"hook_event_name":"Stop","title":"Done","message":"hi there"}"#
+    )
+    #expect(run.tty.isEmpty)
+    let signal = try #require(run.signals.first)
+    let notify = try #require(AgentPresenceOSC.parseNotify(id: signal.id, metadata: signal.metadata))
+    #expect(notify.title == "Done")
+    #expect(notify.body == "hi there")
+  }
+
+  @MainActor
+  @Test func sessionEndAndIdleBothReachTheSocketInOrder() async throws {
+    // A composite emits several signals down one transport; each needs its own
+    // connection, so a second emit must not be swallowed by the first.
+    let run = try await runHookCommandAgainstSocket(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.sessionEnd, .idle], forwardStdinAsNotification: false, agent: .claude),
+      surfaceID: UUID(),
+      expectedSignals: 2
+    )
+    #expect(run.tty.isEmpty)
+    let events = run.signals.compactMap {
+      AgentPresenceOSC.parse(id: $0.id, metadata: $0.metadata)?.eventRawValue
+    }
+    #expect(events == ["session_end", "idle"])
+  }
+
+  @Test func theTTYResolveForksPSOnceAcrossEveryEmit() async throws {
+    // Hooks fire on every tool call, so the resolve has to be idempotent: a
+    // command with two emits must share one `ps` fork, not pay one per emit.
+    let workDir = URL(fileURLWithPath: NSTemporaryDirectory())
+      .appendingPathComponent("supacode-hook-ps-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workDir) }
+    let tally = workDir.appendingPathComponent("forks").path
+    let stub = workDir.appendingPathComponent("ps")
+    try "#!/bin/sh\nprintf 'x\\n' >> \(tally)\nprintf 'ttys001\\n'\n".write(
+      to: stub, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+
+    _ = try await runHookCommandCapturingTTY(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.sessionEnd, .idle], forwardStdinAsNotification: false, agent: .claude),
+      env: [
+        "SUPACODE_SURFACE_ID": UUID().uuidString,
+        "PATH": "\(workDir.path):/usr/bin:/bin",
+      ]
+    )
+    let forks = (try? String(contentsOfFile: tally, encoding: .utf8)) ?? ""
+    #expect(forks == "x\n")
+  }
+
+  @Test func presenceFallsBackToOSCWhenTheSocketIsUnreachable() async throws {
+    // An app restart under a surviving zmx session leaves a stale socket path in
+    // the shell's environment. Presence must still land, so the OSC leg is keyed
+    // on the send FAILING, not merely on the variable being unset.
+    let stale = "/tmp/supacode-tests/gone-\(UUID().uuidString)"
+    let tty = try await runHookCommandCapturingTTY(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.busy], forwardStdinAsNotification: false, agent: .claude),
+      env: ["SUPACODE_SURFACE_ID": UUID().uuidString, "SUPACODE_SOCKET_PATH": stale]
+    )
+    let signal = try #require(Self.parsePresence(fromTTY: tty))
+    #expect(signal.eventRawValue == "busy")
   }
 
   @Test func notifyExtractsBodyFromStdinThroughAwk() async throws {
@@ -601,7 +735,7 @@ struct AgentHookCommandTests {
     // as defense in depth because `kill(1, 0)`'s EPERM reads as alive to the liveness
     // sweep and would pin the badge until surface close. Asserted on the command: no
     // shell lets a test forge `$PPID`.
-    #expect(AgentPresenceOSC.ttyResolveSnippet.contains(#"case "$__ppid" in 0|1) __ppid="";; esac"#))
+    #expect(AgentPresenceOSC.preludeSnippet.contains(#"case "$__ppid" in 0|1) __ppid="";; esac"#))
   }
 
   @Test func notifyAwkPreservesEscapedQuotesNewlinesAndUnicode() async throws {
@@ -957,20 +1091,29 @@ struct AgentHookCommandTests {
     return AgentPresenceOSC.parseNotify(id: id, metadata: metadata)
   }
 
-  // Shared head: surface-id guard, then (inside one brace group) resolve $__ppid /
-  // $__tty from the parent agent's terminal since the hook has none of its own.
-  private static let guardAndTTY =
+  // Shared head: surface-id guard, then (inside one brace group) the prelude that
+  // resolves $__ppid from the parent agent and clears the lazy OSC sink $__tty.
+  private static let guardAndPrelude =
     #"[ -n "${SUPACODE_SURFACE_ID:-}" ] && { "#
-    + #"__ppid=${PPID:-}; "#
-    + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
-    + #"case "$__ppid" in 0|1) __ppid="";; esac; "#
-    + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; "#
+    + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; __tty=""; "#
   private static let suppressTail = #"} >/dev/null 2>&1 || true # supacode-managed-hook"#
 
+  /// Transport branch shared by presence and notify: socket first, OSC on the
+  /// parent agent's tty (resolved lazily, once) when the socket is unreachable.
+  private static func send(_ action: String, _ agent: String) -> String {
+    #"{ [ -n "${SUPACODE_SOCKET_PATH:-}" ] "#
+      + #"&& printf '{"signal":"\#(agent)","metadata":"%s","surface_id":"%s"}' "$__md" "${SUPACODE_SURFACE_ID:-}" "#
+      + #"| /usr/bin/nc -U -w1 "${SUPACODE_SOCKET_PATH:-}"; } "#
+      + #"|| { [ -n "$__tty" ] || { "#
+      + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
+      + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
+      + #"printf '\033]3008;\#(action)=\#(agent);%s\033\\' "$__md" > "$__tty"; }"#
+  }
+
   private static func presence(_ action: String, _ agent: String, _ event: String) -> String {
-    #"__sp=""; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
-      + #"&& __sp=";pid=$__ppid"; "#
-      + #"printf '\033]3008;\#(action)=\#(agent);event=\#(event)%s\033\\' "$__sp" > "$__tty"; "#
+    #"__md="event=\#(event)"; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
+      + #"&& __md="$__md;pid=$__ppid"; "#
+      + send(action, agent) + "; "
   }
 
   private static func notify(_ agent: String) -> String {
@@ -981,30 +1124,32 @@ struct AgentHookCommandTests {
       + #"-v budget=\#(AgentPresenceOSC.notifyTitleByteBudget) '\#(awk)' | base64 | tr -d '\n'); "#
       + #"__b=$(printf '%s' "$__in" | LC_ALL=C awk -v keys="\#(bodyKeys)" "#
       + #"-v budget=\#(AgentPresenceOSC.notifyBodyByteBudget) '\#(awk)' | base64 | tr -d '\n'); "#
-      + #"[ -n "$__t$__b" ] && "#
-      + #"printf '\033]3008;start=\#(agent);kind=notify;title=%s;body=%s\033\\' "$__t" "$__b" > "$__tty"; "#
+      + #"if [ -n "$__t$__b" ]; then __md="kind=notify;title=$__t;body=$__b"; "#
+      + send("start", agent) + "; fi; "
   }
 
   static let snapshotClaudeBusy =
-    guardAndTTY + presence("start", "claude", "busy") + suppressTail
+    guardAndPrelude + presence("start", "claude", "busy") + suppressTail
 
   static let snapshotClaudeIdleAndNotify =
-    guardAndTTY + presence("start", "claude", "idle") + notify("claude") + suppressTail
+    guardAndPrelude + presence("start", "claude", "idle") + notify("claude") + suppressTail
 
   static let snapshotClaudeSessionEndAndIdle =
-    guardAndTTY + presence("end", "claude", "session_end") + presence("start", "claude", "idle") + suppressTail
+    guardAndPrelude + presence("end", "claude", "session_end") + presence("start", "claude", "idle")
+    + suppressTail
 
   static let snapshotCodexIdleAndNotify =
-    guardAndTTY + presence("start", "codex", "idle") + notify("codex") + suppressTail
+    guardAndPrelude + presence("start", "codex", "idle") + notify("codex") + suppressTail
 
   static let snapshotKiroIdleAndNotify =
-    guardAndTTY + presence("start", "kiro", "idle") + notify("kiro") + suppressTail
+    guardAndPrelude + presence("start", "kiro", "idle") + notify("kiro") + suppressTail
 
   static let snapshotOpencodeBusy =
-    guardAndTTY + presence("start", "opencode", "busy") + suppressTail
+    guardAndPrelude + presence("start", "opencode", "busy") + suppressTail
 
   static let snapshotOpencodeSessionEndAndIdle =
-    guardAndTTY + presence("end", "opencode", "session_end") + presence("start", "opencode", "idle") + suppressTail
+    guardAndPrelude + presence("end", "opencode", "session_end")
+    + presence("start", "opencode", "idle") + suppressTail
 
   /// Runs `ttyResolveSnippet` against a `ps` stub that always prints
   /// `stubbedPSOutput`, from a directory seeded with `workingDirectoryEntries`,
@@ -1036,7 +1181,10 @@ struct AgentHookCommandTests {
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-c", "\(AgentPresenceOSC.ttyResolveSnippet); printf '%s' \"\(variable)\""]
+    // The resolve is lazy — it only runs when `$__tty` is still unset — so it
+    // needs the prelude that declares it, exactly as the composite composes them.
+    let snippet = "\(AgentPresenceOSC.preludeSnippet); \(AgentPresenceOSC.ttyResolveSnippet)"
+    process.arguments = ["-c", "\(snippet); printf '%s' \"\(variable)\""]
     process.currentDirectoryURL = workDir
     process.environment = ["PATH": "\(binDir.path):/usr/bin:/bin"]
     let pipe = Pipe()
@@ -1047,6 +1195,55 @@ struct AgentHookCommandTests {
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     for await _ in exited {}
     return String(bytes: data, encoding: .utf8) ?? ""
+  }
+
+  /// A context signal as the app received it off the socket.
+  struct CapturedSignal {
+    let id: String
+    let metadata: String
+    let surfaceID: UUID
+  }
+
+  /// Runs `command` against a live `AgentHookSocketServer` on a private path,
+  /// with the tty sink still redirected to a capture file. Returns both, so a
+  /// test can assert what reached the app AND that nothing reached the tty.
+  @MainActor
+  private func runHookCommandAgainstSocket(
+    _ command: String, surfaceID: UUID, stdin: String = "", expectedSignals: Int = 1
+  ) async throws -> (tty: String, signals: [CapturedSignal]) {
+    let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
+    let socketPath = "\(directory)/pid-\(ProcessInfo.processInfo.processIdentifier)"
+    let server = AgentHookSocketServer(socketPathOverride: socketPath)
+    defer {
+      server.shutdown()
+      try? FileManager.default.removeItem(atPath: directory)
+    }
+    try #require(server.socketPath == socketPath)
+
+    let signals = LockIsolated<[CapturedSignal]>([])
+    let (arrived, arrivedContinuation) = AsyncStream<Void>.makeStream()
+    server.onContextSignal = { id, metadata, signalSurfaceID in
+      let count = signals.withValue {
+        $0.append(CapturedSignal(id: id, metadata: metadata, surfaceID: signalSurfaceID))
+        return $0.count
+      }
+      if count >= expectedSignals { arrivedContinuation.finish() }
+    }
+
+    let tty = try await runHookCommandCapturingTTY(
+      command,
+      env: ["SUPACODE_SURFACE_ID": surfaceID.uuidString, "SUPACODE_SOCKET_PATH": socketPath],
+      stdin: stdin)
+
+    // The hook is acked from the accept thread and exits before the handler has
+    // hopped to the main actor, so the signals land after the process is gone.
+    let watchdog = Task {
+      try? await Task.sleep(for: .seconds(10))
+      arrivedContinuation.finish()
+    }
+    for await _ in arrived {}
+    watchdog.cancel()
+    return (tty, signals.value)
   }
 
   /// Runs `command` with `/dev/tty` (the OSC sink) redirected to a capture file,

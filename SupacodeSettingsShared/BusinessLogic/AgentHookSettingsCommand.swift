@@ -34,7 +34,7 @@ nonisolated enum AgentHookSettingsCommand {
   /// Documented public env var. Used as ONE half of the legacy CLI-shim
   /// fingerprint (paired with `supacode integration event`); never matched
   /// alone. User-authored hooks reference it legitimately.
-  static let socketPathEnvVar = "SUPACODE_SOCKET_PATH"
+  static let socketPathEnvVar = AgentPresenceOSC.socketEnvVar
 
   /// Markers present in legacy Supacode hook commands (pre-socket).
   static let legacyCLIPathEnvVar = "SUPACODE_CLI_PATH"
@@ -54,10 +54,10 @@ nonisolated enum AgentHookSettingsCommand {
     + #" && [ -n "${SUPACODE_TAB_ID:-}" ]"#
     + #" && [ -n "${SUPACODE_SURFACE_ID:-}" ]"#
 
-  /// Composes the OSC 3008 hook command: one guard, then (once that passes) the
-  /// tty resolve plus a presence emit per event and/or a notify emit, all in a
-  /// single brace group whose output is suppressed. Guarding first keeps the
-  /// command truly inert outside Supacode (no `ps` runs when the surface id is
+  /// Composes the hook command: one guard, then (once that passes) the transport
+  /// prelude plus a presence emit per event and/or a notify emit, all in a single
+  /// brace group whose output is suppressed. Guarding first keeps the command
+  /// truly inert outside Supacode (nothing is spawned when the surface id is
   /// unset). The precondition rejects a no-op invocation that would emit nothing.
   static func compositeCommand(
     events: [HookEvent],
@@ -68,7 +68,7 @@ nonisolated enum AgentHookSettingsCommand {
       !events.isEmpty || forwardStdinAsNotification,
       "compositeCommand needs at least one side-effect (events or stdin forward).",
     )
-    var steps: [String] = [AgentPresenceOSC.ttyResolveSnippet]
+    var steps: [String] = [AgentPresenceOSC.preludeSnippet]
     steps += events.map { AgentPresenceOSC.emitShell(event: $0, agent: agent) }
     if forwardStdinAsNotification { steps.append(AgentPresenceOSC.emitNotifyShell(agent: agent)) }
     return "\(oscGuardExpr) && { \(steps.joined(separator: "; ")); } >/dev/null 2>&1 || true \(ownershipMarker)"
@@ -87,7 +87,7 @@ nonisolated enum AgentHookSettingsCommand {
       "\(AgentPresenceOSC.emitShell(event: .idle, agent: agent)); "
       + AgentPresenceOSC.emitNotifyShell(agent: agent, readsStdin: false)
     let steps: [String] = [
-      AgentPresenceOSC.ttyResolveSnippet,
+      AgentPresenceOSC.preludeSnippet,
       AgentPresenceOSC.stopApiErrorProbeShell(),
       #"if [ -n "$__apierr" ]; then \#(errorBranch); else \#(idleBranch); fi"#,
     ]
@@ -98,9 +98,9 @@ nonisolated enum AgentHookSettingsCommand {
   static let errorNotifyTitle = "Agent error"
   static let errorNotifyBody = "Session stopped on an error"
 
-  /// Guard for the OSC command: a surface id present (the no-op-outside-Supacode
-  /// gate). Fires both locally and over SSH; the pid suffix inside the presence
-  /// emit is what's gated on the socket path, not the emission itself.
+  /// Guard for the hook command: a surface id present (the no-op-outside-Supacode
+  /// gate). Fires both locally and over SSH; the socket path inside the emit picks
+  /// the transport (and gates the pid suffix), not whether anything is emitted.
   private static var oscGuardExpr: String {
     #"[ -n "${\#(AgentPresenceOSC.surfaceEnvVar):-}" ]"#
   }
@@ -108,9 +108,9 @@ nonisolated enum AgentHookSettingsCommand {
   /// Env vars Grok must forward into hook subprocesses. Grok spawns hooks without
   /// inheriting the terminal's `SUPACODE_*` env; `${VAR}` expansion copies from
   /// the parent Grok process at spawn time. Presence strictly needs
-  /// `SUPACODE_SURFACE_ID` (OSC guard) and uses `SUPACODE_SOCKET_PATH` for the
-  /// local pid suffix; the remaining vars match the terminal env for parity
-  /// with other agents / future hooks.
+  /// `SUPACODE_SURFACE_ID` (emit guard and socket attribution) and
+  /// `SUPACODE_SOCKET_PATH` (transport choice and local pid suffix); the remaining
+  /// vars match the terminal env for parity with other agents / future hooks.
   static let grokHookEnvPassthrough: [String: String] = [
     "SUPACODE_SURFACE_ID": "${SUPACODE_SURFACE_ID}",
     "SUPACODE_SOCKET_PATH": "${SUPACODE_SOCKET_PATH}",

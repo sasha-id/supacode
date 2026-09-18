@@ -154,13 +154,15 @@ struct OpenCodePluginInstallerTests {
     #expect(source.contains("permission.replied"))
   }
 
-  @Test func sourceEmbedsOpenCodeScopedOSCForEveryState() {
+  @Test func sourceEmbedsOpenCodeScopedPresenceForEveryState() {
+    // The plugin embeds the shared shell composite, which builds the metadata
+    // into `$__md` for both transports and scopes the agent in the OSC action.
     let source = OpenCodePluginContent.source()
-    #expect(source.contains("start=opencode;event=session_start"))
-    #expect(source.contains("start=opencode;event=busy"))
-    #expect(source.contains("start=opencode;event=idle"))
-    #expect(source.contains("start=opencode;event=awaiting_input"))
-    #expect(source.contains("end=opencode;event=session_end"))
+    for event in ["session_start", "busy", "idle", "awaiting_input", "session_end"] {
+      #expect(source.contains(#"__md=\"event=\#(event)\""#))
+    }
+    #expect(source.contains("start=opencode;%s"))
+    #expect(source.contains("end=opencode;%s"))
   }
 
   @Test func sourceDoesNotForwardNotifications() {
