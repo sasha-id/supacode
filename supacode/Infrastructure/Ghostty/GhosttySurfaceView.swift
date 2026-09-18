@@ -93,6 +93,9 @@ final class GhosttySurfaceView: NSView, Identifiable {
   // Display scale carried from creation-time geometry, authoritative until the
   // view joins a window.
   private let initialScale: CGFloat
+  // Backing size carried from creation-time geometry, so the surface — and with
+  // it the pty — is born at the real grid rather than Ghostty's placeholder.
+  private let initialPixelSize: CGSize
   // The scale last pushed to the terminal core; the frozen grid must record
   // this one, since the applied backing size was measured under it.
   private var appliedContentScale: CGFloat
@@ -249,6 +252,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
     self.bridge = GhosttySurfaceBridge()
     self.fontSize = fontSize ?? 0
     self.initialScale = initialGeometry.scale
+    self.initialPixelSize = initialGeometry.pixelSize
     self.appliedContentScale = initialGeometry.scale
     self.context = context
     self.environmentVariables = environmentVariables
@@ -273,7 +277,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
       initialInputCString = nil
     }
     // Off-window backing conversion is 1x, so a point frame equal to the intended
-    // pixel size makes ghostty_surface_new spawn the PTY at an honest grid (#780).
+    // pixel size makes the first `updateSurfaceSize()` measure the honest backing
+    // size before the view joins a window. The pty's own grid comes from
+    // `config.initial_width/height` in `createSurface()`, not from this frame —
+    // Ghostty never reads the nsview's bounds when it builds the surface.
     super.init(frame: NSRect(origin: .zero, size: initialGeometry.pixelSize))
     wantsLayer = true
     bridge.surfaceView = self
@@ -1197,6 +1204,14 @@ final class GhosttySurfaceView: NSView, Identifiable {
         nsview: Unmanaged.passUnretained(self).toOpaque()
       ))
     config.scale_factor = backingScaleFactor()
+    // Give the surface its real backing size up front. Ghostty otherwise starts
+    // at an 800x600 placeholder and waits for our first `set_size`, which is
+    // coalesced on the IO thread — so the pty would be created, and the agent
+    // exec'd, at a ~46-column grid. A wake-time re-attach repaints at that width
+    // and its hard wraps are committed to the scrollback before the real size
+    // ever lands.
+    config.initial_width = UInt32(max(1, Int(initialPixelSize.width.rounded(.down))))
+    config.initial_height = UInt32(max(1, Int(initialPixelSize.height.rounded(.down))))
     config.font_size = fontSize
     config.working_directory = workingDirectoryCString.map { UnsafePointer($0) }
     config.command = commandCString.map { UnsafePointer($0) }
@@ -2405,10 +2420,7 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
 
   private func synchronizeCoreSurface() {
     guard
-      let contentSize = Self.reportedSurfaceSize(
-        scrollContentSize: scrollView.contentSize,
-        surfaceFrameSize: surfaceView.frame.size
-      )
+      let contentSize = Self.reportedSurfaceSize(scrollContentSize: scrollView.contentSize)
     else { return }
     surfaceView.updateSurfaceSize(contentSize: contentSize)
   }
@@ -2471,13 +2483,13 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
     addTrackingArea(area)
   }
 
-  static func reportedSurfaceSize(
-    scrollContentSize: CGSize,
-    surfaceFrameSize: CGSize
-  ) -> CGSize? {
-    let width = scrollContentSize.width
-    let height = surfaceFrameSize.height
-    guard width > 0, height > 0 else { return nil }
-    return CGSize(width: width, height: height)
+  // Both dimensions come from the clip view, which is the visible area in points
+  // and already excludes a legacy scroller. The height used to come from the
+  // surface view's frame instead, which until the first layout pass still holds
+  // the creation-time backing size — a pixel count, pushed to the core as if it
+  // were points. Reading one coordinate space keeps the two honest together.
+  static func reportedSurfaceSize(scrollContentSize: CGSize) -> CGSize? {
+    guard scrollContentSize.width > 0, scrollContentSize.height > 0 else { return nil }
+    return scrollContentSize
   }
 }

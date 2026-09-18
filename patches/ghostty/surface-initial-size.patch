@@ -1,0 +1,48 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -458,6 +458,8 @@
+   const char* const* command_wrapper;
+   size_t command_wrapper_count;
+   bool disable_shell_integration;
++  uint32_t initial_width;
++  uint32_t initial_height;
+ } ghostty_surface_config_s;
+ 
+ typedef struct {
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -473,6 +473,20 @@
+         /// (e.g. a script runner that emits its own OSC sequences) and must not
+         /// have Ghostty's integration injected into the shell.
+         disable_shell_integration: bool = false,
++
++        /// The initial surface size in pixels (i.e. already multiplied by
++        /// `scale_factor`). When either is 0 the built-in placeholder is used.
++        ///
++        /// libghostty otherwise starts every surface at a fixed placeholder
++        /// size and relies on the embedder's first `ghostty_surface_set_size`
++        /// to correct it. That correction is asynchronous, so the pty is
++        /// created, and the child is exec'd, at the placeholder grid: a child
++        /// that paints on startup does so at the wrong width, and anything it
++        /// hard-wraps at that width is already committed to the scrollback by
++        /// the time the real size lands. An embedder that knows its size up
++        /// front can pass it here and skip that window entirely.
++        initial_width: u32 = 0,
++        initial_height: u32 = 0,
+     };
+ 
+     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+@@ -485,7 +499,10 @@
+                 .x = @floatCast(opts.scale_factor),
+                 .y = @floatCast(opts.scale_factor),
+             },
+-            .size = .{ .width = 800, .height = 600 },
++            .size = if (opts.initial_width > 0 and opts.initial_height > 0) .{
++                .width = opts.initial_width,
++                .height = opts.initial_height,
++            } else .{ .width = 800, .height = 600 },
+             .cursor_pos = .{ .x = -1, .y = -1 },
+         };
+ 

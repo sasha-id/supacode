@@ -1056,12 +1056,24 @@ struct GhosttySurfaceViewTests {
     #expect(!GhosttySurfaceView.isSystemManagedMenuItem(noAction))
   }
 
-  @Test func reportedSurfaceSizeUsesScrollContentWidth() {
+  @Test func reportedSurfaceSizeUsesScrollContentSize() {
+    // 799 rather than the wrapper's full 816: a legacy scroller's width is not
+    // part of the grid.
     #expect(
       GhosttySurfaceScrollView.reportedSurfaceSize(
-        scrollContentSize: CGSize(width: 799, height: 600),
-        surfaceFrameSize: CGSize(width: 816, height: 600)
+        scrollContentSize: CGSize(width: 799, height: 600)
       ) == CGSize(width: 799, height: 600)
+    )
+  }
+
+  @Test func reportedSurfaceSizeIsNilBeforeTheClipViewIsLaidOut() {
+    // A sync that lands before the first layout pass must report nothing rather
+    // than a half-measured size; the surface keeps the geometry it was born with.
+    #expect(GhosttySurfaceScrollView.reportedSurfaceSize(scrollContentSize: .zero) == nil)
+    #expect(
+      GhosttySurfaceScrollView.reportedSurfaceSize(
+        scrollContentSize: CGSize(width: 800, height: 0)
+      ) == nil
     )
   }
 
