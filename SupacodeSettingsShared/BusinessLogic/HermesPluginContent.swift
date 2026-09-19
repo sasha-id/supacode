@@ -74,10 +74,19 @@ nonisolated enum HermesPluginContent {
             sock.close()
 
 
+    def _signal_socket():
+        # The restart-stable name wins: the per-instance path a plugin inherited
+        # at spawn stops existing when the app restarts, and falling back to the
+        # terminal from inside Hermes corrupts the TUI.
+        return os.environ.get("\(AgentPresenceOSC.signalSocketEnvVar)") or os.environ.get(
+            "\(AgentPresenceOSC.socketEnvVar)"
+        )
+
+
     def _emit(action, meta):
         if not _is_supacode_surface():
             return
-        path = os.environ.get("SUPACODE_SOCKET_PATH")
+        path = _signal_socket()
         if path:
             envelope = json.dumps(
                 {
@@ -129,7 +138,7 @@ nonisolated enum HermesPluginContent {
         # Emitted only when a socket is reachable. Over a forwarded socket the pid
         # belongs to the remote host, so the app decides whether to keep it; on the
         # plain terminal leg there is no way to tell, hence the omission here.
-        return f";pid={os.getpid()}" if os.environ.get("SUPACODE_SOCKET_PATH") else ""
+        return f";pid={os.getpid()}" if _signal_socket() else ""
 
 
     \(transport)

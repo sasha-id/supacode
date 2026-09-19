@@ -60,7 +60,7 @@ struct AgentEmitterTransportTests {
   }
 
   /// Node runs the `.ts` bodies directly via type stripping (22.18+). Absent a
-  /// usable Node the extension tests have nothing to execute and stand down;
+  /// usable Node the extension tests are skipped rather than passed;
   /// the Hermes test still covers the shared envelope.
   private nonisolated static var nodeExecutable: String? {
     let searchPaths = ProcessInfo.processInfo.environment["PATH"]?.split(separator: ":") ?? []
@@ -68,6 +68,11 @@ struct AgentEmitterTransportTests {
       ["/opt/homebrew/bin/node", "/usr/local/bin/node"] + searchPaths.map { "\($0)/node" }
     return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
   }
+
+  /// What a shell that outlived an app restart still exports: the control socket
+  /// is named after the dead app's pid. Every emitter must dial the stable
+  /// signals path instead when both are present.
+  private nonisolated static let staleControlSocket = "/tmp/supacode-tests/gone/pid-1"
 
   private func makeServer() -> AgentHookSocketServer {
     AgentHookSocketServer(socketPathOverride: "/tmp/supacode-tests/\(UUID().uuidString)")
@@ -92,7 +97,7 @@ struct AgentEmitterTransportTests {
   /// Loads a generated extension under Node and calls its default export with a
   /// stub host, which is what fires `session_start` on load.
   private func expectExtensionSignalsOverTheSocket(agent: String, indexTs: String) async throws {
-    guard let node = Self.nodeExecutable else { return }
+    let node = try #require(Self.nodeExecutable)
     let server = makeServer()
     defer { server.shutdown() }
     let signalPath = try #require(server.signalSocketPath)
@@ -114,7 +119,8 @@ struct AgentEmitterTransportTests {
       ],
       environment: [
         "SUPACODE_SURFACE_ID": surfaceID.uuidString,
-        AgentPresenceOSC.socketEnvVar: signalPath,
+        AgentPresenceOSC.signalSocketEnvVar: signalPath,
+        AgentPresenceOSC.socketEnvVar: Self.staleControlSocket,
       ])
     guard result.status == 0 else {
       Issue.record("node rejected the generated \(agent) extension: \(result.standardError)")
@@ -131,11 +137,11 @@ struct AgentEmitterTransportTests {
 
   // MARK: - Extensions
 
-  @Test func thePiExtensionSignalsOverTheSocket() async throws {
+  @Test(.enabled(if: nodeExecutable != nil)) func thePiExtensionSignalsOverTheSocket() async throws {
     try await expectExtensionSignalsOverTheSocket(agent: "pi", indexTs: PiExtensionContent.indexTs)
   }
 
-  @Test func theOmpExtensionSignalsOverTheSocket() async throws {
+  @Test(.enabled(if: nodeExecutable != nil)) func theOmpExtensionSignalsOverTheSocket() async throws {
     try await expectExtensionSignalsOverTheSocket(agent: "omp", indexTs: OmpExtensionContent.indexTs)
   }
 
@@ -163,7 +169,8 @@ struct AgentEmitterTransportTests {
         "PYTHONPATH": directory.path(percentEncoded: false),
         "PYTHONDONTWRITEBYTECODE": "1",
         "SUPACODE_SURFACE_ID": surfaceID.uuidString,
-        AgentPresenceOSC.socketEnvVar: signalPath,
+        AgentPresenceOSC.signalSocketEnvVar: signalPath,
+        AgentPresenceOSC.socketEnvVar: Self.staleControlSocket,
       ])
     guard result.status == 0 else {
       Issue.record("python rejected the generated Hermes module: \(result.standardError)")

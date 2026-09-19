@@ -25,9 +25,11 @@ nonisolated enum OmpExtensionContent {
      *   SUPACODE_SURFACE_ID  present only on a Supacode surface; absence is the
      *                        no-op gate. Signals are unauthenticated.
      * Optional:
-     *   SUPACODE_SOCKET_PATH  a socket that accepts agent signals; picks the
-     *                         transport and gates the pid so the app's liveness
-     *                         sweep can reap a crashed agent.
+     *   SUPACODE_SIGNAL_SOCKET_PATH  a socket that accepts agent signals whose
+     *                         name survives an app restart. Preferred.
+     *   SUPACODE_SOCKET_PATH  the same, for a surface that predates the stable
+     *                         name. Either picks the transport and gates the pid
+     *                         so the app's liveness sweep can reap a crashed agent.
      *
      * Hook event mapping:
      *   extension load      -> session_start  (agent presence badge)
@@ -57,13 +59,22 @@ nonisolated enum OmpExtensionContent {
     }
 
     /**
+     * The socket to signal over. The restart-stable name wins: the per-instance
+     * path an agent inherited at spawn stops existing when the app restarts, and
+     * falling back to the terminal from inside the agent corrupts the TUI.
+     */
+    function signalSocket(): string | undefined {
+      return process.env["\(AgentPresenceOSC.signalSocketEnvVar)"] ?? process.env["\(AgentPresenceOSC.socketEnvVar)"];
+    }
+
+    /**
      * The agent's process id as a pid suffix, emitted only when a socket is
      * reachable. Over a forwarded socket that pid belongs to the remote host, so
      * the app decides whether to keep it; on the plain terminal leg there is no
      * way to tell, hence the omission here.
      */
     function localPidSuffix(): string {
-      return process.env["SUPACODE_SOCKET_PATH"] ? `;pid=${process.pid}` : "";
+      return signalSocket() ? `;pid=${process.pid}` : "";
     }
 
     /**
@@ -175,7 +186,7 @@ nonisolated enum OmpExtensionContent {
      */
     function emit(action: string, meta: string): Promise<void> {
       const surfaceID = process.env["SUPACODE_SURFACE_ID"] ?? "";
-      const socketPath = process.env["SUPACODE_SOCKET_PATH"];
+      const socketPath = signalSocket();
       emitQueue = emitQueue
         .then(async () => {
           if (socketPath) {

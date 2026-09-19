@@ -114,6 +114,7 @@ nonisolated enum AgentHookSettingsCommand {
   static let grokHookEnvPassthrough: [String: String] = [
     "SUPACODE_SURFACE_ID": "${SUPACODE_SURFACE_ID}",
     "SUPACODE_SOCKET_PATH": "${SUPACODE_SOCKET_PATH}",
+    AgentPresenceOSC.signalSocketEnvVar: "${\(AgentPresenceOSC.signalSocketEnvVar)}",
     "SUPACODE_TAB_ID": "${SUPACODE_TAB_ID}",
     "SUPACODE_WORKTREE_ID": "${SUPACODE_WORKTREE_ID}",
     "SUPACODE_REPO_ID": "${SUPACODE_REPO_ID}",

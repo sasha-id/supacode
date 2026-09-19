@@ -701,7 +701,8 @@ nonisolated enum ZmxAttach {
       + #"if [ -n "$supa_sock" ] && printf '' | \#(AgentPresenceOSC.netcatPath) "#
       + #"-U -w\#(AgentPresenceOSC.socketTimeoutSeconds) "$supa_sock" >/dev/null 2>&1; then "#
       + #"ln -sfn "$supa_sock" \#(symlink) "#
-      + #"&& export \#(AgentPresenceOSC.socketEnvVar)=\#(symlink); "#
+      + #"&& export \#(AgentPresenceOSC.socketEnvVar)=\#(symlink) "#
+      + #"\#(AgentPresenceOSC.signalSocketEnvVar)=\#(symlink); "#
       + #"else rm -f \#(symlink); export \#(socketUnavailableEnvVar)=1; fi; "#
   }
 

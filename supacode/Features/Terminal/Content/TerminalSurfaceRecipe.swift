@@ -98,6 +98,7 @@ nonisolated enum TerminalSurfaceRecipe {
     tabID: TabID,
     surfaceID: UUID,
     socketPath: String?,
+    signalSocketPath: String?,
     extraVariables: [String: String] = [:]
   ) -> [String: String] {
     var env = worktree.scriptEnvironment
@@ -109,7 +110,14 @@ nonisolated enum TerminalSurfaceRecipe {
     env["SUPACODE_TAB_ID"] = tabID.rawValue.uuidString
     env["SUPACODE_SURFACE_ID"] = surfaceID.uuidString
     if let socketPath {
-      env["SUPACODE_SOCKET_PATH"] = socketPath
+      env[AgentPresenceOSC.socketEnvVar] = socketPath
+    }
+    // The control socket above is named after this app instance's pid, so an
+    // agent that outlives a restart keeps a path nobody is listening on and
+    // every hook would resume writing OSC into the agent's own tty. The signals
+    // listener's name survives the restart, so presence keeps reaching the app.
+    if let signalSocketPath {
+      env[AgentPresenceOSC.signalSocketEnvVar] = signalSocketPath
     }
     env.merge(extraVariables) { _, new in new }
     // Lock ZMX_DIR to the value the app's probe used so the shell can't
@@ -239,6 +247,7 @@ nonisolated enum TerminalSurfaceRecipe {
         tabID: request.tabID,
         surfaceID: request.contentID.rawValue,
         socketPath: seed.socketPath,
+        signalSocketPath: seed.signalSocketPath,
         extraVariables: seed.extraEnvironment
       ),
       workingDirectory: workingDirectory,

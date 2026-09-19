@@ -6,8 +6,10 @@ import Foundation
 /// ingest for either:
 /// - **Unix socket** (local): a one-line JSON object
 ///   `{"signal":"<agent>","metadata":"<metadata>","surface_id":"<uuid>"}` piped to
-///   the app's control socket. Preferred whenever `SUPACODE_SOCKET_PATH` is set,
-///   because it never touches the agent's terminal.
+///   a socket the app is listening on. Preferred whenever one is named in the
+///   environment, because it never touches the agent's terminal. The socket arm
+///   counts as delivered only once the app acks, so a listener that is missing,
+///   stale, or wedged falls through to the tty instead of swallowing the signal.
 /// - **OSC 3008** (UAPI hierarchical context signal): `OSC 3008 ; <action>=<agent>
 ///   ; <metadata> ST` written to the agent's tty. libghostty splits that into
 ///   `id = <agent>` (the context id, up to the first `;`) and the metadata that
@@ -58,6 +60,19 @@ public nonisolated enum AgentPresenceOSC {
   /// discriminator. It is NOT a local-host check — see `pid` above.
   public static let socketEnvVar = "SUPACODE_SOCKET_PATH"
 
+  /// Env var carrying a signals-only socket whose name outlives the app process
+  /// that bound it. Preferred over `socketEnvVar`, which is the per-instance
+  /// control socket the CLI discovers by pid: an agent that outlives an app
+  /// restart still holds the old pid in its environment, so every hook would
+  /// fail the socket arm and resume writing OSC into the agent's own tty. This
+  /// name survives the restart, so the signal keeps reaching the app.
+  public static let signalSocketEnvVar = "SUPACODE_SIGNAL_SOCKET_PATH"
+
+  /// Shell expression resolving the socket the emitters should use, preferring
+  /// the restart-stable name.
+  static let socketPathExpression =
+    #"${\#(signalSocketEnvVar):-${\#(socketEnvVar):-}}"#
+
   /// Field names of the socket envelope. `signal` carries what OSC puts in the
   /// context id, `metadata` the identical key=value string, and `surface_id` the
   /// attribution the terminal stream gets for free from the receiving surface.
@@ -68,6 +83,15 @@ public nonisolated enum AgentPresenceOSC {
   /// Absolute path: the hook may run with a PATH that can't reach `nc` (Grok
   /// rewrites the environment, and a stripped PATH is a supported shape).
   public static let netcatPath = "/usr/bin/nc"
+
+  /// Absolute for the same reason as `netcatPath`. Used to gate the socket arm
+  /// on the app's ack: `nc -w` exits 0 when it gives up on an idle connection,
+  /// so without this a wedged listener would report success and the signal would
+  /// be dropped instead of falling back to the tty.
+  public static let grepPath = "/usr/bin/grep"
+
+  /// What the app writes back once a signal is accepted.
+  public static let ackPattern = #""ok":true"#
 
   /// Seconds `nc` waits on the socket. The app acks and half-closes immediately,
   /// so this only bounds a wedged app; the hook's own deadline is 2s.
@@ -238,7 +262,8 @@ public nonisolated enum AgentPresenceOSC {
   /// A ppid of 0 or 1 is dropped: `kill(1, 0)`'s `EPERM` reads as alive to the
   /// liveness sweep and would pin the badge until surface close.
   static let preludeSnippet =
-    #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; __tty="""#
+    #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; "#
+    + #"__sock="\#(socketPathExpression)"; __tty="""#
 
   /// Resolves the parent agent's terminal, since hooks run with no controlling
   /// terminal of their own and `ps` reports a bare tty name (`??` falls back to
@@ -256,18 +281,22 @@ public nonisolated enum AgentPresenceOSC {
   /// Ships the signal already built into `$__md`: over the socket when one is
   /// reachable, else as OSC 3008 on the parent agent's tty.
   ///
-  /// The socket arm's exit status is the fallback condition, so a stale
-  /// `SUPACODE_SOCKET_PATH` (an app restart under a surviving zmx session) still
-  /// lands the signal instead of silently dropping it. Everything on the wire is
-  /// JSON-safe by construction: the metadata is `key=value` pairs whose values are
-  /// event names, digits, or standard base64.
+  /// The socket arm's exit status is the fallback condition, so a stale or
+  /// unreachable socket still lands the signal instead of silently dropping it.
+  /// The arm succeeds only on the app's ack: `nc -w` exits 0 when it times out
+  /// on an idle connection, so matching the ack is the only way a wedged
+  /// listener reaches the tty rather than swallowing the signal. That matches
+  /// what the extension emitters do, which is why all four can claim the same
+  /// contract. Everything on the wire is JSON-safe by construction: the metadata
+  /// is `key=value` pairs whose values are event names, digits, or standard base64.
   private static func sendShell(agent: SkillAgent, action: String) -> String {
     let envelope =
       #"{"\#(signalField)":"\#(agent.rawValue)","\#(metadataField)":"%s","\#(surfaceIDField)":"%s"}"#
     let osc = #"\033]3008;\#(action)=\#(agent.rawValue);%s\033\\"#
-    return #"{ [ -n "${\#(socketEnvVar):-}" ] "#
+    return #"{ [ -n "$__sock" ] "#
       + #"&& printf '\#(envelope)' "$__md" "${\#(surfaceEnvVar):-}" "#
-      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "${\#(socketEnvVar):-}"; } "#
+      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "$__sock" "#
+      + #"| \#(grepPath) -q '\#(ackPattern)'; } "#
       + #"|| { \#(ttyResolveSnippet); printf '\#(osc)' "$__md" > "$__tty"; }"#
   }
 
@@ -283,7 +312,7 @@ public nonisolated enum AgentPresenceOSC {
   /// pid at worst pins a live-looking badge until surface close.
   static func emitShell(event: HookEvent, agent: SkillAgent) -> String {
     #"__md="\#(metadata(event: event))"; "#
-      + #"[ -n "${\#(socketEnvVar):-}" ] && [ -n "$__ppid" ] "#
+      + #"[ -n "$__sock" ] && [ -n "$__ppid" ] "#
       + #"&& __md="$__md;\#(pidField)=$__ppid"; "#
       + sendShell(agent: agent, action: action(for: event))
   }

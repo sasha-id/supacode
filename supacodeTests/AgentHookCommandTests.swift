@@ -451,12 +451,13 @@ struct AgentHookCommandTests {
     )
     let expected =
       #"[ -n "${SUPACODE_SURFACE_ID:-}" ] && { "#
-      + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; __tty=""; "#
-      + #"__md="event=busy"; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
+      + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; "#
+      + #"__sock="${SUPACODE_SIGNAL_SOCKET_PATH:-${SUPACODE_SOCKET_PATH:-}}"; __tty=""; "#
+      + #"__md="event=busy"; [ -n "$__sock" ] && [ -n "$__ppid" ] "#
       + #"&& __md="$__md;pid=$__ppid"; "#
-      + #"{ [ -n "${SUPACODE_SOCKET_PATH:-}" ] "#
+      + #"{ [ -n "$__sock" ] "#
       + #"&& printf '{"signal":"claude","metadata":"%s","surface_id":"%s"}' "$__md" "${SUPACODE_SURFACE_ID:-}" "#
-      + #"| /usr/bin/nc -U -w1 "${SUPACODE_SOCKET_PATH:-}"; } "#
+      + #"| /usr/bin/nc -U -w1 "$__sock" | /usr/bin/grep -q '"ok":true'; } "#
       + #"|| { [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
       + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
@@ -475,7 +476,7 @@ struct AgentHookCommandTests {
     #expect(command.contains(#"[ -n "${SUPACODE_SURFACE_ID:-}" ]"#))
     #expect(!command.contains("token="))
     #expect(command.contains(#""signal":"claude""#))
-    #expect(command.contains(#"/usr/bin/nc -U -w1 "${SUPACODE_SOCKET_PATH:-}""#))
+    #expect(command.contains(#"/usr/bin/nc -U -w1 "$__sock" | /usr/bin/grep -q '"ok":true'"#))
     #expect(command.contains("]3008;start=claude;"))
     #expect(command.contains(#"> "$__tty""#))
     #expect(command.contains("ps -o tty= -p \"$__ppid\""))
@@ -665,6 +666,44 @@ struct AgentHookCommandTests {
       AgentHookSettingsCommand.compositeCommand(
         events: [.busy], forwardStdinAsNotification: false, agent: .claude),
       env: ["SUPACODE_SURFACE_ID": UUID().uuidString, "SUPACODE_SOCKET_PATH": stale]
+    )
+    let signal = try #require(Self.parsePresence(fromTTY: tty))
+    #expect(signal.eventRawValue == "busy")
+  }
+
+  @MainActor
+  @Test func theStableSignalSocketWinsOverAStaleControlSocket() async throws {
+    // The control socket is named after the app's pid, so a shell that outlives an
+    // app restart keeps a dead path. The signals socket keeps its path across
+    // restarts; when both are exported it must be the one the hook dials.
+    let stale = "/tmp/supacode-tests/gone-\(UUID().uuidString)"
+    let run = try await runHookCommandAgainstSocket(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.busy], forwardStdinAsNotification: false, agent: .claude),
+      surfaceID: UUID(),
+      socketEnv: { ["SUPACODE_SIGNAL_SOCKET_PATH": $0, "SUPACODE_SOCKET_PATH": stale] }
+    )
+    #expect(run.tty.isEmpty)
+    let signal = try #require(run.signals.first)
+    let presence = try #require(AgentPresenceOSC.parse(id: signal.id, metadata: signal.metadata))
+    #expect(presence.eventRawValue == "busy")
+    #expect(presence.pid == ProcessInfo.processInfo.processIdentifier)
+  }
+
+  @Test func presenceFallsBackToOSCWhenTheListenerNeverAcks() async throws {
+    // `nc -w1` exits 0 on an idle timeout, so a listener that takes the bytes and
+    // never answers would read as a delivery. Only the app's ack may count.
+    let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
+    try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: directory) }
+    let path = "\(directory)/mute"
+    let listener = try Self.listenWithoutAccepting(at: path)
+    defer { close(listener) }
+
+    let tty = try await runHookCommandCapturingTTY(
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.busy], forwardStdinAsNotification: false, agent: .claude),
+      env: ["SUPACODE_SURFACE_ID": UUID().uuidString, "SUPACODE_SIGNAL_SOCKET_PATH": path]
     )
     let signal = try #require(Self.parsePresence(fromTTY: tty))
     #expect(signal.eventRawValue == "busy")
@@ -1095,15 +1134,16 @@ struct AgentHookCommandTests {
   // resolves $__ppid from the parent agent and clears the lazy OSC sink $__tty.
   private static let guardAndPrelude =
     #"[ -n "${SUPACODE_SURFACE_ID:-}" ] && { "#
-    + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; __tty=""; "#
+    + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; "#
+      + #"__sock="${SUPACODE_SIGNAL_SOCKET_PATH:-${SUPACODE_SOCKET_PATH:-}}"; __tty=""; "#
   private static let suppressTail = #"} >/dev/null 2>&1 || true # supacode-managed-hook"#
 
   /// Transport branch shared by presence and notify: socket first, OSC on the
   /// parent agent's tty (resolved lazily, once) when the socket is unreachable.
   private static func send(_ action: String, _ agent: String) -> String {
-    #"{ [ -n "${SUPACODE_SOCKET_PATH:-}" ] "#
+    #"{ [ -n "$__sock" ] "#
       + #"&& printf '{"signal":"\#(agent)","metadata":"%s","surface_id":"%s"}' "$__md" "${SUPACODE_SURFACE_ID:-}" "#
-      + #"| /usr/bin/nc -U -w1 "${SUPACODE_SOCKET_PATH:-}"; } "#
+      + #"| /usr/bin/nc -U -w1 "$__sock" | /usr/bin/grep -q '"ok":true'; } "#
       + #"|| { [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
       + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
@@ -1111,7 +1151,7 @@ struct AgentHookCommandTests {
   }
 
   private static func presence(_ action: String, _ agent: String, _ event: String) -> String {
-    #"__md="event=\#(event)"; [ -n "${SUPACODE_SOCKET_PATH:-}" ] && [ -n "$__ppid" ] "#
+    #"__md="event=\#(event)"; [ -n "$__sock" ] && [ -n "$__ppid" ] "#
       + #"&& __md="$__md;pid=$__ppid"; "#
       + send(action, agent) + "; "
   }
@@ -1197,6 +1237,29 @@ struct AgentHookCommandTests {
     return String(bytes: data, encoding: .utf8) ?? ""
   }
 
+  /// A bound, listening unix socket nobody accepts on: connects and writes succeed
+  /// (the kernel queues them), and no reply ever comes back.
+  private static func listenWithoutAccepting(at path: String) throws -> Int32 {
+    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(descriptor >= 0)
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let capacity = MemoryLayout.size(ofValue: address.sun_path)
+    path.withCString { source in
+      withUnsafeMutablePointer(to: &address.sun_path) {
+        $0.withMemoryRebound(to: CChar.self, capacity: capacity) { _ = strlcpy($0, source, capacity) }
+      }
+    }
+    let bound = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+      }
+    }
+    try #require(bound == 0)
+    try #require(listen(descriptor, 4) == 0)
+    return descriptor
+  }
+
   /// A context signal as the app received it off the socket.
   struct CapturedSignal {
     let id: String
@@ -1209,7 +1272,8 @@ struct AgentHookCommandTests {
   /// test can assert what reached the app AND that nothing reached the tty.
   @MainActor
   private func runHookCommandAgainstSocket(
-    _ command: String, surfaceID: UUID, stdin: String = "", expectedSignals: Int = 1
+    _ command: String, surfaceID: UUID, stdin: String = "", expectedSignals: Int = 1,
+    socketEnv: (String) -> [String: String] = { ["SUPACODE_SOCKET_PATH": $0] }
   ) async throws -> (tty: String, signals: [CapturedSignal]) {
     let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
     let socketPath = "\(directory)/pid-\(ProcessInfo.processInfo.processIdentifier)"
@@ -1232,7 +1296,7 @@ struct AgentHookCommandTests {
 
     let tty = try await runHookCommandCapturingTTY(
       command,
-      env: ["SUPACODE_SURFACE_ID": surfaceID.uuidString, "SUPACODE_SOCKET_PATH": socketPath],
+      env: socketEnv(socketPath).merging(["SUPACODE_SURFACE_ID": surfaceID.uuidString]) { $1 },
       stdin: stdin)
 
     // The hook is acked from the accept thread and exits before the handler has
@@ -1273,6 +1337,7 @@ struct AgentHookCommandTests {
     // The host may already export Supacode-surface vars (tests can run inside a
     // Supacode surface); clear them so every absent-variable assertion is genuine.
     environment.removeValue(forKey: "SUPACODE_SOCKET_PATH")
+    environment.removeValue(forKey: "SUPACODE_SIGNAL_SOCKET_PATH")
     environment.removeValue(forKey: "SUPACODE_SURFACE_ID")
     for (key, value) in env { environment[key] = value }
     process.environment = environment

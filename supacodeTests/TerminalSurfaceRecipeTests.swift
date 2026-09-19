@@ -25,7 +25,8 @@ struct TerminalSurfaceRecipeTests {
       for: Self.makeWorktree(),
       tabID: tabID,
       surfaceID: surfaceID,
-      socketPath: "/tmp/socket"
+      socketPath: "/tmp/socket",
+      signalSocketPath: "/tmp/signals"
     )
     // Slashes are deliberately encoded: downstream deeplinks embed these IDs.
     #expect(env["SUPACODE_REPO_ID"] == "%2Ftmp%2Frecipe-fixture")
@@ -33,6 +34,9 @@ struct TerminalSurfaceRecipeTests {
     #expect(env["SUPACODE_TAB_ID"] == tabID.rawValue.uuidString)
     #expect(env["SUPACODE_SURFACE_ID"] == surfaceID.uuidString)
     #expect(env["SUPACODE_SOCKET_PATH"] == "/tmp/socket")
+    // The control socket is named after the app's pid; this one is not, so an
+    // agent that outlives an app restart still has a path somebody listens on.
+    #expect(env["SUPACODE_SIGNAL_SOCKET_PATH"] == "/tmp/signals")
     #expect(env["ZMX_DIR"] != nil)
   }
 
@@ -41,9 +45,11 @@ struct TerminalSurfaceRecipeTests {
       for: Self.makeWorktree(),
       tabID: TabID(),
       surfaceID: UUID(),
-      socketPath: nil
+      socketPath: nil,
+      signalSocketPath: nil
     )
     #expect(env["SUPACODE_SOCKET_PATH"] == nil)
+    #expect(env["SUPACODE_SIGNAL_SOCKET_PATH"] == nil)
   }
 
   @Test func extraVariablesCannotOverrideTheZmxDirectoryLock() {
@@ -52,6 +58,7 @@ struct TerminalSurfaceRecipeTests {
       tabID: TabID(),
       surfaceID: UUID(),
       socketPath: nil,
+      signalSocketPath: nil,
       extraVariables: ["ZMX_DIR": "/evil", "SUPACODE_SCRIPT": "1"]
     )
     #expect(env["ZMX_DIR"] == ZmxSocketBudget.socketDir())
