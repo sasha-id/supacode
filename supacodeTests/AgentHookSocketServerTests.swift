@@ -154,6 +154,40 @@ struct AgentHookSocketServerTests {
     #expect(payload == nil)
   }
 
+  @Test func readPayloadReturnsACompleteEnvelopeWithoutWaitingForEOF() {
+    // OpenBSD netcat never half-closes, so EOF only arrives once it has given up
+    // waiting for the ack. A second read here would be that wait.
+    var reads = 0
+    let payload = AgentHookSocketServer.readPayload(from: -1) { _, buffer in
+      reads += 1
+      guard reads == 1 else {
+        Issue.record("read past a complete envelope")
+        return 0
+      }
+      return Self.fill(buffer, with: #"{"signal":"claude","metadata":"event=busy"}"#)
+    }
+    #expect(payload.flatMap { String(bytes: $0, encoding: .utf8) } == #"{"signal":"claude","metadata":"event=busy"}"#)
+  }
+
+  @Test func readPayloadKeepsReadingAnEnvelopeSplitAtAClosingBrace() {
+    // The first chunk ends in `}` but is only the nested object closing, so it
+    // must not be mistaken for the whole message.
+    let chunks = [#"{"params":{"a":"b"}"#, #","resource":"tabs"}"#]
+    var reads = 0
+    let payload = AgentHookSocketServer.readPayload(from: -1) { _, buffer in
+      defer { reads += 1 }
+      return reads < chunks.count ? Self.fill(buffer, with: chunks[reads]) : 0
+    }
+    #expect(payload.flatMap { String(bytes: $0, encoding: .utf8) } == chunks.joined())
+    #expect(reads == 2)
+  }
+
+  private static func fill(_ buffer: UnsafeMutableBufferPointer<UInt8>, with text: String) -> Int {
+    let bytes = Array(text.utf8)
+    _ = buffer.update(fromContentsOf: bytes)
+    return bytes.count
+  }
+
   // MARK: - AgentHookEvent decoding.
 
   // `AgentHookEvent` is the in-app event type the OSC ingest synthesizes; it is
@@ -412,10 +446,26 @@ struct AgentHookSocketServerTests {
     #expect(response == nil)
   }
 
+  @Test func aSenderThatNeverHalfClosesIsStillAcked() async throws {
+    // OpenBSD netcat, the default `nc` on Debian and Ubuntu, keeps its write side
+    // open after stdin ends. Waiting for its EOF meant timing the read out and
+    // closing without an ack, which the hook reads as "not delivered".
+    let server = AgentHookSocketServer(socketPathOverride: "/tmp/supacode-tests/\(UUID().uuidString)")
+    defer { server.shutdown() }
+    let signalPath = try #require(server.signalSocketPath)
+    let payload =
+      #"{"signal":"claude","metadata":"event=busy","surface_id":"\#(UUID().uuidString)"}"#
+    let response = try #require(
+      await Self.sendAndReceive(path: signalPath, payload: payload, halfCloses: false))
+    #expect(response.contains(#""ok":true"#))
+  }
+
   /// Connects, writes `payload`, half-closes, and reads the response to EOF,
   /// all off the main actor so the server's main-actor dispatch can run while
   /// the client blocks. Returns nil when the connection fails.
-  private nonisolated static func sendAndReceive(path: String, payload: String) async -> String? {
+  private nonisolated static func sendAndReceive(
+    path: String, payload: String, halfCloses: Bool = true
+  ) async -> String? {
     await withCheckedContinuation { continuation in
       DispatchQueue.global().async {
         let clientFD = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -453,7 +503,7 @@ struct AgentHookSocketServerTests {
         }
         // Half-close so the server's read-to-EOF loop completes while the
         // response can still come back.
-        Darwin.shutdown(clientFD, SHUT_WR)
+        if halfCloses { Darwin.shutdown(clientFD, SHUT_WR) }
         var data = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
         while true {

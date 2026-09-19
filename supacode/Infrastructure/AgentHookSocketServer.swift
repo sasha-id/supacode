@@ -461,18 +461,10 @@ final class AgentHookSocketServer {
     // a write to a CLI that already disconnected must not raise SIGPIPE.
     setNoSIGPIPE(clientFD)
 
-    // Set a read timeout so a misbehaving client cannot block the accept loop.
-    var timeout = timeval(tv_sec: receiveTimeoutSeconds, tv_usec: 0)
-    guard
-      setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        == 0
-    else {
-      socketLogger.warning("setsockopt(SO_RCVTIMEO) failed: \(String(cString: strerror(errno)))")
-      shutdownAndClose(clientFD)
-      return nil
-    }
-
-    guard let data = readPayload(from: clientFD) else {
+    // One deadline for the whole payload, so a misbehaving client cannot block the
+    // accept loop by trickling bytes under a per-read timeout.
+    let deadline = ContinuousClock.now + .seconds(receiveTimeoutSeconds)
+    guard let data = readPayload(from: clientFD, deadline: deadline) else {
       shutdownAndClose(clientFD)
       return nil
     }
@@ -502,8 +494,13 @@ final class AgentHookSocketServer {
     }
   }
 
+  /// Reads one message: to EOF, or until the bytes held form a complete envelope.
+  /// Not every client half-closes after writing (OpenBSD netcat keeps its write
+  /// side open until it exits), and one that does not would otherwise get its ack
+  /// only after it had stopped waiting for it.
   nonisolated static func readPayload(
     from clientFD: Int32,
+    deadline: ContinuousClock.Instant? = nil,
     readChunk: (Int32, UnsafeMutableBufferPointer<UInt8>) -> Int = { fileDescriptor, buffer in
       guard let baseAddress = buffer.baseAddress else { return 0 }
       return Darwin.read(fileDescriptor, baseAddress, buffer.count)
@@ -512,6 +509,7 @@ final class AgentHookSocketServer {
     var data = Data()
     var buffer = [UInt8](repeating: 0, count: 4096)
     while true {
+      if let deadline, !setReceiveTimeout(clientFD, until: deadline) { return nil }
       let bytesRead = buffer.withUnsafeMutableBufferPointer { buffer in
         readChunk(clientFD, buffer)
       }
@@ -526,7 +524,41 @@ final class AgentHookSocketServer {
         socketLogger.warning("Payload exceeded \(maxPayloadSize) bytes, dropping connection")
         return nil
       }
+      if isCompleteEnvelope(data) { return data }
     }
+  }
+
+  /// Every message on this socket is a single JSON object, and a strict prefix of
+  /// one never parses as one, so bytes that parse are the whole message.
+  private nonisolated static func isCompleteEnvelope(_ data: Data) -> Bool {
+    let closesAnObject =
+      data.last { !($0 == 0x20 || (0x09...0x0D).contains($0)) } == UInt8(ascii: "}")
+    guard closesAnObject else { return false }
+    return (try? JSONSerialization.jsonObject(with: data)) is [String: Any]
+  }
+
+  /// Arms the read timeout with whatever is left until `deadline`; false once it
+  /// has passed.
+  private nonisolated static func setReceiveTimeout(
+    _ clientFD: Int32, until deadline: ContinuousClock.Instant
+  ) -> Bool {
+    guard deadline > .now else {
+      socketLogger.warning("Client did not finish its payload in time, dropping connection")
+      return false
+    }
+    // A zero timeval means "block forever", so never round the remainder down to it.
+    let remaining = max(deadline - .now, .milliseconds(1))
+    let (seconds, attoseconds) = remaining.components
+    var timeout = timeval(
+      tv_sec: Int(seconds), tv_usec: Int32(attoseconds / 1_000_000_000_000))
+    guard
+      setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        == 0
+    else {
+      socketLogger.warning("setsockopt(SO_RCVTIMEO) failed: \(String(cString: strerror(errno)))")
+      return false
+    }
+    return true
   }
 
   nonisolated static func parse(data: Data) -> Message? {
