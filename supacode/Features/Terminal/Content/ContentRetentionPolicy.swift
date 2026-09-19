@@ -11,6 +11,12 @@ nonisolated struct ContentRetentionPolicy: Sendable {
 
   var budgetBytes: UInt64
   static let maximumWorktrees = 32
+  /// Retained regardless of the estimate. A single full-screen pane on a large
+  /// display estimates in the hundreds of megabytes, so a pure budget fit keeps
+  /// only the selected worktree and every switch pays a full tree remount —
+  /// exactly the cost retention exists to avoid. The estimate governs how far
+  /// above this floor retention may go, not whether retention happens at all.
+  static let minimumWorktrees = 3
   static let unknownContentBytes: UInt64 = 64 * 1024 * 1024
 
   /// Conservative fit to isolated native retention measurements: viewport
@@ -36,6 +42,13 @@ nonisolated struct ContentRetentionPolicy: Sendable {
         continue
       }
       remaining -= candidate.estimatedBytes
+      included.insert(candidate.id)
+      result.append(candidate.id)
+    }
+    // Candidates arrive most-recent-first, so the floor keeps the worktrees the
+    // user is actually switching between.
+    for candidate in candidates where result.count < Self.minimumWorktrees {
+      guard !included.contains(candidate.id) else { continue }
       included.insert(candidate.id)
       result.append(candidate.id)
     }

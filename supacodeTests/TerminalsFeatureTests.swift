@@ -46,16 +46,38 @@ struct ContentRetentionPolicyTests {
 
   @Test func oversizedOlderSessionsDoNotDisplaceAffordableRecentContent() {
     let policy = ContentRetentionPolicy(budgetBytes: 100)
+    // Enough affordable candidates that the budget pass alone clears the floor,
+    // so this asserts budget precedence rather than the floor.
     let candidates = [
       ContentRetentionPolicy.Candidate(id: Worktree.ID("selected"), estimatedBytes: 40),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("expensive"), estimatedBytes: 80),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("affordable"), estimatedBytes: 50),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("over-budget"), estimatedBytes: 20),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("spare"), estimatedBytes: 5),
     ]
     #expect(
       policy.retained(candidates, selected: Worktree.ID("selected")) == [
-        Worktree.ID("selected"), Worktree.ID("affordable"),
+        Worktree.ID("selected"), Worktree.ID("affordable"), Worktree.ID("spare"),
       ])
+  }
+
+  @Test func retentionKeepsAFloorWhenEveryCandidateExceedsTheBudget() {
+    // A single full-screen pane on a large display estimates in the hundreds of
+    // megabytes and alone exhausts a 16 GB machine's 512 MiB budget. Without a
+    // floor only the selected worktree is retained and every switch pays a full
+    // tree remount, reinstating the cost retention exists to remove.
+    let policy = ContentRetentionPolicy(budgetBytes: 512 * 1024 * 1024)
+    let perWorktree = ContentRetentionPolicy.terminalBytes(
+      displayedTargetBytes: 47 * 1024 * 1024)
+    let candidates = (0..<5).map {
+      ContentRetentionPolicy.Candidate(
+        id: Worktree.ID("/tmp/large-\($0)"), estimatedBytes: perWorktree)
+    }
+    #expect(perWorktree > policy.budgetBytes / 2)
+    let retained = policy.retained(candidates, selected: candidates[0].id)
+    #expect(retained.count == ContentRetentionPolicy.minimumWorktrees)
+    #expect(retained.first == candidates[0].id)
+    #expect(Set(retained).count == retained.count)
   }
 
   @Test func selectionSurvivesEvenWhenItExceedsTheBudget() {
@@ -64,8 +86,11 @@ struct ContentRetentionPolicyTests {
       ContentRetentionPolicy.Candidate(id: Worktree.ID("old"), estimatedBytes: 10),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("selected"), estimatedBytes: .max),
     ]
-    #expect(
-      policy.retained(candidates, selected: Worktree.ID("selected")) == [Worktree.ID("selected")])
+    let retained = policy.retained(candidates, selected: Worktree.ID("selected"))
+    #expect(retained.first == Worktree.ID("selected"))
+    // A selection that saturates the budget leaves nothing for the rest, so the
+    // floor is the only reason the neighbour is still retained.
+    #expect(retained == [Worktree.ID("selected"), Worktree.ID("old")])
   }
 }
 
