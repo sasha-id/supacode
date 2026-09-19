@@ -42,11 +42,20 @@ nonisolated enum AgentSignal {
   /// cause. The wire never carries a surface id (so a payload can't spoof another
   /// worktree). The parser rejects a non-positive pid before it could reach the
   /// liveness sweep; a forged positive pid at worst pins a live-looking badge.
+  ///
+  /// `carriesLocalPID` must be false for a remote surface. Emitters gate `pid=`
+  /// on the socket path being set, which used to imply the local host; once a
+  /// remote surface gets a forwarded socket that stops holding, and a remote pid
+  /// reaching the local `kill(pid, 0)` sweep either reaps a live badge (no such
+  /// local process) or pins a dead one (a local pid that happens to collide).
+  /// Dropping it here covers every emitter version, including ones already
+  /// installed in agent settings on hosts we do not control.
   static func presenceEvent(
     id: String,
     metadata: String,
     surfaceID: UUID,
-    surfaceExists: Bool
+    surfaceExists: Bool,
+    carriesLocalPID: Bool
   ) -> Result<AgentHookEvent, PresenceDrop> {
     guard surfaceExists else { return .failure(.unknownSurface) }
     guard let signal = AgentPresenceOSC.parse(id: id, metadata: metadata) else {
@@ -54,7 +63,10 @@ nonisolated enum AgentSignal {
     }
     return .success(
       AgentHookEvent(
-        agent: signal.agent, event: signal.eventRawValue, surfaceID: surfaceID, pid: signal.pid))
+        agent: signal.agent,
+        event: signal.eventRawValue,
+        surfaceID: surfaceID,
+        pid: carriesLocalPID ? signal.pid : nil))
   }
 
   /// Splits a raw OSC 3008 payload (`<action>=<id>[;<metadata>]`) into context id

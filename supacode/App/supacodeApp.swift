@@ -373,6 +373,9 @@ struct SupacodeApp: App {
       socketPath: { [weak terminalManager] in
         terminalManager?.socketServer?.socketPath
       },
+      signalSocketPath: { [weak terminalManager] in
+        terminalManager?.socketServer?.signalSocketPath
+      },
       zmxExecutablePath: {
         @Dependency(\.zmxClient) var zmxClient
         return zmxClient.executableURL()?.path(percentEncoded: false)

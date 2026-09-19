@@ -108,6 +108,19 @@ public struct TerminalSettingsView: View {
             """
           )
         }
+        Toggle(isOn: $store.remoteAgentPresenceForwardingEnabled) {
+          HStack(spacing: 6) {
+            Text("Forward agent presence from remote hosts")
+            BetaBadge()
+          }
+          Text(
+            """
+            Reports agent activity over a forwarded socket instead of the terminal stream, \
+            which keeps hook output from corrupting the agent's own display. Turn off for \
+            hosts that disallow socket forwarding, where the attempt costs an extra login.
+            """
+          )
+        }
       }
       GhosttyConfigurationSection(
         store: store,

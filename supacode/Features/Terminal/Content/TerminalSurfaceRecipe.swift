@@ -30,7 +30,8 @@ nonisolated enum TerminalSurfaceRecipe {
     _ intent: LaunchIntent,
     for worktree: Worktree,
     surfaceID: UUID,
-    zmxExecutablePath: String?
+    zmxExecutablePath: String?,
+    signalSocketPath: String?
   ) -> Launch {
     let command = intent.command
     let initialInput = intent.initialInput
@@ -53,6 +54,8 @@ nonisolated enum TerminalSurfaceRecipe {
         defaultCommand: remoteDefaultShellCommand(
           remotePath: worktree.workingDirectory.path(percentEncoded: false)),
         hostPersistenceEnabled: settingsFile.global.remoteSessionPersistenceEnabled,
+        localSignalSocketPath: settingsFile.global.remoteAgentPresenceForwardingEnabled
+          ? signalSocketPath : nil,
       )
       return Launch(
         command: ZmxAttach.buildRemoteCommand(remote, localZmxExecutablePath: zmxExecutablePath),
@@ -160,6 +163,10 @@ nonisolated enum TerminalSurfaceRecipe {
     var terminalState: TerminalContentState
     var worktree: Worktree
     var socketPath: String?
+    /// Signals-only socket reverse-forwarded to remote hosts. Distinct from
+    /// `socketPath`, which speaks the full control protocol and never leaves
+    /// this machine.
+    var signalSocketPath: String?
     var zmxExecutablePath: String?
     /// Live source surface for Ghostty's window-inherit config; nil spawns
     /// without inheritance.
@@ -174,6 +181,7 @@ nonisolated enum TerminalSurfaceRecipe {
       terminalState: TerminalContentState,
       worktree: Worktree,
       socketPath: String?,
+      signalSocketPath: String?,
       zmxExecutablePath: String?,
       inheritedFrom: GhosttySurfaceView? = nil,
       fallbackFontSize: Float32? = nil,
@@ -182,6 +190,7 @@ nonisolated enum TerminalSurfaceRecipe {
       self.terminalState = terminalState
       self.worktree = worktree
       self.socketPath = socketPath
+      self.signalSocketPath = signalSocketPath
       self.zmxExecutablePath = zmxExecutablePath
       self.inheritedFrom = inheritedFrom
       self.fallbackFontSize = fallbackFontSize
@@ -202,7 +211,8 @@ nonisolated enum TerminalSurfaceRecipe {
       ),
       for: seed.worktree,
       surfaceID: request.contentID.rawValue,
-      zmxExecutablePath: seed.zmxExecutablePath
+      zmxExecutablePath: seed.zmxExecutablePath,
+      signalSocketPath: seed.signalSocketPath
     )
     let context = context(for: request.origin)
     let inherited = inheritedConfig(from: seed.inheritedFrom, context: context)
@@ -286,6 +296,7 @@ struct TerminalContentBuilder {
   var runtime: GhosttyRuntime
   var worktree: (Worktree.ID) -> Worktree?
   var socketPath: () -> String?
+  var signalSocketPath: () -> String?
   var zmxExecutablePath: () -> String?
   /// Live renderer lookup for window-inherit config; the integration layer
   /// wires it to `ContentRuntime`. No silent default: forgetting it would
@@ -348,6 +359,7 @@ struct TerminalContentBuilder {
             terminalState: seedState,
             worktree: worktree,
             socketPath: socketPath(),
+            signalSocketPath: signalSocketPath(),
             zmxExecutablePath: zmxExecutablePath(),
             inheritedFrom: effective.inheritedFrom.flatMap(sourceSurface),
             fallbackFontSize: TerminalSurfaceRecipe.rememberedZoomFontSize(

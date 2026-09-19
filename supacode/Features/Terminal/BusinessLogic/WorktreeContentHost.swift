@@ -460,7 +460,8 @@ final class WorktreeContentHost {
       id: id,
       metadata: metadata,
       surfaceID: surfaceID,
-      surfaceExists: isKnownSurface(surfaceID)
+      surfaceExists: isKnownSurface(surfaceID),
+      carriesLocalPID: worktree.host == nil
     ) {
     case .success(let event):
       onAgentHookEvent?(event)

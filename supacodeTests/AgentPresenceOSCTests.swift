@@ -94,7 +94,7 @@ struct AgentPresenceOSCTests {
   @Test func presenceEventThreadsLocalPid() {
     let metadata = AgentPresenceOSC.metadata(event: .busy, pidSuffix: ";pid=4242")
     let result = AgentSignal.presenceEvent(
-      id: "claude", metadata: metadata, surfaceID: UUID(), surfaceExists: true)
+      id: "claude", metadata: metadata, surfaceID: UUID(), surfaceExists: true, carriesLocalPID: true)
     #expect((try? result.get())?.pid == 4242)
   }
 
@@ -111,7 +111,7 @@ struct AgentPresenceOSCTests {
     let surfaceID = UUID()
     let metadata = AgentPresenceOSC.metadata(event: .busy)
     let result = AgentSignal.presenceEvent(
-      id: "claude", metadata: metadata, surfaceID: surfaceID, surfaceExists: true)
+      id: "claude", metadata: metadata, surfaceID: surfaceID, surfaceExists: true, carriesLocalPID: true)
     let event = try? result.get()
     #expect(event?.surfaceID == surfaceID)
     #expect(event?.agent == "claude")
@@ -119,16 +119,32 @@ struct AgentPresenceOSCTests {
     #expect(event?.pid == nil)
   }
 
+  @Test func presenceEventDropsThePidForARemoteSurface() {
+    // A remote hook now satisfies the emitter's socket gate (its socket is
+    // reverse-forwarded), so it sends a pid from the other host. The local
+    // liveness sweep would either reap a live badge or pin a dead one against a
+    // colliding local pid, so the ingest strips it.
+    let metadata = AgentPresenceOSC.metadata(event: .busy, pidSuffix: ";pid=4242")
+    let result = AgentSignal.presenceEvent(
+      id: "claude", metadata: metadata, surfaceID: UUID(), surfaceExists: true,
+      carriesLocalPID: false)
+    let event = try? result.get()
+    #expect(event?.pid == nil)
+    // Everything else still lands: the surface is tracked by identity alone.
+    #expect(event?.event == "busy")
+    #expect(event?.agent == "claude")
+  }
+
   @Test func presenceEventDropsUnknownSurface() {
     let metadata = AgentPresenceOSC.metadata(event: .busy)
     let result = AgentSignal.presenceEvent(
-      id: "claude", metadata: metadata, surfaceID: UUID(), surfaceExists: false)
+      id: "claude", metadata: metadata, surfaceID: UUID(), surfaceExists: false, carriesLocalPID: true)
     #expect(result == .failure(.unknownSurface))
   }
 
   @Test func presenceEventDropsMalformedMetadata() {
     let result = AgentSignal.presenceEvent(
-      id: "claude", metadata: "event=nope", surfaceID: UUID(), surfaceExists: true)
+      id: "claude", metadata: "event=nope", surfaceID: UUID(), surfaceExists: true, carriesLocalPID: true)
     #expect(result == .failure(.parseFailed))
   }
 

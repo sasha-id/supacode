@@ -22,7 +22,7 @@ nonisolated enum OmpExtensionContent {
      *   SUPACODE_SURFACE_ID  present only on a Supacode surface; absence is the
      *                        no-op gate. Signals are unauthenticated.
      * Optional:
-     *   SUPACODE_SOCKET_PATH  present only on the local host; gates the local pid
+     *   SUPACODE_SOCKET_PATH  a socket that accepts agent signals; gates the pid
      *                         so the app's liveness sweep can reap a crashed agent.
      *
      * Hook event mapping:

@@ -6,19 +6,38 @@ import SupacodeSettingsShared
 private nonisolated let socketLogger = SupaLogger("AgentHookSocket")
 
 /// Lightweight Unix domain socket server for the Supacode CLI control protocol
-/// and local agent presence.
+/// and agent presence.
 ///
 /// Three message formats are supported, all JSON objects:
 /// - **Command**: a `"deeplink"` key wrapping a `supacode://` URL.
 /// - **Query**: a `"query"` key and optional parameters.
 /// - **Context signal**: a `"signal"` key with `"metadata"` and `"surface_id"` —
-///   the agent presence / notify wire (see `AgentPresenceOSC`), sent by hooks
-///   running on this host. It is the preferred transport precisely because it
-///   leaves the agent's terminal alone; hooks fall back to OSC 3008 on the tty
-///   only over SSH, or when this socket turns out to be unreachable.
+///   the agent presence / notify wire (see `AgentPresenceOSC`). It is the
+///   preferred transport precisely because it leaves the agent's terminal
+///   alone; hooks fall back to OSC 3008 on the tty only when the socket turns
+///   out to be unreachable.
+///
+/// Two listeners are bound, and the difference is a security boundary, not a
+/// convenience. `socketPath` speaks the full protocol and must stay local-only:
+/// `AutomatedActionPolicy.cliOnly` (the default) treats socket-sourced commands
+/// as trusted, so anything that can reach it can run worktree scripts, delete
+/// worktrees and type into tabs without a confirmation prompt.
+/// `signalSocketPath` accepts context signals and refuses commands and queries
+/// outright, which is what makes it safe to reverse-forward to a remote host
+/// (see `ZmxAttach.socketPrelude`). Never forward `socketPath`.
 @MainActor
 final class AgentHookSocketServer {
   private(set) var socketPath: String?
+
+  /// Signals-only listener, reverse-forwarded to remote hosts so their agent
+  /// hooks reach presence without writing OSC into the agent's own tty.
+  private(set) var signalSocketPath: String?
+
+  /// Shared name for the signals listener, and the suffix of the per-instance
+  /// fallback. Deliberately not `pid-<pid>`-parseable, so the CLI's socket
+  /// discovery keeps ignoring both.
+  nonisolated static let signalSocketName = "signals"
+  nonisolated static let signalSocketSuffix = "-signals"
 
   /// Cancellation flag for the accept-loop thread; shared by reference so the
   /// thread never retains `self`.
@@ -64,6 +83,40 @@ final class AgentHookSocketServer {
     unlink(path)
     guard startListening(path: path) else { return }
     socketPath = path
+    let perInstanceSignalPath = path + Self.signalSocketSuffix
+    bindSignalListener(
+      preferred: socketPathOverride == nil
+        ? "\(directory)/\(Self.signalSocketName)" : perInstanceSignalPath,
+      fallback: perInstanceSignalPath
+    )
+  }
+
+  /// Binds the signals-only listener, preferring the instance-independent
+  /// `signals` name. A remote surface's reconnect loop bakes its `-R` target
+  /// when the surface spawns, so a pid-derived name would leave every surface
+  /// that outlived an app restart forwarding to a socket nobody owns. A second
+  /// concurrent instance must not simply steal the shared name either — the
+  /// first instance's remote signals would then be delivered here and dropped
+  /// as unknown surfaces — so a live listener sends us to the per-instance name
+  /// and only the first instance gets restart recovery.
+  private func bindSignalListener(preferred: String, fallback: String) {
+    let path = Self.isLiveSocket(path: preferred) ? fallback : preferred
+    unlink(path)
+    guard startListening(path: path, signalsOnly: true) else { return }
+    signalSocketPath = path
+  }
+
+  /// True when something is accepting connections at `path` right now. A socket
+  /// file left behind by a crashed process refuses the connect and reads as
+  /// free, which is the distinction that makes the name safe to reclaim.
+  private nonisolated static func isLiveSocket(path: String) -> Bool {
+    let probeFD = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard probeFD >= 0 else { return false }
+    defer { close(probeFD) }
+    let connected = withUnixAddress(path: path) { addr, addrLen in
+      connect(probeFD, addr, addrLen) == 0
+    }
+    return connected ?? false
   }
 
   /// Removes socket files left behind by processes that are no longer running.
@@ -72,9 +125,15 @@ final class AgentHookSocketServer {
       let entries = try? FileManager.default.contentsOfDirectory(atPath: directory)
     else { return }
     for entry in entries {
-      guard entry.hasPrefix("pid-"),
-        let pid = Int32(entry.dropFirst(4))
-      else { continue }
+      // `pid-<pid>` is the control socket; `pid-<pid>-signals` is the
+      // per-instance signals listener a second concurrent instance falls back
+      // to. Both die with their process, so both are prunable by the same pid.
+      guard entry.hasPrefix("pid-") else { continue }
+      var digits = entry.dropFirst(4)
+      if digits.hasSuffix(signalSocketSuffix) {
+        digits = digits.dropLast(signalSocketSuffix.count)
+      }
+      guard let pid = Int32(digits) else { continue }
       // Only ESRCH proves the process is gone; EPERM means it exists but
       // cannot be signaled (e.g. a sandboxed or differently-owned process).
       // Mirrors `ProcessLiveness.isRunning` in the CLI and
@@ -96,6 +155,9 @@ final class AgentHookSocketServer {
     if let socketPath {
       unlink(socketPath)
     }
+    if let signalSocketPath {
+      unlink(signalSocketPath)
+    }
   }
 
   func shutdown() {
@@ -109,12 +171,16 @@ final class AgentHookSocketServer {
       unlink(socketPath)
     }
     socketPath = nil
+    if let signalSocketPath {
+      unlink(signalSocketPath)
+    }
+    signalSocketPath = nil
   }
 
   // MARK: - Socket lifecycle.
 
   @discardableResult
-  private func startListening(path: String) -> Bool {
+  private func startListening(path: String, signalsOnly: Bool = false) -> Bool {
     let socketFD = Self.createSocket(path: path)
     guard socketFD >= 0 else { return false }
 
@@ -138,7 +204,11 @@ final class AgentHookSocketServer {
             // terminals from exporting a dead socket path.
             unlink(path)
             Task { @MainActor [weak self] in
-              self?.socketPath = nil
+              if signalsOnly {
+                self?.signalSocketPath = nil
+              } else {
+                self?.socketPath = nil
+              }
             }
             break
           }
@@ -151,7 +221,7 @@ final class AgentHookSocketServer {
         }
 
         Task { @MainActor [weak self] in
-          Self.dispatch(message: message, to: self)
+          Self.dispatch(message: message, to: self, signalsOnly: signalsOnly)
         }
       }
     }
@@ -162,7 +232,24 @@ final class AgentHookSocketServer {
 
   /// Routes an accepted message to the server's handlers, answering "Not
   /// ready." when the server died or has no handler installed yet.
-  private static func dispatch(message: Message, to server: AgentHookSocketServer?) {
+  ///
+  /// `signalsOnly` marks the reverse-forwardable listener: commands and queries
+  /// are refused there without ever reaching a handler, so reaching a remote
+  /// host's forwarded socket buys no access to the CLI control protocol.
+  private static func dispatch(
+    message: Message, to server: AgentHookSocketServer?, signalsOnly: Bool
+  ) {
+    if signalsOnly {
+      switch message {
+      case .command(_, let clientFD), .query(_, _, let clientFD):
+        socketLogger.warning("Refused a control message on the signals-only socket")
+        sendCommandResponse(
+          clientFD: clientFD, ok: false, error: "This socket accepts agent signals only.")
+        return
+      case .contextSignal:
+        break
+      }
+    }
     switch message {
     case .command(let deeplinkURL, let clientFD):
       guard let handler = server?.onCommand else {
@@ -244,6 +331,28 @@ final class AgentHookSocketServer {
 
   // MARK: - Socket creation (nonisolated).
 
+  /// Fills a `sockaddr_un` for `path` and runs `body` against it. Returns nil
+  /// when the path does not fit `sun_path`, which callers must treat as a hard
+  /// failure rather than a falsy result.
+  private nonisolated static func withUnixAddress<T>(
+    path: String,
+    _ body: (UnsafePointer<sockaddr>, socklen_t) -> T
+  ) -> T? {
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = path.utf8CString
+    guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
+    _ = withUnsafeMutablePointer(to: &addr.sun_path) { sunPath in
+      pathBytes.withUnsafeBufferPointer { buffer in
+        memcpy(sunPath, buffer.baseAddress!, buffer.count)
+      }
+    }
+    let addrLen = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
+    return withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { body($0, addrLen) }
+    }
+  }
+
   private nonisolated static func createSocket(path: String) -> Int32 {
     let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
     guard socketFD >= 0 else {
@@ -253,25 +362,13 @@ final class AgentHookSocketServer {
     // Keep the control socket out of spawned shells' fd tables.
     setCloseOnExec(socketFD)
 
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathBytes = path.utf8CString
-    guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+    let bindResult = withUnixAddress(path: path) { addr, addrLen in
+      bind(socketFD, addr, addrLen)
+    }
+    guard let bindResult else {
       socketLogger.warning("Socket path too long: \(path)")
       close(socketFD)
       return -1
-    }
-    _ = withUnsafeMutablePointer(to: &addr.sun_path) { sunPath in
-      pathBytes.withUnsafeBufferPointer { buffer in
-        memcpy(sunPath, buffer.baseAddress!, buffer.count)
-      }
-    }
-
-    let addrLen = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
-    let bindResult = withUnsafePointer(to: &addr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-        bind(socketFD, sockaddrPtr, addrLen)
-      }
     }
     guard bindResult == 0 else {
       socketLogger.warning("bind() failed: \(String(cString: strerror(errno)))")

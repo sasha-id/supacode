@@ -159,6 +159,12 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
   /// When true, remote surfaces wrap their session in zmx on the host when
   /// the host has it installed, so the session survives disconnects.
   public var remoteSessionPersistenceEnabled: Bool
+  /// When true, remote surfaces reverse-forward the app's signals-only socket
+  /// so host-side agent hooks report presence over it instead of writing OSC
+  /// into the agent's own terminal. Off is the escape hatch for hosts that
+  /// forbid stream-local forwarding, where the attempt costs an extra
+  /// authentication.
+  public var remoteAgentPresenceForwardingEnabled: Bool
   /// Where Supacode appears: Dock, menu bar, or both.
   public var appVisibility: AppVisibility
   /// Beta: hidden terminal tabs release their renderer after a few minutes of
@@ -214,6 +220,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     confirmCloseTab: .busy,
     terminateSessionsOnQuit: false,
     remoteSessionPersistenceEnabled: true,
+    remoteAgentPresenceForwardingEnabled: true,
     appVisibility: .dockAndMenuBar,
     chromeTextSize: .default
   )
@@ -257,6 +264,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     confirmCloseTab: ConfirmCloseTabMode = .busy,
     terminateSessionsOnQuit: Bool = false,
     remoteSessionPersistenceEnabled: Bool = true,
+    remoteAgentPresenceForwardingEnabled: Bool = true,
     appVisibility: AppVisibility = .dockAndMenuBar,
     terminalHibernationEnabled: Bool = true,
     chromeTextSize: ChromeTextSize = .default,
@@ -302,6 +310,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     self.confirmCloseTab = confirmCloseTab
     self.terminateSessionsOnQuit = terminateSessionsOnQuit
     self.remoteSessionPersistenceEnabled = remoteSessionPersistenceEnabled
+    self.remoteAgentPresenceForwardingEnabled = remoteAgentPresenceForwardingEnabled
     self.appVisibility = appVisibility
     self.terminalHibernationEnabled = terminalHibernationEnabled
     self.chromeTextSize = chromeTextSize
@@ -502,6 +511,9 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     remoteSessionPersistenceEnabled =
       try container.decodeIfPresent(Bool.self, forKey: .remoteSessionPersistenceEnabled)
       ?? Self.default.remoteSessionPersistenceEnabled
+    remoteAgentPresenceForwardingEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .remoteAgentPresenceForwardingEnabled)
+      ?? Self.default.remoteAgentPresenceForwardingEnabled
     // Reject unrecognized values (and a mistyped key) from corrupted or
     // hand-edited settings files: a throw here resets the whole file to defaults.
     appVisibility =

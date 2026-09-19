@@ -28,9 +28,12 @@ import Foundation
 /// - attribution is by the receiving surface for OSC, by `surface_id` for the
 ///   socket, so presence metadata carries no surface id;
 /// - `event` is the `HookEvent` rawValue;
-/// - `pid` is the agent's LOCAL process id, present only when the hook ran on the
-///   same host (gated on `SUPACODE_SOCKET_PATH`); it feeds the app's liveness
-///   sweep so a crashed local agent is reaped. Omitted over SSH.
+/// - `pid` is the agent's process id, emitted whenever the socket transport is
+///   available; it feeds the app's liveness sweep so a crashed agent is reaped.
+///   The sweep is local, so a remote surface's pid is meaningless there and the
+///   app drops it on ingest (`AgentSignal.presenceEvent(carriesLocalPID:)`) —
+///   the emitter cannot tell the two apart once a remote host has a forwarded
+///   socket.
 ///
 /// Both transports also carry the rich notification leg
 /// (`kind=notify;title=<base64>;body=<base64>`); the emitter extracts the display
@@ -49,9 +52,10 @@ public nonisolated enum AgentPresenceOSC {
   /// no-op-outside-Supacode emit gate.
   public static let surfaceEnvVar = "SUPACODE_SURFACE_ID"
 
-  /// Env var carrying the app's control-socket path. Exported on every local
-  /// surface and never over SSH, so its presence is the transport discriminator
-  /// AND the local-host check the `pid=` field needs.
+  /// Env var carrying the path of a socket that accepts agent signals: the
+  /// app's control socket on a local surface, or a reverse-forwarded
+  /// signals-only socket on a remote one. Its presence is the transport
+  /// discriminator. It is NOT a local-host check — see `pid` above.
   public static let socketEnvVar = "SUPACODE_SOCKET_PATH"
 
   /// Field names of the socket envelope. `signal` carries what OSC puts in the
@@ -63,11 +67,11 @@ public nonisolated enum AgentPresenceOSC {
 
   /// Absolute path: the hook may run with a PATH that can't reach `nc` (Grok
   /// rewrites the environment, and a stripped PATH is a supported shape).
-  static let netcatPath = "/usr/bin/nc"
+  public static let netcatPath = "/usr/bin/nc"
 
   /// Seconds `nc` waits on the socket. The app acks and half-closes immediately,
   /// so this only bounds a wedged app; the hook's own deadline is 2s.
-  static let socketTimeoutSeconds = 1
+  public static let socketTimeoutSeconds = 1
 
   static let eventField = "event"
   static let pidField = "pid"
@@ -271,12 +275,12 @@ public nonisolated enum AgentPresenceOSC {
   /// transport. The caller guards emission on `SUPACODE_SURFACE_ID` and runs
   /// `preludeSnippet` first.
   ///
-  /// The pid suffix is gated on `SUPACODE_SOCKET_PATH` (set only on the local host)
-  /// and on `$__ppid` having resolved, so a remote hook or a reparented shell leaves
-  /// the field off the wire instead of sending a dangling `pid=`. Both shapes parse to
-  /// `pid: nil` today, so this is wire hygiene, not a behavior fix: a local agent
-  /// with no resolvable parent stays untracked by the liveness sweep either way. A
-  /// forged positive pid at worst pins a live-looking badge until surface close.
+  /// The pid suffix is gated on the socket transport being available and on
+  /// `$__ppid` having resolved, so a reparented shell leaves the field off the
+  /// wire instead of sending a dangling `pid=`. A remote hook can satisfy both
+  /// gates (its socket is reverse-forwarded), so the app, not the emitter, is
+  /// what keeps a remote pid out of the local liveness sweep. A forged positive
+  /// pid at worst pins a live-looking badge until surface close.
   static func emitShell(event: HookEvent, agent: SkillAgent) -> String {
     #"__md="\#(metadata(event: event))"; "#
       + #"[ -n "${\#(socketEnvVar):-}" ] && [ -n "$__ppid" ] "#

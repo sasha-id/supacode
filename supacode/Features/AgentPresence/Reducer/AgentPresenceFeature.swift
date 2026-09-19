@@ -231,10 +231,11 @@ struct AgentPresenceFeature {
     }
   }
 
-  /// A pid is the local-hook source (OSC presence carries `pid=$__ppid` only on the
-  /// local host); a missing pid is the OSC-over-SSH source, which attributes by the
-  /// receiving surface and has no local pid to track. Either way the restart clears
-  /// a sticky state, or an SSH session that errored would never recover.
+  /// A pid is the local-hook source; a missing pid is a remote surface, whose pid
+  /// the ingest strips because this sweep's `kill(pid, 0)` only means anything for
+  /// local processes. A remote surface is therefore tracked by the receiving
+  /// surface alone. Either way the restart clears a sticky state, or an SSH
+  /// session that errored would never recover.
   private static func applySessionStart(
     event: AgentHookEvent, key: PresenceKey, into state: inout State
   ) -> Set<UUID> {

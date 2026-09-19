@@ -463,11 +463,37 @@ nonisolated enum ZmxAttach {
     var userCommand: String?
     var defaultCommand: String?
     var hostPersistenceEnabled: Bool
+    /// The app's signals-only listener, reverse-forwarded so the host's agent
+    /// hooks reach presence over a socket instead of the agent's own tty. Nil
+    /// when the user turned forwarding off, or when the listener failed to
+    /// bind: the surface then keeps today's OSC-on-the-tty behaviour.
+    var localSignalSocketPath: String?
 
     var sessionID: String { ZmxSessionID.make(surfaceID: surfaceID) }
 
     var export: String {
       "export SUPACODE_SURFACE_ID=\(ZmxAttach.shellQuote(surfaceID.uuidString)); "
+    }
+
+    /// Stable per-surface path the hooks actually export. It is a symlink, not
+    /// the listener: sshd never unlinks a remote-forward socket on teardown and
+    /// `StreamLocalBindUnlink` is a server-side option defaulting to `no`, so a
+    /// fixed listener path fails to rebind on the first reconnect. Each attempt
+    /// binds a fresh `-<nonce>` path and re-points this symlink at it, which
+    /// keeps the value frozen in a surviving host session valid.
+    var remoteSocketSymlink: String { "/tmp/\(sessionID).sock" }
+
+    /// Glob covering every listener this surface has ever bound, including the
+    /// leftovers sshd declined to clean up.
+    var remoteSocketGlob: String { "/tmp/\(sessionID)-*.sock" }
+
+    /// Listener path for one connection attempt. `$supa_n` is expanded by the
+    /// local reconnect loop, not here, so every attempt gets a free path.
+    var remoteSocketListenPath: String { "/tmp/\(sessionID)-$supa_n.sock" }
+
+    /// `-R` spec, or nil when nothing should be forwarded.
+    var remoteForwardSpec: String? {
+      localSignalSocketPath.map { "\(remoteSocketListenPath):\($0)" }
     }
 
     /// Whitespace-only commands count as absent.
@@ -514,13 +540,19 @@ nonisolated enum ZmxAttach {
   ) -> String {
     let connectLine = SSHCommand.commandLine(
       host: launch.host,
-      remoteCommand: SSHCommand.posixShellWrapped(remoteConnectScript(launch))
+      remoteCommand: SSHCommand.posixShellWrapped(remoteConnectScript(launch)),
+      remoteForward: launch.remoteForwardSpec
     )
     let reconnectLine = SSHCommand.commandLine(
       host: launch.host,
-      remoteCommand: SSHCommand.posixShellWrapped(remoteReconnectScript(launch))
+      remoteCommand: SSHCommand.posixShellWrapped(remoteReconnectScript(launch)),
+      remoteForward: launch.remoteForwardSpec
     )
-    let loop = SSHReconnectLoop.script(connect: connectLine, reconnect: reconnectLine)
+    let loop = SSHReconnectLoop.script(
+      connect: connectLine,
+      reconnect: reconnectLine,
+      noncePerAttempt: launch.remoteForwardSpec != nil
+    )
     guard let localZmxExecutablePath else { return "/bin/sh -c " + shellQuote(loop) }
     // The local and host-side sessions share the `supa-<surfaceID>` name.
     return buildCommand(
@@ -546,12 +578,14 @@ nonisolated enum ZmxAttach {
   /// the non-zmx branch on dash-as-/bin/sh hosts). The env export precedes
   /// the attach, so the session inherits it on create. A failed attach falls
   /// through to a plain run with a visible notice instead of an instant,
-  /// unreadable close. The awaiting-input signal rides the terminal stream
-  /// (OSC 3008), not a socket, so no reverse forward is needed.
+  /// unreadable close. `socketPrelude` runs alongside the export, for the same
+  /// reason: it is what decides whether presence rides the forwarded socket or
+  /// falls back to OSC on the tty.
   static func remoteConnectScript(_ launch: RemoteSurfaceLaunch) -> String {
     let command = launch.connectCommand
     guard launch.hostPersistenceEnabled else {
-      return launch.export + betaBanner + loginShellRun(command)
+      return launch.export + socketPrelude(launch) + betaBanner + socketUnavailableBanner(launch)
+        + loginShellRun(command)
     }
     // Always the `-c` form: the interactive default carries the cd into the
     // worktree, so the created session must run it too, via a login shell so
@@ -559,13 +593,16 @@ nonisolated enum ZmxAttach {
     // the session command: printed outside it they would be swallowed by
     // zmx's screen takeover, inside it they land in the session's screen
     // state and so also survive reattach restores.
-    let sessionCommand = "\"$SHELL\" -l -c " + shellQuote(betaBanner + persistentBanner + command)
+    let sessionCommand =
+      "\"$SHELL\" -l -c "
+      + shellQuote(betaBanner + persistentBanner + socketUnavailableBanner(launch) + command)
     // Newline separators keep a command with a trailing `;` from breaking
     // the `fi`; the trailing fallback line serves only the no-zmx branch.
     // The failed-attach fallthrough execs its own fresh default shell, never
     // `command`: attach can fail AFTER the session started running it, and a
     // second concurrent copy of a one-shot command must never spawn.
     return launch.export
+      + socketPrelude(launch)
       + brewPathPrefix
       + "if command -v zmx >/dev/null 2>&1; then "
       + "zmx attach \(launch.sessionID) \(sessionCommand)\n"
@@ -591,9 +628,11 @@ nonisolated enum ZmxAttach {
   /// a blank shell session; accepted (the window is milliseconds).
   static func remoteReconnectScript(_ launch: RemoteSurfaceLaunch) -> String {
     guard launch.hostPersistenceEnabled else {
-      return launch.export + reconnectShellNotice + loginShellRun(launch.reconnectFallbackCommand)
+      return launch.export + socketPrelude(launch) + reconnectShellNotice
+        + loginShellRun(launch.reconnectFallbackCommand)
     }
     return launch.export
+      + socketPrelude(launch)
       + brewPathPrefix
       + "if command -v zmx >/dev/null 2>&1; then "
       + "if zmx list --short 2>/dev/null | grep -q '\(launch.sessionID)$'; then "
@@ -614,7 +653,10 @@ nonisolated enum ZmxAttach {
     host: RemoteHost,
     sessionID: String
   ) -> (executableURL: URL, arguments: [String]) {
-    SSHCommand.invocation(
+    // The forwarded-socket cleanup runs ahead of the zmx guard: a host without
+    // zmx exits 0 there, and it can still have accumulated socket files.
+    let removeSockets = "rm -f /tmp/\(sessionID).sock /tmp/\(sessionID)-*.sock; "
+    return SSHCommand.invocation(
       host: host,
       executable: "/bin/sh",
       // `|| exit 0`, not `&&`: a host without zmx must exit 0 (true no-op),
@@ -624,7 +666,7 @@ nonisolated enum ZmxAttach {
       // `runProcess` logs.
       arguments: [
         "-c",
-        brewPathPrefix
+        removeSockets + brewPathPrefix
           + "command -v zmx >/dev/null 2>&1 || exit 0; zmx kill \(sessionID); "
           + "! zmx list --short 2>/dev/null | grep -q '\(sessionID)$'",
       ],
@@ -632,6 +674,55 @@ nonisolated enum ZmxAttach {
       extraOptions: SSHCommand.backgroundProbeOptions
     )
   }
+
+  /// Adopts the socket sshd just reverse-forwarded for this attempt, when there
+  /// is one. Runs in the `/bin/sh` layer beside `export`, so the value reaches
+  /// the session (and, under host persistence, is inherited on create).
+  ///
+  /// The glob picks the lexically last listener, which is the newest: nonces are
+  /// fixed-width and monotonic per surface. Everything older is a leftover sshd
+  /// declined to unlink, so it is removed. `SUPACODE_SOCKET_PATH` is exported
+  /// only after an end-to-end probe with the same binary the hooks use, so a
+  /// host that refuses stream-local forwarding, lacks `nc`, or ships a `nc`
+  /// without `-U` costs the hooks nothing — they take the OSC arm directly
+  /// instead of paying a failed exec per event. The probe's empty payload is
+  /// dropped app-side without dispatching anything.
+  ///
+  /// On failure the symlink is removed rather than left dangling: a session that
+  /// survived from an earlier connect still holds the exported path, and a
+  /// missing file fails `nc` immediately instead of after a connect timeout.
+  static func socketPrelude(_ launch: RemoteSurfaceLaunch) -> String {
+    guard launch.localSignalSocketPath != nil else { return "" }
+    let glob = launch.remoteSocketGlob
+    let symlink = launch.remoteSocketSymlink
+    return "supa_sock=; "
+      + #"for f in \#(glob); do [ -S "$f" ] && supa_sock=$f; done; "#
+      + #"for f in \#(glob); do [ -e "$f" ] && [ "$f" != "$supa_sock" ] && rm -f "$f"; done; "#
+      + #"if [ -n "$supa_sock" ] && printf '' | \#(AgentPresenceOSC.netcatPath) "#
+      + #"-U -w\#(AgentPresenceOSC.socketTimeoutSeconds) "$supa_sock" >/dev/null 2>&1; then "#
+      + #"ln -sfn "$supa_sock" \#(symlink) "#
+      + #"&& export \#(AgentPresenceOSC.socketEnvVar)=\#(symlink); "#
+      + #"else rm -f \#(symlink); export \#(socketUnavailableEnvVar)=1; fi; "#
+  }
+
+  /// Set by `socketPrelude` when presence could not be moved off the tty, so the
+  /// banner can explain it in the one place the user will see it.
+  static let socketUnavailableEnvVar = "SUPACODE_SOCKET_FORWARD_UNAVAILABLE"
+
+  /// Dim notice for a host that refused the presence forward, and nothing at
+  /// all when forwarding was never attempted — the variable it tests could not
+  /// be set then, so the guard would be dead text in every remote surface.
+  /// Actionable: the attempt itself costs an extra authentication on hosts that
+  /// forbid forwarding, which is the reason to turn it off rather than ignore it.
+  static func socketUnavailableBanner(_ launch: RemoteSurfaceLaunch) -> String {
+    launch.localSignalSocketPath == nil ? "" : socketUnavailableBannerSnippet
+  }
+
+  private static let socketUnavailableBannerSnippet =
+    #"[ -n "${\#(socketUnavailableEnvVar):-}" ] && "#
+    + #"printf '\033[2m── This host declined the agent-presence socket; presence rides the "#
+    + #"terminal stream instead.\033[0m\r\n"#
+    + #"\033[2m   Turn off Forward agent presence in Settings › Terminal to skip the attempt.\033[0m ──\r\n'; "#
 
   /// Appends the well-known tool directories to `PATH` before every `zmx`
   /// lookup and invocation, so a brew-installed `zmx` that a non-interactive
@@ -698,11 +789,20 @@ nonisolated enum ZmxAttach {
 nonisolated enum SSHReconnectLoop {
   static let maxDelaySeconds = 15
 
-  static func script(connect: String, reconnect: String) -> String {
+  /// `noncePerAttempt` seeds and advances `$supa_n`, which the ssh lines
+  /// interpolate into their `-R` listen path. sshd leaves a remote-forward
+  /// socket behind on teardown, so every attempt must ask for a path that is
+  /// still free. The seed is the epoch second and each retry increments it:
+  /// monotonic, fixed-width (so a glob sorts them), and immune to two attempts
+  /// landing in the same second the way a bare `date` re-read would not be.
+  static func script(connect: String, reconnect: String, noncePerAttempt: Bool = false) -> String {
     let passExitUnless255 = "; supa_rc=$?; [ \"$supa_rc\" -ne 255 ] && exit \"$supa_rc\""
+    let seedNonce = noncePerAttempt ? "supa_n=$(date +%s); " : ""
+    let advanceNonce = noncePerAttempt ? "supa_n=$((supa_n + 1)); " : ""
     return "trap 'exit 130' INT; "
+      + seedNonce
       + connect + passExitUnless255 + "; "
-      + "supa_delay=1; while :; do "
+      + "supa_delay=1; while :; do " + advanceNonce
       + #"printf '\033[1;33m── Connection failed (ssh exit 255). Retrying in %ss. "#
       + #"Press Ctrl-C to stop. ──\033[0m\r\n' "$supa_delay"; "#
       + "sleep \"$supa_delay\"; supa_delay=$((supa_delay * 2)); "

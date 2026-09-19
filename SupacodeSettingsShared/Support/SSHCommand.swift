@@ -228,13 +228,15 @@ public nonisolated enum SSHCommand {
     host: RemoteHost,
     remoteCommand: String,
     allocateTTY: Bool = true,
-    controlPath: String = defaultControlPath
+    controlPath: String = defaultControlPath,
+    remoteForward: String? = nil
   ) -> String {
     commandLine(
       host: host,
       loginShellCommand: loginShellWrapped(remoteCommand),
       allocateTTY: allocateTTY,
-      controlPath: controlPath
+      controlPath: controlPath,
+      remoteForward: remoteForward
     )
   }
 
@@ -261,17 +263,28 @@ public nonisolated enum SSHCommand {
   }
 
   /// Assemble the interactive ssh argv, applying the terminal-compatibility wrap.
+  ///
+  /// `remoteForward` is a `<remote socket>:<local socket>` spec emitted as
+  /// `-R`. It is deliberately left unquoted with the other option tokens so a
+  /// `$var` in the remote path expands in the parent `/bin/sh` at connect time,
+  /// which is how the reconnect loop gives every attempt a fresh listener path.
+  /// Never pass `ExitOnForwardFailure`: a host that refuses the forward must
+  /// still get a working terminal.
   private static func commandLine(
     host: RemoteHost,
     loginShellCommand: String,
     allocateTTY: Bool,
-    controlPath: String
+    controlPath: String,
+    remoteForward: String? = nil
   ) -> String {
     var tokens = [sshExecutablePath]
     tokens += controlOptions(controlPath: controlPath)
     tokens += interactiveOptions
     if allocateTTY {
       tokens.append("-tt")
+    }
+    if let remoteForward {
+      tokens += ["-R", remoteForward]
     }
     tokens += host.sshOptionArguments
     tokens.append(host.sshDestination)

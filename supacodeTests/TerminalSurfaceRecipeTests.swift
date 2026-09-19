@@ -63,7 +63,8 @@ struct TerminalSurfaceRecipeTests {
       TerminalSurfaceRecipe.LaunchIntent(command: "./script.sh", initialInput: "input\n", bypassZmx: true),
       for: Self.makeWorktree(),
       surfaceID: UUID(),
-      zmxExecutablePath: "/usr/local/bin/zmx"
+      zmxExecutablePath: "/usr/local/bin/zmx",
+      signalSocketPath: nil
     )
     #expect(launch.command == "./script.sh")
     #expect(launch.initialInput == "input\n")
@@ -77,7 +78,8 @@ struct TerminalSurfaceRecipeTests {
       TerminalSurfaceRecipe.LaunchIntent(),
       for: Self.makeWorktree(),
       surfaceID: surfaceID,
-      zmxExecutablePath: "/usr/local/bin/zmx"
+      zmxExecutablePath: "/usr/local/bin/zmx",
+      signalSocketPath: nil
     )
     // The session name is the surface identity; hibernated wakes and the CLI
     // both address it by this derivation.
@@ -110,6 +112,7 @@ struct TerminalSurfaceRecipeTests {
           terminalState: state,
           worktree: worktree,
           socketPath: nil,
+          signalSocketPath: nil,
           zmxExecutablePath: nil
         )
       ).context
@@ -129,6 +132,7 @@ struct TerminalSurfaceRecipeTests {
         terminalState: persistedState,
         worktree: worktree,
         socketPath: nil,
+        signalSocketPath: nil,
         zmxExecutablePath: nil
       )
     )
@@ -140,6 +144,7 @@ struct TerminalSurfaceRecipeTests {
         terminalState: emptyState,
         worktree: worktree,
         socketPath: nil,
+        signalSocketPath: nil,
         zmxExecutablePath: nil
       )
     )
@@ -159,6 +164,7 @@ struct TerminalSurfaceRecipeTests {
         terminalState: state,
         worktree: worktree,
         socketPath: "/tmp/socket",
+        signalSocketPath: nil,
         zmxExecutablePath: "/usr/local/bin/zmx",
         // A frozen grid outranks any fallback font: the frozen backing size
         // only reproduces the grid at the frozen font.

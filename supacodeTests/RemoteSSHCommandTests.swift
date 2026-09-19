@@ -559,20 +559,23 @@ struct ZmxAttachRemoteTests {
   private let surfaceID = UUID(uuidString: "00000000-0000-0000-0000-0000000000AB")!
   private var hostSessionID: String { ZmxSessionID.make(surfaceID: surfaceID) }
   private let localZmx = "/Applications/Supacode.app/Contents/MacOS/zmx"
+  private let signalSocket = "/tmp/supacode-501/signals"
   private static let defaultShell = "cd '/home/dev/repo/wt-1' 2>/dev/null; exec \"$SHELL\" -l"
 
   private func makeLaunch(
     host: RemoteHost = RemoteHost(alias: "devbox"),
     userCommand: String? = nil,
     defaultCommand: String? = defaultShell,
-    hostPersistenceEnabled: Bool = true
+    hostPersistenceEnabled: Bool = true,
+    localSignalSocketPath: String? = nil
   ) -> ZmxAttach.RemoteSurfaceLaunch {
     ZmxAttach.RemoteSurfaceLaunch(
       host: host,
       surfaceID: surfaceID,
       userCommand: userCommand,
       defaultCommand: defaultCommand,
-      hostPersistenceEnabled: hostPersistenceEnabled
+      hostPersistenceEnabled: hostPersistenceEnabled,
+      localSignalSocketPath: localSignalSocketPath
     )
   }
 
@@ -777,10 +780,17 @@ struct ZmxAttachRemoteTests {
       connect: "sh -c 'exit 7'",
       reconnect: "sh -c 'exit 0'"
     )
+    let forwarding = makeLaunch(userCommand: "echo 'x'", localSignalSocketPath: signalSocket)
     let scripts = [
       loop,
       ZmxAttach.remoteConnectScript(launch),
       ZmxAttach.remoteReconnectScript(launch),
+      // The socket prelude is unquoted POSIX shell running on an unknown host;
+      // a stray quote there would break every remote surface, not just presence.
+      ZmxAttach.remoteConnectScript(forwarding),
+      ZmxAttach.remoteReconnectScript(forwarding),
+      SSHReconnectLoop.script(
+        connect: "sh -c 'exit 7'", reconnect: "sh -c 'exit 0'", noncePerAttempt: true),
     ]
     for script in scripts {
       let check = Process()
@@ -798,8 +808,8 @@ struct ZmxAttachRemoteTests {
     #expect(run.terminationStatus == 7)
   }
 
-  @Test func buildRemoteCommandWrapsReconnectLoopInLocalZmxWithoutReverseForward() {
-    let launch = makeLaunch()
+  @Test func buildRemoteCommandOmitsTheReverseForwardWhenForwardingIsOff() {
+    let launch = makeLaunch(localSignalSocketPath: nil)
     let connectLine = SSHCommand.commandLine(
       host: launch.host,
       remoteCommand: SSHCommand.posixShellWrapped(ZmxAttach.remoteConnectScript(launch))
@@ -822,9 +832,180 @@ struct ZmxAttachRemoteTests {
     #expect(command.contains("attach \(hostSessionID)"))
     #expect(command.contains(localZmx))
     #expect(command.contains("SUPACODE_SURFACE_ID="))
-    // Presence rides the OSC stream now, with no reverse socket / remote socket path.
+    // With forwarding off nothing is forwarded and no socket path is exported,
+    // so presence falls back to the OSC-on-the-tty leg.
     #expect(!command.contains("-R "))
     #expect(!command.contains("SUPACODE_SOCKET_PATH"))
+    #expect(!command.contains("supa_n"))
+  }
+
+  @Test func buildRemoteCommandForwardsTheSignalSocketPerAttempt() {
+    let launch = makeLaunch(localSignalSocketPath: signalSocket)
+    let command = ZmxAttach.buildRemoteCommand(launch, localZmxExecutablePath: localZmx)
+    // The listen path carries an unexpanded nonce: it has to expand in the
+    // local loop at connect time, because sshd leaves the previous attempt's
+    // socket file behind and a repeated path would fail to bind.
+    #expect(command.contains("-R /tmp/\(hostSessionID)-$supa_n.sock:\(signalSocket)"))
+    #expect(command.contains("supa_n=$(date +%s)"))
+    #expect(command.contains("supa_n=$((supa_n + 1))"))
+    // Hooks export the stable symlink, never the per-attempt listener, so a
+    // host session that survives a reconnect keeps a valid path.
+    #expect(command.contains("export SUPACODE_SOCKET_PATH=/tmp/\(hostSessionID).sock"))
+    #expect(command.contains("ln -sfn"))
+  }
+
+  @Test func theForwardedSocketIsAdoptedOnlyAfterItAnswers() {
+    let launch = makeLaunch(localSignalSocketPath: signalSocket)
+    let script = ZmxAttach.remoteConnectScript(launch)
+    // The probe is the whole point: a host that refuses the forward, has no
+    // `nc`, or has one without `-U` must leave SUPACODE_SOCKET_PATH unset so
+    // the hooks take the OSC arm directly instead of paying a failed exec per
+    // event.
+    #expect(script.contains("/usr/bin/nc -U -w1 \"$supa_sock\""))
+    let probe = script.range(of: "/usr/bin/nc")
+    let export = script.range(of: "export SUPACODE_SOCKET_PATH")
+    #expect(probe != nil)
+    #expect(export != nil)
+    if let probe, let export {
+      #expect(probe.lowerBound < export.lowerBound)
+    }
+    // Failure removes the symlink rather than leaving it dangling.
+    #expect(script.contains("rm -f /tmp/\(hostSessionID).sock"))
+  }
+
+  @MainActor
+  @Test func thePreludeExportsTheSymlinkOnlyWhenTheForwardedSocketAnswers() throws {
+    // Executes the generated shell for real: it runs on hosts we do not
+    // control, where a quoting slip or a wrong probe would silently put every
+    // agent back on the corrupting tty leg.
+    let surfaceID = UUID()
+    let launch = ZmxAttach.RemoteSurfaceLaunch(
+      host: RemoteHost(alias: "devbox"),
+      surfaceID: surfaceID,
+      userCommand: nil,
+      defaultCommand: nil,
+      hostPersistenceEnabled: false,
+      localSignalSocketPath: signalSocket
+    )
+    let sessionID = ZmxSessionID.make(surfaceID: surfaceID)
+    let nonce = "1700000000"
+    let listenPath = "/tmp/\(sessionID)-\(nonce).sock"
+    let symlink = "/tmp/\(sessionID).sock"
+    defer {
+      for path in [listenPath, symlink] { unlink(path) }
+    }
+    // `supa_n` is expanded by the reconnect loop, so the probe needs it bound.
+    let probe =
+      "supa_n=\(nonce); " + ZmxAttach.socketPrelude(launch)
+      + "printenv \(AgentPresenceOSC.socketEnvVar) || echo UNSET"
+
+    // No listener: nothing to adopt, so the hooks must be left on the OSC leg.
+    #expect(try Self.runSh(probe).trimmingCharacters(in: .whitespacesAndNewlines) == "UNSET")
+
+    // A socket file with no listener behind it (what sshd leaves after a drop)
+    // must read as unusable too, not merely as present: `[ -S ]` passes there
+    // and only the probe tells the two apart.
+    Self.makeOrphanSocketFile(at: listenPath)
+    #expect(Self.isSocketFile(listenPath))
+    #expect(try Self.runSh(probe).trimmingCharacters(in: .whitespacesAndNewlines) == "UNSET")
+    unlink(listenPath)
+
+    // A live listener at the forwarded path is adopted, and what gets exported
+    // is the stable symlink, never the per-attempt listener.
+    let server = AgentHookSocketServer(socketPathOverride: listenPath)
+    #expect(server.socketPath == listenPath)
+    let output = try Self.runSh(probe).trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(output == symlink)
+    let resolved = try FileManager.default.destinationOfSymbolicLink(atPath: symlink)
+    #expect(resolved == listenPath)
+    server.shutdown()
+  }
+
+  @Test func thePreludeReapsListenersSSHDLeftBehind() throws {
+    // sshd never unlinks a remote-forward socket on teardown, so without this
+    // every reconnect of a long-lived surface leaks another file into /tmp.
+    let surfaceID = UUID()
+    let launch = ZmxAttach.RemoteSurfaceLaunch(
+      host: RemoteHost(alias: "devbox"),
+      surfaceID: surfaceID,
+      userCommand: nil,
+      defaultCommand: nil,
+      hostPersistenceEnabled: false,
+      localSignalSocketPath: signalSocket
+    )
+    let sessionID = ZmxSessionID.make(surfaceID: surfaceID)
+    let stale = ["/tmp/\(sessionID)-1700000001.sock", "/tmp/\(sessionID)-1700000002.sock"]
+    let newest = "/tmp/\(sessionID)-1700000003.sock"
+    defer {
+      for path in stale + [newest, "/tmp/\(sessionID).sock"] { unlink(path) }
+    }
+    for path in stale + [newest] {
+      Self.makeOrphanSocketFile(at: path)
+    }
+
+    _ = try Self.runSh("supa_n=1700000003; " + ZmxAttach.socketPrelude(launch))
+
+    // Only the newest survives: nonces are fixed-width and monotonic, so the
+    // lexically last entry is the one this attempt bound.
+    for path in stale {
+      #expect(!FileManager.default.fileExists(atPath: path))
+    }
+    #expect(FileManager.default.fileExists(atPath: newest))
+  }
+
+  /// Binds and closes a Unix socket, leaving the socket inode on disk with
+  /// nothing accepting on it — exactly what sshd leaves behind when a
+  /// reverse-forwarded connection goes away.
+  private nonisolated static func makeOrphanSocketFile(at path: String) {
+    unlink(path)
+    let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard socketFD >= 0 else { return }
+    defer { close(socketFD) }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = path.utf8CString
+    guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return }
+    _ = withUnsafeMutablePointer(to: &addr.sun_path) { sunPath in
+      pathBytes.withUnsafeBufferPointer { memcpy(sunPath, $0.baseAddress!, $0.count) }
+    }
+    let addrLen = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
+    _ = withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(socketFD, $0, addrLen) }
+    }
+  }
+
+  private nonisolated static func isSocketFile(_ path: String) -> Bool {
+    var info = stat()
+    guard stat(path, &info) == 0 else { return false }
+    return (info.st_mode & S_IFMT) == S_IFSOCK
+  }
+
+  /// Runs a POSIX script under `/bin/sh` and returns its stdout.
+  private nonisolated static func runSh(_ script: String) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", script]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return String(bytes: data, encoding: .utf8) ?? ""
+  }
+
+  @Test func closingARemoteSurfaceRemovesItsForwardedSockets() {
+    let invocation = ZmxAttach.remoteKillInvocation(
+      host: RemoteHost(alias: "devbox"), sessionID: hostSessionID)
+    let script = invocation.arguments.last
+    // Ahead of the zmx guard: a host without zmx exits 0 there but can still
+    // have accumulated socket files.
+    #expect(script?.contains("rm -f /tmp/\(hostSessionID).sock /tmp/\(hostSessionID)-*.sock") == true)
+    if let script, let removal = script.range(of: "rm -f"),
+      let zmxGuard = script.range(of: "command -v zmx")
+    {
+      #expect(removal.lowerBound < zmxGuard.lowerBound)
+    }
   }
 
   @Test func buildRemoteCommandFallsBackToBareReconnectLoopWhenLocalZmxUnavailable() {
@@ -905,8 +1086,11 @@ struct ZmxAttachRemoteTests {
     // guard. Compose the expected argument through the same quoting helpers
     // rather than hand-escaping: `pathExportPrefix` embeds single quotes, so a
     // literal golden would be fragile without adding review value.
+    // The socket cleanup leads, unconditionally: the surface may have forwarded
+    // under an earlier setting, and `rm -f` on absent paths is a no-op.
     let killScript =
-      ZmxAttach.brewPathPrefix
+      "rm -f /tmp/supa-x.sock /tmp/supa-x-*.sock; "
+      + ZmxAttach.brewPathPrefix
       + "command -v zmx >/dev/null 2>&1 || exit 0; zmx kill supa-x; "
       + "! zmx list --short 2>/dev/null | grep -q 'supa-x$'"
     #expect(result.executableURL == URL(fileURLWithPath: "/usr/bin/ssh"))
@@ -927,9 +1111,17 @@ struct ZmxAttachRemoteTests {
         ),
       ]
     )
-    // Guard the intent directly: brew PATH precedes the zmx guard, and the
-    // spliced `-c` script parses as POSIX sh (symmetry with connect/reconnect).
-    #expect(killScript.hasPrefix("export PATH="))
+    // Guard the intent directly: socket cleanup runs before the zmx guard that
+    // can exit 0 early, brew PATH precedes the guard too, and the spliced `-c`
+    // script parses as POSIX sh (symmetry with connect/reconnect).
+    #expect(killScript.hasPrefix("rm -f "))
+    if let removal = killScript.range(of: "rm -f"),
+      let path = killScript.range(of: "export PATH="),
+      let zmxGuard = killScript.range(of: "command -v zmx")
+    {
+      #expect(removal.lowerBound < path.lowerBound)
+      #expect(path.lowerBound < zmxGuard.lowerBound)
+    }
     let check = Process()
     check.executableURL = URL(fileURLWithPath: "/bin/sh")
     check.arguments = ["-n", "-c", killScript]

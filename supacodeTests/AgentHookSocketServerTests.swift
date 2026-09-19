@@ -278,6 +278,127 @@ struct AgentHookSocketServerTests {
     server.shutdown()
   }
 
+  // MARK: - The signals-only listener (reverse-forwardable).
+
+  @Test func theSignalsSocketAcceptsContextSignals() async throws {
+    let path = "/tmp/supacode-tests/\(UUID().uuidString)"
+    let server = AgentHookSocketServer(socketPathOverride: path)
+    let signalPath = try #require(server.signalSocketPath)
+    let surfaceID = UUID()
+    let (signals, continuation) = AsyncStream.makeStream(of: CapturedSignal.self)
+    server.onContextSignal = { id, metadata, surface in
+      continuation.yield(CapturedSignal(id: id, metadata: metadata, surfaceID: surface))
+    }
+    let watchdog = Task {
+      try? await Task.sleep(for: .seconds(10))
+      continuation.finish()
+    }
+    defer { watchdog.cancel() }
+
+    let payload =
+      #"{"signal":"claude","metadata":"event=busy","surface_id":"\#(surfaceID.uuidString)"}"#
+    let response = try #require(await Self.sendAndReceive(path: signalPath, payload: payload))
+    // Acked before dispatch: a hook is holding up an agent turn and must never
+    // wait on app state.
+    #expect(response.contains(#""ok":true"#))
+
+    var iterator = signals.makeAsyncIterator()
+    let signal = try #require(await iterator.next())
+    #expect(signal.id == "claude")
+    #expect(signal.metadata == "event=busy")
+    #expect(signal.surfaceID == surfaceID)
+    server.shutdown()
+  }
+
+  @Test func theSignalsSocketRefusesDeeplinksWithoutReachingAHandler() async throws {
+    // This is the boundary that makes the socket safe to reverse-forward: the
+    // deeplink protocol bypasses confirmation under the default
+    // `automatedActionPolicy`, so a remote host must never reach it.
+    let path = "/tmp/supacode-tests/\(UUID().uuidString)"
+    let server = AgentHookSocketServer(socketPathOverride: path)
+    let signalPath = try #require(server.signalSocketPath)
+    let reachedHandler = LockIsolated(false)
+    server.onCommand = { _, clientFD in
+      reachedHandler.setValue(true)
+      AgentHookSocketServer.sendCommandResponse(clientFD: clientFD, ok: true)
+    }
+    server.onQuery = { _, _, clientFD in
+      reachedHandler.setValue(true)
+      AgentHookSocketServer.sendCommandResponse(clientFD: clientFD, ok: true)
+    }
+
+    for payload in [
+      #"{"deeplink":"supacode://worktree/%2Ftmp%2Frepo/run"}"#,
+      #"{"query":"worktrees"}"#,
+    ] {
+      let response = try #require(await Self.sendAndReceive(path: signalPath, payload: payload))
+      #expect(response.contains(#""ok":false"#))
+      #expect(response.contains("agent signals only"))
+    }
+    #expect(reachedHandler.value == false)
+    // The same payloads still work on the control socket.
+    let allowed = try #require(
+      await Self.sendAndReceive(path: path, payload: #"{"query":"worktrees"}"#))
+    #expect(allowed.contains(#""ok":true"#))
+    server.shutdown()
+  }
+
+  @Test func aSecondInstanceDoesNotStealTheSharedSignalsName() throws {
+    // Stealing would silently swallow the first instance's remote presence:
+    // its forwards still target the shared path, and signals for surfaces it
+    // owns would arrive here and be dropped as unknown.
+    let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
+    try FileManager.default.createDirectory(
+      atPath: directory, withIntermediateDirectories: true)
+    let first = AgentHookSocketServer(socketPathOverride: "\(directory)/pid-1")
+    let second = AgentHookSocketServer(socketPathOverride: "\(directory)/pid-2")
+    #expect(first.signalSocketPath == "\(directory)/pid-1-signals")
+    #expect(second.signalSocketPath == "\(directory)/pid-2-signals")
+    #expect(first.signalSocketPath != second.signalSocketPath)
+    first.shutdown()
+    second.shutdown()
+  }
+
+  @Test func shutdownRemovesBothSockets() async throws {
+    let path = "/tmp/supacode-tests/\(UUID().uuidString)"
+    let server = AgentHookSocketServer(socketPathOverride: path)
+    let signalPath = try #require(server.signalSocketPath)
+    #expect(FileManager.default.fileExists(atPath: signalPath))
+
+    server.shutdown()
+
+    #expect(server.signalSocketPath == nil)
+    #expect(!FileManager.default.fileExists(atPath: signalPath))
+    #expect(await Self.sendAndReceive(path: signalPath, payload: "{}") == nil)
+  }
+
+  @Test func prunerReapsAPerInstanceSignalsSocketOfADeadProcess() throws {
+    // The shared `signals` name is unlinked before every bind, so only the
+    // per-instance fallback can outlive its owner. The CLI ignores both names
+    // (neither parses as `pid-<pid>`), so the pruner is what reclaims them.
+    let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
+    try FileManager.default.createDirectory(
+      atPath: directory, withIntermediateDirectories: true)
+    let deadPID: Int32 = 999_999
+    #expect(kill(deadPID, 0) != 0)
+    for name in ["pid-\(deadPID)", "pid-\(deadPID)-signals", "signals"] {
+      FileManager.default.createFile(atPath: "\(directory)/\(name)", contents: Data())
+    }
+
+    AgentHookSocketServer.pruneStaleSocketFiles(in: directory)
+
+    #expect(!FileManager.default.fileExists(atPath: "\(directory)/pid-\(deadPID)"))
+    #expect(!FileManager.default.fileExists(atPath: "\(directory)/pid-\(deadPID)-signals"))
+    // The shared name carries no pid, so the pruner must leave it to its owner.
+    #expect(FileManager.default.fileExists(atPath: "\(directory)/signals"))
+  }
+
+  private struct CapturedSignal {
+    var id: String
+    var metadata: String
+    var surfaceID: UUID
+  }
+
   @Test func shutdownRemovesSocketAndRefusesNewConnections() async throws {
     let path = "/tmp/supacode-tests/\(UUID().uuidString)"
     let server = AgentHookSocketServer(socketPathOverride: path)
