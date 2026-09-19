@@ -216,7 +216,13 @@ final class AgentHookSocketServer {
         }
         guard ready > 0 else { continue }
 
-        guard let message = Self.acceptAndParse(socketFD: socketFD) else {
+        // Every hook on the machine shares the signals listener and gives up on
+        // it after a second, so one stalled sender must not hold the loop longer.
+        let receiveTimeoutSeconds = signalsOnly ? 1 : 5
+        guard
+          let message = Self.acceptAndParse(
+            socketFD: socketFD, receiveTimeoutSeconds: receiveTimeoutSeconds)
+        else {
           continue
         }
 
@@ -235,7 +241,9 @@ final class AgentHookSocketServer {
   ///
   /// `signalsOnly` marks the reverse-forwardable listener: commands and queries
   /// are refused there without ever reaching a handler, so reaching a remote
-  /// host's forwarded socket buys no access to the CLI control protocol.
+  /// host's forwarded socket buys no access to the CLI control protocol. What it
+  /// does grant is the ability to post presence and notifications for a known
+  /// surface id, the same authority an OSC written to that surface's tty has.
   private static func dispatch(
     message: Message, to server: AgentHookSocketServer?, signalsOnly: Bool
   ) {
@@ -435,7 +443,7 @@ final class AgentHookSocketServer {
   }
 
   private nonisolated static func acceptAndParse(
-    socketFD: Int32
+    socketFD: Int32, receiveTimeoutSeconds: Int
   ) -> Message? {
     let clientFD = accept(socketFD, nil, nil)
     guard clientFD >= 0 else {
@@ -454,7 +462,7 @@ final class AgentHookSocketServer {
     setNoSIGPIPE(clientFD)
 
     // Set a read timeout so a misbehaving client cannot block the accept loop.
-    var timeout = timeval(tv_sec: 5, tv_usec: 0)
+    var timeout = timeval(tv_sec: receiveTimeoutSeconds, tv_usec: 0)
     guard
       setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         == 0
