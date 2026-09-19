@@ -29,30 +29,35 @@ nonisolated struct ContentRetentionPolicy: Sendable {
 
   func retained(_ candidates: [Candidate], selected: Worktree.ID?) -> [Worktree.ID] {
     var remaining = budgetBytes
-    var result: [Worktree.ID] = []
     var included: Set<Worktree.ID> = []
-    if let selected, let candidate = candidates.first(where: { $0.id == selected }) {
-      result.append(selected)
-      included.insert(selected)
+    func include(_ candidate: Candidate) {
+      included.insert(candidate.id)
       remaining -= min(remaining, candidate.estimatedBytes)
     }
+    if let selected, let candidate = candidates.first(where: { $0.id == selected }) {
+      include(candidate)
+    }
+    // The floor goes first and is charged to the budget. Candidates arrive
+    // most-recent-first, so it is the worktrees the user is switching between
+    // that stay; filling it afterwards would let cheap older ones take the slots.
+    for candidate in candidates where included.count < Self.minimumWorktrees {
+      guard !included.contains(candidate.id) else { continue }
+      include(candidate)
+    }
     for candidate in candidates {
-      guard result.count < Self.maximumWorktrees else { break }
+      guard included.count < Self.maximumWorktrees else { break }
       guard !included.contains(candidate.id), candidate.estimatedBytes <= remaining else {
         continue
       }
-      remaining -= candidate.estimatedBytes
-      included.insert(candidate.id)
-      result.append(candidate.id)
+      include(candidate)
     }
-    // Candidates arrive most-recent-first, so the floor keeps the worktrees the
-    // user is actually switching between.
-    for candidate in candidates where result.count < Self.minimumWorktrees {
-      guard !included.contains(candidate.id) else { continue }
-      included.insert(candidate.id)
-      result.append(candidate.id)
+    // Selection first, then recency: the result is fed back as the next order.
+    var emitted: Set<Worktree.ID> = []
+    let rest = candidates.map(\.id).filter {
+      included.contains($0) && $0 != selected && emitted.insert($0).inserted
     }
-    return result
+    guard let selected, included.contains(selected) else { return rest }
+    return [selected] + rest
   }
 }
 

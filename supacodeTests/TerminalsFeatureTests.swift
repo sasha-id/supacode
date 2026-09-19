@@ -46,18 +46,39 @@ struct ContentRetentionPolicyTests {
 
   @Test func oversizedOlderSessionsDoNotDisplaceAffordableRecentContent() {
     let policy = ContentRetentionPolicy(budgetBytes: 100)
-    // Enough affordable candidates that the budget pass alone clears the floor,
-    // so this asserts budget precedence rather than the floor.
+    // The first three are the floor and cost 30 between them; past it, only what
+    // fits the remaining 70 is kept, in recency order.
     let candidates = [
-      ContentRetentionPolicy.Candidate(id: Worktree.ID("selected"), estimatedBytes: 40),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("selected"), estimatedBytes: 10),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("recent-a"), estimatedBytes: 10),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("recent-b"), estimatedBytes: 10),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("expensive"), estimatedBytes: 80),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("affordable"), estimatedBytes: 50),
-      ContentRetentionPolicy.Candidate(id: Worktree.ID("over-budget"), estimatedBytes: 20),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("over-budget"), estimatedBytes: 30),
       ContentRetentionPolicy.Candidate(id: Worktree.ID("spare"), estimatedBytes: 5),
     ]
     #expect(
       policy.retained(candidates, selected: Worktree.ID("selected")) == [
-        Worktree.ID("selected"), Worktree.ID("affordable"), Worktree.ID("spare"),
+        Worktree.ID("selected"), Worktree.ID("recent-a"), Worktree.ID("recent-b"),
+        Worktree.ID("affordable"), Worktree.ID("spare"),
+      ])
+  }
+
+  @Test func theFloorKeepsTheMostRecentWorktreesNotTheCheapest() {
+    // Two full-size worktrees the user is alternating between, then two that were
+    // only passed over and never grew a surface. Filling the floor from whatever
+    // still fits would keep the cheap pair and remount on every A/B switch.
+    let mebibyte: UInt64 = 1024 * 1024
+    let policy = ContentRetentionPolicy(budgetBytes: 512 * mebibyte)
+    let candidates = [
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("a"), estimatedBytes: 265 * mebibyte),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("b"), estimatedBytes: 265 * mebibyte),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("c"), estimatedBytes: 71 * mebibyte),
+      ContentRetentionPolicy.Candidate(id: Worktree.ID("d"), estimatedBytes: 71 * mebibyte),
+    ]
+    #expect(
+      policy.retained(candidates, selected: Worktree.ID("a")) == [
+        Worktree.ID("a"), Worktree.ID("b"), Worktree.ID("c"),
       ])
   }
 
@@ -75,9 +96,7 @@ struct ContentRetentionPolicyTests {
     }
     #expect(perWorktree > policy.budgetBytes / 2)
     let retained = policy.retained(candidates, selected: candidates[0].id)
-    #expect(retained.count == ContentRetentionPolicy.minimumWorktrees)
-    #expect(retained.first == candidates[0].id)
-    #expect(Set(retained).count == retained.count)
+    #expect(retained == candidates.prefix(ContentRetentionPolicy.minimumWorktrees).map(\.id))
   }
 
   @Test func selectionSurvivesEvenWhenItExceedsTheBudget() {
