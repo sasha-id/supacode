@@ -13,17 +13,21 @@ nonisolated enum OmpExtensionContent {
     /**
      * Supacode + Oh My Pi integration extension.
      *
-     * Reports agent lifecycle and notifications to Supacode by emitting OSC 3008
-     * escape sequences to the controlling terminal. The sequences are inert in any
-     * terminal that does not handle OSC 3008, and reach Supacode over SSH too (no
-     * local socket needed), matching the Claude / Codex / Kiro hook integrations.
+     * Reports agent lifecycle and notifications to Supacode over a Unix socket
+     * when one is reachable, falling back to OSC 3008 on the controlling terminal
+     * when it is not. The socket is strongly preferred: this extension runs inside
+     * the agent's own process, so a terminal write lands in the middle of whatever
+     * the agent is drawing, the parser eats the rest of the sequence, and the
+     * agent's next output paints at the wrong cursor position. The OSC sequences
+     * are inert in any terminal that does not handle OSC 3008.
      *
      * Required env var (injected automatically by Supacode on every surface):
      *   SUPACODE_SURFACE_ID  present only on a Supacode surface; absence is the
      *                        no-op gate. Signals are unauthenticated.
      * Optional:
-     *   SUPACODE_SOCKET_PATH  a socket that accepts agent signals; gates the pid
-     *                         so the app's liveness sweep can reap a crashed agent.
+     *   SUPACODE_SOCKET_PATH  a socket that accepts agent signals; picks the
+     *                         transport and gates the pid so the app's liveness
+     *                         sweep can reap a crashed agent.
      *
      * Hook event mapping:
      *   extension load      -> session_start  (agent presence badge)
@@ -34,6 +38,7 @@ nonisolated enum OmpExtensionContent {
 
     import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
     import { openSync, writeSync, closeSync } from "node:fs";
+    import { createConnection, type Socket } from "node:net";
 
     interface NotifyContent {
       title?: string;
@@ -44,6 +49,7 @@ nonisolated enum OmpExtensionContent {
 
     let lastWarnedAt = 0;
     const WARN_INTERVAL_MS = 60_000;
+    const SOCKET_TIMEOUT_MS = \(AgentPresenceOSC.socketTimeoutSeconds) * 1000;
 
     function isSupacodeSurface(): boolean {
       const id = process.env["SUPACODE_SURFACE_ID"];
@@ -51,9 +57,10 @@ nonisolated enum OmpExtensionContent {
     }
 
     /**
-     * The agent's local process id as an OSC pid suffix, but only on the local
-     * host (SUPACODE_SOCKET_PATH is set). A remote pid over SSH would be
-     * meaningless to the app's liveness sweep, so it is omitted there.
+     * The agent's process id as a pid suffix, emitted only when a socket is
+     * reachable. Over a forwarded socket that pid belongs to the remote host, so
+     * the app decides whether to keep it; on the plain terminal leg there is no
+     * way to tell, hence the omission here.
      */
     function localPidSuffix(): string {
       return process.env["SUPACODE_SOCKET_PATH"] ? `;pid=${process.pid}` : "";
@@ -120,10 +127,74 @@ nonisolated enum OmpExtensionContent {
       }
     }
 
-    function emitPresence(event: string): void {
+    /**
+     * Sends one signal over the app's Unix socket. Resolves true only once the
+     * app has acked and half-closed, so a missing, stale, or wedged listener
+     * falls through to the terminal instead of swallowing the signal.
+     */
+    function sendToSocket(path: string, payload: string): Promise<boolean> {
+      return new Promise((resolve) => {
+        let client: Socket;
+        try {
+          client = createConnection({ path });
+        } catch {
+          resolve(false);
+          return;
+        }
+        const settle = (ok: boolean) => {
+          client.destroy();
+          resolve(ok);
+        };
+        // Attached before anything else can fail: an unhandled "error" on a
+        // socket is rethrown out of the event loop and would kill the agent.
+        client.on("error", () => settle(false));
+        client.setTimeout(SOCKET_TIMEOUT_MS, () => settle(false));
+        client.on("close", () => resolve(false));
+        client.on("connect", () => {
+          // Half-close after the payload so the app sees EOF, then drain its
+          // ack: leaving it unread makes the app's reply fail with EPIPE.
+          client.end(payload);
+          client.resume();
+          client.on("end", () => settle(true));
+        });
+      });
+    }
+
+    /**
+     * Serializes every emit. The socket leg is asynchronous while the terminal
+     * leg is not, and the app cancels a debounced `idle` on any newer event, so
+     * two racing emits could settle the badge on the wrong one. Chaining keeps
+     * the wire order equal to the call order across both transports.
+     */
+    let emitQueue: Promise<void> = Promise.resolve();
+
+    /**
+     * Queues one signal, preferring the out-of-band socket. The terminal write
+     * is the fallback for a surface that has none: this extension runs inside
+     * the agent's own process, so an OSC lands mid-render and corrupts the TUI.
+     */
+    function emit(action: string, meta: string): Promise<void> {
+      const surfaceID = process.env["SUPACODE_SURFACE_ID"] ?? "";
+      const socketPath = process.env["SUPACODE_SOCKET_PATH"];
+      emitQueue = emitQueue
+        .then(async () => {
+          if (socketPath) {
+            const envelope = JSON.stringify({
+              "\(AgentPresenceOSC.signalField)": AGENT,
+              "\(AgentPresenceOSC.metadataField)": meta,
+              "\(AgentPresenceOSC.surfaceIDField)": surfaceID,
+            });
+            if (await sendToSocket(socketPath, envelope)) return;
+          }
+          writeToTerminal(`\\x1b]3008;${action}=${AGENT};${meta}\\x1b\\\\`);
+        })
+        .catch(() => {});
+      return emitQueue;
+    }
+
+    function emitPresence(event: string): Promise<void> {
       const action = event === "session_end" ? "end" : "start";
-      const meta = `event=${event}${localPidSuffix()}`;
-      writeToTerminal(`\\x1b]3008;${action}=${AGENT};${meta}\\x1b\\\\`);
+      return emit(action, `event=${event}${localPidSuffix()}`);
     }
 
     // JSON-escape (minus the surrounding quotes) so the wire matches the shell
@@ -136,12 +207,12 @@ nonisolated enum OmpExtensionContent {
       return capped.toString("base64");
     }
 
-    function emitNotification(content: NotifyContent): void {
+    function emitNotification(content: NotifyContent): Promise<void> {
       const meta =
         `kind=notify` +
         `;title=${notifyField(content.title ?? "", \(AgentPresenceOSC.notifyTitleByteBudget))}` +
         `;body=${notifyField(content.body ?? "", \(AgentPresenceOSC.notifyBodyByteBudget))}`;
-      writeToTerminal(`\\x1b]3008;start=${AGENT};${meta}\\x1b\\\\`);
+      return emit("start", meta);
     }
 
     function lastAssistantText(ctx: { sessionManager: { getEntries(): any[] } }): string | undefined {
@@ -184,10 +255,12 @@ nonisolated enum OmpExtensionContent {
         emitNotification({ body: lastAssistantText(ctx) });
       });
 
-      omp.on("session_shutdown", (_event, _ctx) => {
+      omp.on("session_shutdown", async (_event, _ctx) => {
         // OMP loads extensions into in-process subagent sessions. Their
         // shutdown must not end the shared top-level process presence.
-        emitPresence("idle");
+        // Awaited so the queue drains before OMP tears the process down, if it
+        // honours the returned promise.
+        await emitPresence("idle");
       });
     }
     """
