@@ -1,5 +1,6 @@
 import AppKit
 import ComposableArchitecture
+import SupacodeSettingsShared
 import SwiftUI
 
 /// Everything one worktree's terminal tree renders from, as one value.
@@ -78,6 +79,7 @@ private struct WorktreeTerminalStackBridge: NSViewRepresentable {
 
 @MainActor
 final class WorktreeTerminalStackView: NSView {
+  private static let logger = SupaLogger("Terminal")
   private var hosted: [Worktree.ID: NSHostingView<WorktreeTerminalRoot>] = [:]
   /// Mounted worktrees, least recently selected first.
   private var mountOrder: [Worktree.ID] = []
@@ -91,6 +93,21 @@ final class WorktreeTerminalStackView: NSView {
   private var parkedHeldKeyboard = false
 
   var mountedWorktreeIDs: [Worktree.ID] { mountOrder }
+
+  /// Visibility is re-derived here as well as in `select(_:retaining:)`, so a
+  /// selection update that never reaches the representable cannot leave another
+  /// worktree's live tree on screen for the rest of the session. The pass is a
+  /// dictionary walk over at most a handful of trees, and every write is
+  /// guarded by a compare, so an already-correct stack costs nothing.
+  override func layout() {
+    super.layout()
+    applyVisibility()
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    applyVisibility()
+  }
 
   /// The hosting view a worktree's tree lives in, for asserting that a switch
   /// left it in place.
@@ -122,16 +139,14 @@ final class WorktreeTerminalStackView: NSView {
     selectedWorktreeID = worktreeID
     mountOrder.removeAll { $0 == worktreeID }
     mountOrder.append(worktreeID)
-    for (id, view) in hosted {
-      let shouldHide = id != worktreeID
-      if view.isHidden != shouldHide {
-        view.isHidden = shouldHide
-      }
-    }
+    applyVisibility()
     if selectionMoved {
       // Hiding a tree drops its holes from the window tint without moving any
       // region, so nothing else would mark the mask dirty.
       WindowTintMaskRegistry.regionVisibilityDidChange(in: self)
+      Self.logger.debug(
+        "Stack selection \(worktreeID.rawValue) mounted=\(mountOrder.map(\.rawValue)) writes=\(hostedRootWrites)"
+      )
     }
     if let outgoing, outgoingHoldsKeyboard {
       handOverFirstResponder(from: outgoing, to: worktreeID, manager: inputs.manager)
@@ -140,6 +155,20 @@ final class WorktreeTerminalStackView: NSView {
       inputs.manager.hostIfExists(for: worktreeID)?.focusSelectedTab()
     }
     evictOutsideRetention(Set(retainedWorktreeIDs).union([worktreeID]))
+  }
+
+  /// Derives every tree's visibility from `selectedWorktreeID` — the one place
+  /// that decides it. Hiding a tree also takes the keyboard off it: AppKit
+  /// resigns a first responder whose ancestor becomes hidden, which is what
+  /// makes this the difference between showing another worktree's pane and
+  /// typing into its agent.
+  private func applyVisibility() {
+    for (id, view) in hosted {
+      let shouldHide = id != selectedWorktreeID
+      if view.isHidden != shouldHide {
+        view.isHidden = shouldHide
+      }
+    }
   }
 
   /// Deselects and hides the current tree without unmounting anything; the

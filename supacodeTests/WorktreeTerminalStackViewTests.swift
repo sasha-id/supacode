@@ -170,6 +170,25 @@ struct WorktreeTerminalStackViewTests {
     #expect(fixture.stack.mountedWorktreeIDs == [first.worktree.id, second.worktree.id])
   }
 
+  /// Visibility has to be re-derivable from the stack's own state. Every other
+  /// test drives `select()`, which is exactly why none of them can see a
+  /// selection update that never arrives — and a stale one leaves another
+  /// worktree's live tree on screen for the rest of the session.
+  @Test func layoutReassertsVisibilityWithoutASelection() {
+    let fixture = Fixture()
+    let first = fixture.inputs("/tmp/repo/wt-a")
+    let second = fixture.inputs("/tmp/repo/wt-b")
+    fixture.select(first)
+    fixture.select(second)
+    // Stands in for the outgoing tree never being told to hide.
+    fixture.stack.hostedView(for: first.worktree.id)?.isHidden = false
+
+    fixture.stack.layout()
+
+    #expect(fixture.stack.hostedView(for: first.worktree.id)?.isHidden == true)
+    #expect(fixture.stack.hostedView(for: second.worktree.id)?.isHidden == false)
+  }
+
   @Test func mountingPastTheLimitEvictsTheLeastRecentlySelected() {
     let fixture = Fixture()
     let visited = (0...8).map { fixture.inputs("/tmp/repo/wt-\($0)") }
