@@ -1135,7 +1135,7 @@ struct AgentHookCommandTests {
   private static let guardAndPrelude =
     #"[ -n "${SUPACODE_SURFACE_ID:-}" ] && { "#
     + #"__ppid=${PPID:-}; case "$__ppid" in 0|1) __ppid="";; esac; "#
-      + #"__sock="${SUPACODE_SIGNAL_SOCKET_PATH:-${SUPACODE_SOCKET_PATH:-}}"; __tty=""; "#
+    + #"__sock="${SUPACODE_SIGNAL_SOCKET_PATH:-${SUPACODE_SOCKET_PATH:-}}"; __tty=""; "#
   private static let suppressTail = #"} >/dev/null 2>&1 || true # supacode-managed-hook"#
 
   /// Transport branch shared by presence and notify: socket first, OSC on the

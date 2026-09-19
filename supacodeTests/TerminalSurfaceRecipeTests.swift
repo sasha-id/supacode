@@ -1,7 +1,10 @@
+import DependenciesTestSupport
 import Foundation
 import GhosttyKit
+import Sharing
 import Testing
 
+@testable import SupacodeSettingsShared
 @testable import supacode
 
 @MainActor
@@ -92,6 +95,32 @@ struct TerminalSurfaceRecipeTests {
     // both address it by this derivation.
     #expect(launch.usesZmx)
     #expect(launch.commandWrapper.contains(ZmxSessionID.make(surfaceID: surfaceID)))
+  }
+
+  @Test(.dependencies) func remoteLaunchForwardsTheSignalSocketOnlyWhenTheSettingAllowsIt() {
+    let worktree = Worktree(
+      id: WorktreeID("devbox:/srv/wt"),
+      name: "wt",
+      detail: "detail",
+      workingDirectory: URL(filePath: "/srv/wt", directoryHint: .notDirectory),
+      repositoryRootURL: URL(filePath: "/srv", directoryHint: .notDirectory),
+      host: RemoteHost(alias: "devbox")
+    )
+    func command(forwarding: Bool) -> String {
+      @Shared(.settingsFile) var settingsFile
+      $settingsFile.withLock { $0.global.remoteAgentPresenceForwardingEnabled = forwarding }
+      return TerminalSurfaceRecipe.launch(
+        TerminalSurfaceRecipe.LaunchIntent(),
+        for: worktree,
+        surfaceID: UUID(),
+        zmxExecutablePath: "/usr/local/bin/zmx",
+        signalSocketPath: "/tmp/signals"
+      ).command ?? ""
+    }
+    // Opting out must leave no reverse forward behind: the remote host would
+    // otherwise keep a socket into this machine the user asked not to open.
+    #expect(command(forwarding: true).contains(":/tmp/signals"))
+    #expect(!command(forwarding: false).contains("/tmp/signals"))
   }
 
   // MARK: - Surface plans.

@@ -994,18 +994,16 @@ struct ZmxAttachRemoteTests {
     return String(bytes: data, encoding: .utf8) ?? ""
   }
 
-  @Test func closingARemoteSurfaceRemovesItsForwardedSockets() {
+  @Test func closingARemoteSurfaceRemovesItsForwardedSockets() throws {
     let invocation = ZmxAttach.remoteKillInvocation(
       host: RemoteHost(alias: "devbox"), sessionID: hostSessionID)
-    let script = invocation.arguments.last
+    let script = try #require(invocation.arguments.last)
     // Ahead of the zmx guard: a host without zmx exits 0 there but can still
     // have accumulated socket files.
-    #expect(script?.contains("rm -f /tmp/\(hostSessionID).sock /tmp/\(hostSessionID)-*.sock") == true)
-    if let script, let removal = script.range(of: "rm -f"),
-      let zmxGuard = script.range(of: "command -v zmx")
-    {
-      #expect(removal.lowerBound < zmxGuard.lowerBound)
-    }
+    #expect(script.contains("rm -f /tmp/\(hostSessionID).sock /tmp/\(hostSessionID)-*.sock"))
+    let removal = try #require(script.range(of: "rm -f"))
+    let zmxGuard = try #require(script.range(of: "command -v zmx"))
+    #expect(removal.lowerBound < zmxGuard.lowerBound)
   }
 
   @Test func buildRemoteCommandFallsBackToBareReconnectLoopWhenLocalZmxUnavailable() {
@@ -1115,13 +1113,11 @@ struct ZmxAttachRemoteTests {
     // can exit 0 early, brew PATH precedes the guard too, and the spliced `-c`
     // script parses as POSIX sh (symmetry with connect/reconnect).
     #expect(killScript.hasPrefix("rm -f "))
-    if let removal = killScript.range(of: "rm -f"),
-      let path = killScript.range(of: "export PATH="),
-      let zmxGuard = killScript.range(of: "command -v zmx")
-    {
-      #expect(removal.lowerBound < path.lowerBound)
-      #expect(path.lowerBound < zmxGuard.lowerBound)
-    }
+    let removal = try #require(killScript.range(of: "rm -f"))
+    let path = try #require(killScript.range(of: "export PATH="))
+    let zmxGuard = try #require(killScript.range(of: "command -v zmx"))
+    #expect(removal.lowerBound < path.lowerBound)
+    #expect(path.lowerBound < zmxGuard.lowerBound)
     let check = Process()
     check.executableURL = URL(fileURLWithPath: "/bin/sh")
     check.arguments = ["-n", "-c", killScript]
