@@ -381,16 +381,89 @@ struct AgentHookSocketServerTests {
     // Stealing would silently swallow the first instance's remote presence:
     // its forwards still target the shared path, and signals for surfaces it
     // owns would arrive here and be dropped as unknown.
+    let directory = try Self.makeSocketDirectory()
+    let shared = "\(directory)/\(AgentHookSocketServer.signalSocketName)"
+    let first = AgentHookSocketServer(
+      socketPathOverride: "\(directory)/pid-1", contendsForSharedSignalName: true)
+    defer { first.shutdown() }
+    let second = AgentHookSocketServer(
+      socketPathOverride: "\(directory)/pid-2", contendsForSharedSignalName: true)
+
+    #expect(first.signalSocketPath == shared)
+    #expect(second.signalSocketPath == "\(directory)/pid-2-signals")
+
+    // The incident this test exists for: the loser's teardown used to unlink the
+    // shared name unconditionally, leaving the winner listening on a file no
+    // client can address — every agent hook on the machine silently transportless
+    // until the app restarted.
+    let inodeBefore = try #require(Self.inode(at: shared))
+    second.shutdown()
+    #expect(Self.inode(at: shared) == inodeBefore)
+    #expect(first.signalSocketPath == shared)
+  }
+
+  @Test func theOwnerRebindsTheSharedNameAfterItIsUnlinkedUnderneathIt() async throws {
+    // The bound descriptor survives an outside `unlink`, so the server keeps
+    // accepting at a name that no longer resolves. Nothing observable fails —
+    // which is why the owner has to notice and re-bind rather than wait for a
+    // report.
+    let directory = try Self.makeSocketDirectory()
+    let shared = "\(directory)/\(AgentHookSocketServer.signalSocketName)"
+    let server = AgentHookSocketServer(
+      socketPathOverride: "\(directory)/pid-1", contendsForSharedSignalName: true)
+    defer { server.shutdown() }
+    #expect(server.signalSocketPath == shared)
+
+    unlink(shared)
+    #expect(!FileManager.default.fileExists(atPath: shared))
+
+    // Driven directly; the watchdog runs the same call on a timer.
+    server.reclaimSignalNameIfLost()
+
+    #expect(server.signalSocketPath == shared)
+    let payload =
+      #"{"signal":"claude","metadata":"event=busy","surface_id":"\#(UUID().uuidString)"}"#
+    let response = try #require(await Self.sendAndReceive(path: shared, payload: payload))
+    #expect(response.contains(#""ok":true"#))
+  }
+
+  @Test func theOwnerStandsDownWhenAnotherInstanceHoldsTheSharedName() throws {
+    // A successor that legitimately reclaimed the name is answering there. Taking
+    // it back would start a tug-of-war, and unlinking its file would strand it the
+    // same way this instance was stranded.
+    let directory = try Self.makeSocketDirectory()
+    let shared = "\(directory)/\(AgentHookSocketServer.signalSocketName)"
+    let first = AgentHookSocketServer(
+      socketPathOverride: "\(directory)/pid-1", contendsForSharedSignalName: true)
+    defer { first.shutdown() }
+    #expect(first.signalSocketPath == shared)
+
+    unlink(shared)
+    let successor = AgentHookSocketServer(
+      socketPathOverride: "\(directory)/pid-2", contendsForSharedSignalName: true)
+    defer { successor.shutdown() }
+    #expect(successor.signalSocketPath == shared)
+    let successorInode = try #require(Self.inode(at: shared))
+
+    first.reclaimSignalNameIfLost()
+
+    #expect(Self.inode(at: shared) == successorInode)
+  }
+
+  private static func makeSocketDirectory() throws -> String {
     let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
     try FileManager.default.createDirectory(
       atPath: directory, withIntermediateDirectories: true)
-    let first = AgentHookSocketServer(socketPathOverride: "\(directory)/pid-1")
-    let second = AgentHookSocketServer(socketPathOverride: "\(directory)/pid-2")
-    #expect(first.signalSocketPath == "\(directory)/pid-1-signals")
-    #expect(second.signalSocketPath == "\(directory)/pid-2-signals")
-    #expect(first.signalSocketPath != second.signalSocketPath)
-    first.shutdown()
-    second.shutdown()
+    return directory
+  }
+
+  /// The inode of the file at `path`, or nil when nothing is there. Ownership of
+  /// a socket name is an inode question: a successor that reclaims the name puts
+  /// a different file at the same path.
+  private static func inode(at path: String) -> ino_t? {
+    var info = stat()
+    guard stat(path, &info) == 0 else { return nil }
+    return info.st_ino
   }
 
   @Test func shutdownRemovesBothSockets() async throws {
@@ -407,9 +480,10 @@ struct AgentHookSocketServerTests {
   }
 
   @Test func prunerReapsAPerInstanceSignalsSocketOfADeadProcess() throws {
-    // The shared `signals` name is unlinked before every bind, so only the
-    // per-instance fallback can outlive its owner. The CLI ignores both names
-    // (neither parses as `pid-<pid>`), so the pruner is what reclaims them.
+    // The CLI ignores both signals names (neither parses as `pid-<pid>`), so the
+    // pruner is what reclaims a per-instance one whose owner died. The shared
+    // name is never pruned: it carries no pid to test, and a live owner's file
+    // is indistinguishable from a stale one here.
     let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
     try FileManager.default.createDirectory(
       atPath: directory, withIntermediateDirectories: true)

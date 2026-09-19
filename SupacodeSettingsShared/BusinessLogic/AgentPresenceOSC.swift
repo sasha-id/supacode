@@ -6,24 +6,25 @@ import Foundation
 /// ingest for either:
 /// - **Unix socket** (local): a one-line JSON object
 ///   `{"signal":"<agent>","metadata":"<metadata>","surface_id":"<uuid>"}` piped to
-///   a socket the app is listening on. Preferred whenever one is named in the
-///   environment, because it never touches the agent's terminal. The socket arm
-///   counts as delivered only once the app acks, so a listener that is missing,
-///   stale, or wedged falls through to the tty instead of swallowing the signal.
+///   a socket the app is listening on. The transport whenever one is named in
+///   the environment, because it never touches the agent's terminal. A socket
+///   that is named but unreachable drops the signal rather than falling back:
+///   see `sendShell`.
 /// - **OSC 3008** (UAPI hierarchical context signal): `OSC 3008 ; <action>=<agent>
 ///   ; <metadata> ST` written to the agent's tty. libghostty splits that into
 ///   `id = <agent>` (the context id, up to the first `;`) and the metadata that
 ///   `parse` receives. Inert in any terminal that doesn't handle OSC 3008 (no
-///   toast, no side effect). The fallback for SSH, where the socket can't be
-///   reached, and for a stale socket path (an app restart under a surviving zmx
-///   session).
+///   toast, no side effect). The transport only for a surface that names no
+///   socket at all — plain SSH with no reverse forward.
 ///
 /// The tty is a shared resource: the agent is writing its own frames to it, and a
 /// hook's bytes land between the chunks the kernel splits a large write into,
 /// i.e. mid-escape-sequence. That corrupts the agent's rendering, and no amount
-/// of shrinking the payload closes the window — only not writing does. Hence the
-/// socket is the default and OSC is the fallback (#390 made OSC unconditional and
-/// shipped that corruption to every local session).
+/// of shrinking the payload closes the window — only not writing does. Hence a
+/// surface that names a socket never writes to the tty, not even when the socket
+/// turns out to be unreachable (#390 made OSC unconditional and shipped that
+/// corruption to every local session; a socket-failure fallback re-opened the
+/// same window whenever the app's listener went away under a live session).
 ///
 /// Presence metadata is `event=<event>[;pid=<pid>]`, and `parse` derives the event
 /// solely from the `event=` field, ignoring the start/end action byte:
@@ -83,12 +84,6 @@ public nonisolated enum AgentPresenceOSC {
   /// Absolute path: the hook may run with a PATH that can't reach `nc` (Grok
   /// rewrites the environment, and a stripped PATH is a supported shape).
   public static let netcatPath = "/usr/bin/nc"
-
-  /// What the app writes back once a signal is accepted. The socket arm is gated
-  /// on it: `nc -w` exits 0 when it gives up on an idle connection, so without
-  /// this a wedged listener would report success and the signal would be dropped
-  /// instead of falling back to the tty.
-  public static let ackPattern = #""ok":true"#
 
   /// Seconds `nc` waits on the socket. The app acks as soon as it holds the whole
   /// envelope and then closes, so this only bounds a wedged app; the hook's own
@@ -267,36 +262,37 @@ public nonisolated enum AgentPresenceOSC {
   /// terminal of their own and `ps` reports a bare tty name (`??` falls back to
   /// `/dev/tty`). `set -f` is load-bearing: that `??` is a glob.
   ///
-  /// Idempotent and lazy — it runs only inside the OSC fallback arm, so a local
-  /// hook never pays the `ps` fork, and a composite that falls back twice resolves
-  /// once. The resolve always lands on a non-empty path, so `$__tty` doubles as
-  /// the already-resolved flag.
+  /// Idempotent and lazy — it runs only inside the OSC arm, so a hook on a
+  /// socket-bearing surface never pays the `ps` fork, and a composite that takes
+  /// that arm twice resolves once. The resolve always lands on a non-empty path,
+  /// so `$__tty` doubles as the already-resolved flag.
   static let ttyResolveSnippet =
     #"[ -n "$__tty" ] || { "#
     + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
     + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }"#
 
-  /// Ships the signal already built into `$__md`: over the socket when one is
-  /// reachable, else as OSC 3008 on the parent agent's tty.
+  /// Ships the signal already built into `$__md`: over the socket when the
+  /// surface has one, else as OSC 3008 on the parent agent's tty.
   ///
-  /// The socket arm's exit status is the fallback condition, so a stale or
-  /// unreachable socket still lands the signal instead of silently dropping it.
-  /// The arm succeeds only on the app's ack: `nc -w` exits 0 when it times out
-  /// on an idle connection, so matching the ack is the only way a wedged
-  /// listener reaches the tty rather than swallowing the signal. The match is a
-  /// shell `case`, not `grep`: a remote host owes us no particular path for one.
-  /// The extension emitters are looser, accepting any clean close as delivery.
+  /// Which arm runs is decided by whether a socket is *configured*, never by
+  /// whether the write to it succeeded. A configured-but-unreachable socket is
+  /// always a managed surface, and the tty it would fall back to is the one the
+  /// agent is actively rendering into — an OSC landing mid-frame corrupts the
+  /// TUI, which is a far worse outcome than a missing presence badge. So the
+  /// unreachable case emits nothing at all, and no future socket-lifecycle bug
+  /// can reach a terminal. Only an unset path — plain SSH with no reverse
+  /// forward, where the OSC is the sole transport — takes the tty arm.
+  ///
   /// Everything on the wire is JSON-safe by construction: the metadata is
   /// `key=value` pairs whose values are event names, digits, or standard base64.
   private static func sendShell(agent: SkillAgent, action: String) -> String {
     let envelope =
       #"{"\#(signalField)":"\#(agent.rawValue)","\#(metadataField)":"%s","\#(surfaceIDField)":"%s"}"#
     let osc = #"\033]3008;\#(action)=\#(agent.rawValue);%s\033\\"#
-    return #"{ [ -n "$__sock" ] "#
-      + #"&& case "$(printf '\#(envelope)' "$__md" "${\#(surfaceEnvVar):-}" "#
-      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "$__sock")" "#
-      + #"in *'\#(ackPattern)'*) :;; *) false;; esac; } "#
-      + #"|| { \#(ttyResolveSnippet); printf '\#(osc)' "$__md" > "$__tty"; }"#
+    return #"if [ -n "$__sock" ]; then "#
+      + #"printf '\#(envelope)' "$__md" "${\#(surfaceEnvVar):-}" "#
+      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "$__sock" >/dev/null 2>&1; "#
+      + #"else \#(ttyResolveSnippet); printf '\#(osc)' "$__md" > "$__tty"; fi"#
   }
 
   /// Shell that emits the presence signal for `event` over the available

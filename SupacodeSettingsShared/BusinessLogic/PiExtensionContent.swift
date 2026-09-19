@@ -14,12 +14,13 @@ nonisolated enum PiExtensionContent {
      * Supacode + Pi integration extension.
      *
      * Reports agent lifecycle and notifications to Supacode over a Unix socket
-     * when one is reachable, falling back to OSC 3008 on the controlling terminal
-     * when it is not. The socket is strongly preferred: this extension runs inside
-     * the agent's own process, so a terminal write lands in the middle of whatever
-     * the agent is drawing, the parser eats the rest of the sequence, and the
-     * agent's next output paints at the wrong cursor position. The OSC sequences
-     * are inert in any terminal that does not handle OSC 3008.
+     * whenever the surface has one, and as OSC 3008 on the controlling terminal
+     * only when it has none. A configured socket that cannot be reached drops
+     * the signal instead: this extension runs inside the agent's own process, so
+     * a terminal write lands in the middle of whatever the agent is drawing, the
+     * parser eats the rest of the sequence, and the agent's next output paints at
+     * the wrong cursor position. The OSC sequences are inert in any terminal that
+     * does not handle OSC 3008.
      *
      * Required env var (injected automatically by Supacode on every surface):
      *   SUPACODE_SURFACE_ID  present only on a Supacode surface; absence is the
@@ -126,8 +127,9 @@ nonisolated enum PiExtensionContent {
 
     /**
      * Sends one signal over the app's Unix socket. Resolves true only once the
-     * app has acked and half-closed, so a missing, stale, or wedged listener
-     * falls through to the terminal instead of swallowing the signal.
+     * app has acked and half-closed; a missing, stale, or wedged listener
+     * resolves false, which the caller ignores: the terminal is never the
+     * fallback for a surface that has a socket configured.
      */
     function sendToSocket(path: string, payload: string): Promise<boolean> {
       return new Promise((resolve) => {
@@ -166,9 +168,12 @@ nonisolated enum PiExtensionContent {
     let emitQueue: Promise<void> = Promise.resolve();
 
     /**
-     * Queues one signal, preferring the out-of-band socket. The terminal write
-     * is the fallback for a surface that has none: this extension runs inside
-     * the agent's own process, so an OSC lands mid-render and corrupts the TUI.
+     * Queues one signal. The socket is the transport whenever the surface has
+     * one configured; the terminal write serves only a surface that has none.
+     * A configured socket that cannot be reached drops the signal rather than
+     * falling through: this extension runs inside the agent's own process, so
+     * an OSC lands mid-render and corrupts the TUI, which costs more than a
+     * missing badge.
      */
     function emit(action: string, meta: string): Promise<void> {
       const surfaceID = process.env["SUPACODE_SURFACE_ID"] ?? "";
@@ -181,7 +186,8 @@ nonisolated enum PiExtensionContent {
               "\(AgentPresenceOSC.metadataField)": meta,
               "\(AgentPresenceOSC.surfaceIDField)": surfaceID,
             });
-            if (await sendToSocket(socketPath, envelope)) return;
+            await sendToSocket(socketPath, envelope);
+            return;
           }
           writeToTerminal(`\\x1b]3008;${action}=${AGENT};${meta}\\x1b\\\\`);
         })

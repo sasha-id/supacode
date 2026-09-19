@@ -12,10 +12,12 @@ private nonisolated let socketLogger = SupaLogger("AgentHookSocket")
 /// - **Command**: a `"deeplink"` key wrapping a `supacode://` URL.
 /// - **Query**: a `"query"` key and optional parameters.
 /// - **Context signal**: a `"signal"` key with `"metadata"` and `"surface_id"` —
-///   the agent presence / notify wire (see `AgentPresenceOSC`). It is the
-///   preferred transport precisely because it leaves the agent's terminal
-///   alone; hooks fall back to OSC 3008 on the tty only when the socket turns
-///   out to be unreachable.
+///   the agent presence / notify wire (see `AgentPresenceOSC`). It is the only
+///   transport a managed surface uses, precisely because it leaves the agent's
+///   terminal alone: a hook that cannot reach the socket drops the signal rather
+///   than writing OSC into a tty its agent is mid-render on. That makes this
+///   listener's availability the whole presence story, which is why the name it
+///   is bound to is defended below rather than merely bound once.
 ///
 /// Two listeners are bound, and the difference is a security boundary, not a
 /// convenience. `socketPath` speaks the full protocol and must stay local-only:
@@ -33,6 +35,12 @@ final class AgentHookSocketServer {
   /// hooks reach presence without writing OSC into the agent's own tty.
   private(set) var signalSocketPath: String?
 
+  /// Inode of the file `signalSocketPath` named when this instance bound it.
+  /// Ownership is proved by inode rather than by path: a successor that reclaims
+  /// the shared name binds a *different* file at the same path, and unlinking
+  /// that one is exactly the defect the ownership checks exist to prevent.
+  private var signalSocketInode: ino_t?
+
   /// Shared name for the signals listener, and the suffix of the per-instance
   /// fallback. Deliberately not `pid-<pid>`-parseable, so the CLI's socket
   /// discovery keeps ignoring both.
@@ -42,6 +50,24 @@ final class AgentHookSocketServer {
   /// Cancellation flag for the accept-loop thread; shared by reference so the
   /// thread never retains `self`.
   private let listenStopped = LockIsolated(false)
+
+  /// The same for the signals listener alone, so a re-bind can retire just that
+  /// accept loop and leave the control socket running. Replaced wholesale
+  /// rather than reset: the retired thread keeps the old instance and stops,
+  /// while the new thread watches the new one.
+  private var signalListenStopped = LockIsolated(false)
+
+  /// Watches the shared signals name for disappearing underneath us. Only an
+  /// instance holding the *shared* name runs one — a per-instance name is
+  /// derived from this process's pid, so nothing else can take it. A `Task`
+  /// rather than a `Timer` because `deinit` has to be able to stop it, and a
+  /// non-Sendable `Timer` cannot be touched from there.
+  private var signalNameWatchdog: Task<Void, Never>?
+
+  /// How often the watchdog compares the name on disk against what it bound.
+  /// A `stat` every few seconds is far cheaper than the failure it catches,
+  /// where every agent hook on the machine loses its transport until restart.
+  private static let signalNameWatchdogInterval: TimeInterval = 5
   /// Deeplink URL received from the CLI. Second parameter is the client FD for response.
   var onCommand: ((URL, Int32) -> Void)?
   /// Query received from the CLI. Parameters: resource name, extra params, client FD for response.
@@ -53,7 +79,12 @@ final class AgentHookSocketServer {
 
   /// `socketPathOverride` lets tests bind a unique path; the default is the
   /// pid-derived path the CLI discovers.
-  init(socketPathOverride: String? = nil) {
+  ///
+  /// `contendsForSharedSignalName` is the opt-in for the tests that exercise the
+  /// shared-name handover. An overridden path otherwise stays on its per-instance
+  /// signals name, so unrelated tests sharing a directory never fight over one
+  /// file — which also means the contention path needs an explicit way in.
+  init(socketPathOverride: String? = nil, contendsForSharedSignalName: Bool = false) {
     let directory: String
     let path: String
     if let socketPathOverride {
@@ -62,7 +93,14 @@ final class AgentHookSocketServer {
     } else {
       let uid = getuid()
       let pid = ProcessInfo.processInfo.processIdentifier
-      directory = "/tmp/supacode-\(uid)"
+      // A test host is a real second instance — every bundle sets `TEST_HOST` to
+      // the app, and parallel testing launches several at once. Pointing them at
+      // the live directory lets them contend for, and tear down, the running
+      // app's sockets; giving them their own is the enforceable form of "don't
+      // run a second instance against someone's live machine".
+      directory =
+        ProcessInfo.processInfo.isRunningUnitTests
+        ? "/tmp/supacode-\(uid)-tests" : "/tmp/supacode-\(uid)"
       path = "\(directory)/pid-\(pid)"
     }
 
@@ -84,8 +122,14 @@ final class AgentHookSocketServer {
     guard startListening(path: path) else { return }
     socketPath = path
     let perInstanceSignalPath = path + Self.signalSocketSuffix
+    // The shared name exists for restart recovery — surfaces that outlive an app
+    // restart keep reaching presence through it. A test host has no sessions to
+    // recover, so it never competes for it.
+    let wantsSharedName =
+      contendsForSharedSignalName
+      || (socketPathOverride == nil && !ProcessInfo.processInfo.isRunningUnitTests)
     bindSignalListener(
-      preferred: socketPathOverride == nil
+      preferred: wantsSharedName
         ? "\(directory)/\(Self.signalSocketName)" : perInstanceSignalPath,
       fallback: perInstanceSignalPath
     )
@@ -101,22 +145,107 @@ final class AgentHookSocketServer {
   /// and only the first instance gets restart recovery.
   private func bindSignalListener(preferred: String, fallback: String) {
     let path = Self.isLiveSocket(path: preferred) ? fallback : preferred
+    // Safe for either outcome: `isLiveSocket` proved nothing answers at
+    // `preferred`, and `fallback` is derived from this process's own pid, so
+    // only a crashed predecessor sharing our pid could have left it behind.
     unlink(path)
     guard startListening(path: path, signalsOnly: true) else { return }
     signalSocketPath = path
+    signalSocketInode = Self.inode(at: path)
+    if path != fallback { startSignalNameWatchdog() }
   }
 
-  /// True when something is accepting connections at `path` right now. A socket
-  /// file left behind by a crashed process refuses the connect and reads as
-  /// free, which is the distinction that makes the name safe to reclaim.
+  /// True unless it can be *proved* that nothing is listening at `path`.
+  ///
+  /// Deliberately fails closed. The caller reclaims a name this reports free,
+  /// and reclaiming a name whose owner is merely busy strands that owner on a
+  /// socket no client can address. Only two errno values prove a free name:
+  /// `ENOENT` (no such name) and a `ECONNREFUSED` that persists — a socket file
+  /// outliving the process that bound it refuses every time, whereas a live
+  /// listener whose backlog is momentarily full refuses one connect and accepts
+  /// the next. Every other failure (a sandbox's `EPERM`, `EINTR`, a path too
+  /// long to express) is ambiguous and reads as live.
   private nonisolated static func isLiveSocket(path: String) -> Bool {
-    let probeFD = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard probeFD >= 0 else { return false }
-    defer { close(probeFD) }
-    let connected = withUnixAddress(path: path) { addr, addrLen in
-      connect(probeFD, addr, addrLen) == 0
+    // Four probes at 75ms cover a backlog that drains within one poll interval
+    // (200ms) without making startup wait noticeably on a genuinely dead name.
+    for attempt in 0..<4 {
+      if attempt > 0 { usleep(75_000) }
+      let probeFD = socket(AF_UNIX, SOCK_STREAM, 0)
+      guard probeFD >= 0 else { return true }
+      defer { close(probeFD) }
+      var failure: Int32 = 0
+      let connected = withUnixAddress(path: path) { addr, addrLen in
+        let result = connect(probeFD, addr, addrLen)
+        failure = result == 0 ? 0 : errno
+        return result == 0
+      }
+      guard let connected else { return true }
+      if connected { return true }
+      if failure == ENOENT { return false }
+      guard failure == ECONNREFUSED else { return true }
     }
-    return connected ?? false
+    return false
+  }
+
+  /// The inode of the socket file at `path`, or nil when nothing is there.
+  private nonisolated static func inode(at path: String) -> ino_t? {
+    var info = stat()
+    guard stat(path, &info) == 0 else { return nil }
+    return info.st_ino
+  }
+
+  /// Removes `signalSocketPath` only while the file there is still the one this
+  /// instance bound. A successor that reclaimed the name left a different inode,
+  /// and unlinking that would strand *it* the same way.
+  private nonisolated static func unlinkOwnedSignalSocket(
+    path: String?, inode: ino_t?
+  ) {
+    guard let path, let inode, Self.inode(at: path) == inode else { return }
+    unlink(path)
+  }
+
+  /// Re-binds the shared signals name when it stops pointing at this instance's
+  /// socket. The listener's file descriptor survives an outside `unlink`, so
+  /// without this the app goes on accepting connections at a name no client can
+  /// reach — and every agent hook that dials it loses its transport for the rest
+  /// of the app's life. Idempotent; the watchdog calls it on a timer.
+  func reclaimSignalNameIfLost() {
+    guard let path = signalSocketPath, let inode = signalSocketInode else { return }
+    guard Self.inode(at: path) != inode else { return }
+    guard !Self.isLiveSocket(path: path) else {
+      // Somebody else is answering there now. Taking it back would start a
+      // tug-of-war, and its signals for our surfaces are already lost; say so
+      // once per tick rather than fight.
+      socketLogger.warning("Signals socket \(path) was taken over by another instance")
+      return
+    }
+    socketLogger.warning("Signals socket \(path) disappeared; rebinding")
+    signalListenStopped.setValue(true)
+    signalListenStopped = LockIsolated(false)
+    unlink(path)
+    guard startListening(path: path, signalsOnly: true) else {
+      signalSocketPath = nil
+      signalSocketInode = nil
+      stopSignalNameWatchdog()
+      return
+    }
+    signalSocketInode = Self.inode(at: path)
+  }
+
+  private func startSignalNameWatchdog() {
+    stopSignalNameWatchdog()
+    signalNameWatchdog = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(Self.signalNameWatchdogInterval))
+        guard !Task.isCancelled, let self else { return }
+        reclaimSignalNameIfLost()
+      }
+    }
+  }
+
+  private func stopSignalNameWatchdog() {
+    signalNameWatchdog?.cancel()
+    signalNameWatchdog = nil
   }
 
   /// Removes socket files left behind by processes that are no longer running.
@@ -152,16 +281,18 @@ final class AgentHookSocketServer {
 
   deinit {
     listenStopped.setValue(true)
+    signalListenStopped.setValue(true)
+    signalNameWatchdog?.cancel()
     if let socketPath {
       unlink(socketPath)
     }
-    if let signalSocketPath {
-      unlink(signalSocketPath)
-    }
+    Self.unlinkOwnedSignalSocket(path: signalSocketPath, inode: signalSocketInode)
   }
 
   func shutdown() {
     listenStopped.setValue(true)
+    signalListenStopped.setValue(true)
+    stopSignalNameWatchdog()
     // A connection accepted in the final poll window must get "Not ready."
     // instead of running against state the owner is tearing down.
     onCommand = nil
@@ -171,10 +302,9 @@ final class AgentHookSocketServer {
       unlink(socketPath)
     }
     socketPath = nil
-    if let signalSocketPath {
-      unlink(signalSocketPath)
-    }
+    Self.unlinkOwnedSignalSocket(path: signalSocketPath, inode: signalSocketInode)
     signalSocketPath = nil
+    signalSocketInode = nil
   }
 
   // MARK: - Socket lifecycle.
@@ -188,7 +318,11 @@ final class AgentHookSocketServer {
     // the cooperative pool it would pin a thread, and under the test main
     // serial executor it would starve the main thread outright. The thread
     // captures the stop flag, never `self`, so deinit stays reachable.
-    let stopped = listenStopped
+    let stopped = signalsOnly ? signalListenStopped : listenStopped
+    // Captured here so the accept thread can tell "the name still points at the
+    // socket I bound" from "somebody else rebound it" without reaching back
+    // into main-actor state.
+    let boundInode = Self.inode(at: path)
     let thread = Thread { [weak self] in
       socketLogger.info("Listening on \(path)")
       defer { close(socketFD) }
@@ -201,11 +335,18 @@ final class AgentHookSocketServer {
             socketLogger.warning("poll() failed: \(String(cString: strerror(errno)))")
             // Remove the advertised path so the CLI sees "not running"
             // instead of a confusing refused connection, and stop new
-            // terminals from exporting a dead socket path.
-            unlink(path)
+            // terminals from exporting a dead socket path. The signals name can
+            // be shared, so it only goes when it is still ours.
+            if signalsOnly {
+              Self.unlinkOwnedSignalSocket(path: path, inode: boundInode)
+            } else {
+              unlink(path)
+            }
             Task { @MainActor [weak self] in
               if signalsOnly {
                 self?.signalSocketPath = nil
+                self?.signalSocketInode = nil
+                self?.stopSignalNameWatchdog()
               } else {
                 self?.socketPath = nil
               }
@@ -384,7 +525,11 @@ final class AgentHookSocketServer {
       return -1
     }
 
-    guard listen(socketFD, 8) == 0 else {
+    // Every agent hook on the machine dials the signals listener, and a full
+    // backlog refuses a connect exactly the way a dead socket does — which is
+    // what a second instance's liveness probe reads as a free name. Depth costs
+    // nothing here and keeps that misreading rare.
+    guard listen(socketFD, 64) == 0 else {
       socketLogger.warning("listen() failed: \(String(cString: strerror(errno)))")
       close(socketFD)
       return -1
