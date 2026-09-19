@@ -188,6 +188,25 @@ struct SettingsFeatureAgentIntegrationTests {
     #expect(checked.value == Set(SkillAgent.allCases))
   }
 
+  @Test(.dependencies) func refreshLandsEachProbeOnItsOwnAgent() async {
+    let store = TestStore(initialState: SettingsFeature.State()) {
+      SettingsFeature()
+    } withDependencies: {
+      $0[AgentIntegrationClient.self].state = { agent in
+        agent == .claude ? .installed : .notInstalled
+      }
+    }
+
+    store.exhaustivity = .off(showSkippedAssertions: false)
+    await store.send(.refreshAgentIntegrationStates)
+    await store.skipReceivedActions()
+
+    for agent in SkillAgent.allCases {
+      let expected: AgentIntegrationState = agent == .claude ? .installed : .notInstalled
+      #expect(store.state.agentIntegrationStates[agent] == .ready(expected))
+    }
+  }
+
   @Test(.dependencies) func outdatedStateAlwaysAutoFiresInstall() async {
     var state = SettingsFeature.State()
     state.agentIntegrationStates[.claude] = .ready(.installed)

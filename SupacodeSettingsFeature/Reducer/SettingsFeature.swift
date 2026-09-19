@@ -331,18 +331,19 @@ public struct SettingsFeature {
         // shares `AgentIntegrationCancelID` with the install effect and
         // would kill the first install mid-write.
         return .run { [agentIntegrationClient] send in
-          await withTaskGroup(of: (SkillAgent, Result<AgentIntegrationState, Error>).self) { group in
+          await withTaskGroup(of: AgentIntegrationProbe.self) { group in
             for agent in SkillAgent.allCases {
               group.addTask {
                 do {
-                  return (agent, .success(try await agentIntegrationClient.state(agent)))
+                  let state = try await agentIntegrationClient.state(agent)
+                  return AgentIntegrationProbe(agent: agent, result: .success(state))
                 } catch {
-                  return (agent, .failure(error))
+                  return AgentIntegrationProbe(agent: agent, result: .failure(error))
                 }
               }
             }
-            for await (agent, probe) in group {
-              await send(.agentIntegrationChecked(agent, probe))
+            for await probe in group {
+              await send(.agentIntegrationChecked(probe.agent, probe.result))
             }
           }
         }
@@ -975,6 +976,14 @@ public struct SettingsFeature {
 /// the next tap (or a fresh Settings open) supersedes the prior one.
 private nonisolated struct AgentIntegrationCancelID: Hashable, Sendable {
   let agent: SkillAgent
+}
+
+/// One agent's probe outcome as it leaves the refresh task group. A named type
+/// rather than a tuple: the optimizer collapsed the tuple's agent to the first
+/// `SkillAgent` case in Release builds, so every result landed on one row.
+private nonisolated struct AgentIntegrationProbe: Sendable {
+  let agent: SkillAgent
+  let result: Result<AgentIntegrationState, Error>
 }
 
 /// Cancellation key for the agent-state refresh effect so stacked scene
