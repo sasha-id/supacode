@@ -120,6 +120,13 @@ public struct AppearanceSettingsView: View {
           }
           Text("Sizes all non-terminal text. The terminal keeps its own font size.")
         }
+        Picker(selection: $store.animationsEnabled) {
+          DefaultTaggedLabel(label: "Enabled", isDefault: true).tag(true)
+          Text("Disabled").tag(false)
+        } label: {
+          Text("Animations")
+          Text("Motion in the app chrome: tab shimmer, agent badges and progress indicators.")
+        }
       }
       Section {
         Toggle(isOn: $store.analyticsEnabled) {

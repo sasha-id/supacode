@@ -173,6 +173,13 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
   /// Accessibility size for the app chrome's text. Drives the scale published at
   /// each window root. Defaults to the unmodified system size.
   public var chromeTextSize: ChromeTextSize
+  /// Governs every motion-guarded animation in the app chrome. On by default;
+  /// off holds each one in its still form. Several of those still forms carry
+  /// less information than the moving ones — a compacting agent badge is
+  /// indistinguishable from an idle one, a busy tab from a quiet one — so this
+  /// is the user's own switch and not a mirror of the system Reduce Motion
+  /// setting.
+  public var animationsEnabled: Bool
   /// Gates all background repository polling (remote SSH, PR checks, reconcile).
   /// On by default; disable to stop SSH passphrase prompts or GitHub rate limiting.
   public var automaticRepositoryRefreshEnabled: Bool
@@ -222,7 +229,8 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     remoteSessionPersistenceEnabled: true,
     remoteAgentPresenceForwardingEnabled: true,
     appVisibility: .dockAndMenuBar,
-    chromeTextSize: .default
+    chromeTextSize: .default,
+    animationsEnabled: true
   )
 
   public init(
@@ -268,6 +276,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     appVisibility: AppVisibility = .dockAndMenuBar,
     terminalHibernationEnabled: Bool = true,
     chromeTextSize: ChromeTextSize = .default,
+    animationsEnabled: Bool = true,
     automaticRepositoryRefreshEnabled: Bool = true,
     hoverFocusMode: HoverFocusMode = .never,
     globalToggleVisibilityHotkey: AppShortcutOverride? = nil
@@ -314,6 +323,7 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
     self.appVisibility = appVisibility
     self.terminalHibernationEnabled = terminalHibernationEnabled
     self.chromeTextSize = chromeTextSize
+    self.animationsEnabled = animationsEnabled
     self.automaticRepositoryRefreshEnabled = automaticRepositoryRefreshEnabled
     self.hoverFocusMode = hoverFocusMode
     self.globalToggleVisibilityHotkey = globalToggleVisibilityHotkey
@@ -531,6 +541,10 @@ public nonisolated struct GlobalSettings: Codable, Equatable, Sendable {
       ((try? container.decodeIfPresent(String.self, forKey: .chromeTextSize)) ?? nil)
       .flatMap(ChromeTextSize.init(rawValue:))
       ?? Self.default.chromeTextSize
+    // Pre-feature files omit this key; motion defaults on.
+    animationsEnabled =
+      try container.decodeIfPresent(Bool.self, forKey: .animationsEnabled)
+      ?? Self.default.animationsEnabled
     // Pre-feature files omit this key; background refresh defaults on.
     automaticRepositoryRefreshEnabled =
       try container.decodeIfPresent(Bool.self, forKey: .automaticRepositoryRefreshEnabled)

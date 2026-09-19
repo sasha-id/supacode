@@ -1436,6 +1436,45 @@ struct SettingsFilePersistenceTests {
     #expect(settings.global.appearanceMode == .light)
   }
 
+  @Test(.dependencies) func decodesMissingAnimationsEnabledAsDefault() throws {
+    // Files written before the Animations setting have no key; they must keep
+    // animating rather than loading as if the user had switched motion off.
+    let json = """
+      {"appearanceMode":"light","updatesAutomaticallyCheckForUpdates":false,\
+      "updatesAutomaticallyDownloadUpdates":false}
+      """
+    let storage = MutableTestStorage(initialData: Data(json.utf8))
+
+    let settings: SettingsFile = withDependencies {
+      $0.settingsFileStorage = storage.storage
+    } operation: {
+      @Shared(.settingsFile) var settings: SettingsFile
+      return settings
+    }
+
+    #expect(settings.global.animationsEnabled == true)
+  }
+
+  @Test(.dependencies) func roundTripsDisabledAnimations() throws {
+    let storage = SettingsTestStorage()
+
+    withDependencies {
+      $0.settingsFileStorage = storage.storage
+    } operation: {
+      @Shared(.settingsFile) var settings: SettingsFile
+      $settings.withLock { $0.global.animationsEnabled = false }
+    }
+
+    let reloaded: SettingsFile = withDependencies {
+      $0.settingsFileStorage = storage.storage
+    } operation: {
+      @Shared(.settingsFile) var reloaded: SettingsFile
+      return reloaded
+    }
+
+    #expect(reloaded.global.animationsEnabled == false)
+  }
+
   @Test(.dependencies) func roundTripsExplicitChromeTextSize() throws {
     let storage = SettingsTestStorage()
 

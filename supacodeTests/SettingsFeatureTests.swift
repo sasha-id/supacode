@@ -183,6 +183,59 @@ struct SettingsFeatureTests {
     #expect(settingsFile.global.chromeTextSize == .large)
   }
 
+  @Test(.dependencies) func togglingAnimationsPersistsChanges() async {
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global = .default }
+
+    let store = TestStore(initialState: SettingsFeature.State()) {
+      SettingsFeature()
+    }
+
+    await store.send(.binding(.set(\.animationsEnabled, false))) {
+      $0.animationsEnabled = false
+    }
+    await store.receive(\.delegate.settingsChanged)
+    #expect(settingsFile.global.animationsEnabled == false)
+  }
+
+  @Test(.dependencies) func settingsLoadedAppliesAnimationsEnabled() async {
+    // The read side: a disabled file value must reach feature state, or the
+    // picker shows Enabled while every guarded animation is held still.
+    var loaded = GlobalSettings.default
+    loaded.animationsEnabled = false
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global = loaded }
+
+    let store = TestStore(initialState: SettingsFeature.State()) {
+      SettingsFeature()
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.settingsLoaded(loaded))
+    #expect(store.state.animationsEnabled == false)
+    await store.skipReceivedActions()
+  }
+
+  @Test(.dependencies) func unrelatedSettingsChangeKeepsAnimationsEnabled() async {
+    // `persist` assigns `$0.global` wholesale, so a field missing from this
+    // feature's state would be written back as its default on every unrelated
+    // change.
+    var initialSettings = GlobalSettings.default
+    initialSettings.animationsEnabled = false
+    @Shared(.settingsFile) var settingsFile
+    $settingsFile.withLock { $0.global = initialSettings }
+
+    let store = TestStore(initialState: SettingsFeature.State(settings: initialSettings)) {
+      SettingsFeature()
+    }
+
+    await store.send(.binding(.set(\.terminalHibernationEnabled, false))) {
+      $0.terminalHibernationEnabled = false
+    }
+    await store.receive(\.delegate.settingsChanged)
+    #expect(settingsFile.global.animationsEnabled == false)
+  }
+
   @Test(.dependencies) func togglingAutomaticRepositoryRefreshPersistsChanges() async {
     @Shared(.settingsFile) var settingsFile
     $settingsFile.withLock { $0.global = .default }

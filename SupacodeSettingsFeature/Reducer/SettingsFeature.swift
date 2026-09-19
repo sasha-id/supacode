@@ -89,6 +89,7 @@ public struct SettingsFeature {
     public var appVisibility: AppVisibility
     public var terminalHibernationEnabled: Bool
     public var chromeTextSize: ChromeTextSize
+    public var animationsEnabled: Bool
     public var automaticRepositoryRefreshEnabled: Bool
     public var hoverFocusMode: HoverFocusMode
     public var globalToggleVisibilityHotkey: AppShortcutOverride?
@@ -182,6 +183,7 @@ public struct SettingsFeature {
       appVisibility = settings.appVisibility
       terminalHibernationEnabled = settings.terminalHibernationEnabled
       chromeTextSize = settings.chromeTextSize
+      animationsEnabled = settings.animationsEnabled
       automaticRepositoryRefreshEnabled = settings.automaticRepositoryRefreshEnabled
       hoverFocusMode = settings.hoverFocusMode
       globalToggleVisibilityHotkey = settings.globalToggleVisibilityHotkey
@@ -235,6 +237,7 @@ public struct SettingsFeature {
         appVisibility: appVisibility,
         terminalHibernationEnabled: terminalHibernationEnabled,
         chromeTextSize: chromeTextSize,
+        animationsEnabled: animationsEnabled,
         automaticRepositoryRefreshEnabled: automaticRepositoryRefreshEnabled,
         hoverFocusMode: hoverFocusMode,
         globalToggleVisibilityHotkey: globalToggleVisibilityHotkey
@@ -402,6 +405,7 @@ public struct SettingsFeature {
         state.appVisibility = normalizedSettings.appVisibility
         state.terminalHibernationEnabled = normalizedSettings.terminalHibernationEnabled
         state.chromeTextSize = normalizedSettings.chromeTextSize
+        state.animationsEnabled = normalizedSettings.animationsEnabled
         state.automaticRepositoryRefreshEnabled = normalizedSettings.automaticRepositoryRefreshEnabled
         state.hoverFocusMode = normalizedSettings.hoverFocusMode
         state.globalToggleVisibilityHotkey = normalizedSettings.globalToggleVisibilityHotkey
