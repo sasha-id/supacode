@@ -27,8 +27,8 @@ final class TerminalPresentation {
   /// restore. A warm surface is never covered. Geometry moves on every event of a
   /// divider drag or a sidebar animation, so `expectedSize` would keep moving out
   /// from under `frameAvailable` and the cover would hold for the whole gesture;
-  /// letting the last frame stretch for a refresh reads far better than blanking
-  /// a terminal that already has content.
+  /// showing the last frame at its old size for a refresh reads far better than
+  /// blanking a terminal that already has content.
   func prepare(size: CGSize, cold: Bool) {
     guard size.width > 0, size.height > 0 else { return }
     expectedSize = size

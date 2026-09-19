@@ -815,7 +815,7 @@ extension LayoutFeature {
   }
 
   /// Drops a pending wake and cancels its effect; `.none` when none was in
-  /// flight, so ordinary closes and hibernations stay epoch-neutral.
+  /// flight, so ordinary closes and hibernations cancel nothing.
   private func cancelPendingWake(_ state: inout State, tabID: TabID) -> Effect<Action> {
     guard state.wakingTabs.remove(tabID) != nil else { return .none }
     return .cancel(id: WakeID.tab(tabID))

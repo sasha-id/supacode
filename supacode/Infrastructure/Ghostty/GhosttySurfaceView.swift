@@ -108,9 +108,9 @@ final class GhosttySurfaceView: NSView, Identifiable {
   private var lastAppliedBackingSize: CGSize = .zero
   // A size that arrived while this view was hidden, deferred to the reveal.
   private var needsSizeSyncOnReveal = false
-  // Whether a size measured from a real window has ever been applied. Until it
-  // has, the surface is still running at creation geometry, which is only an
-  // estimate, so even a hidden view must take the first measured size.
+  // Whether a size measured from a real window has been applied, or has confirmed
+  // the creation geometry. Until then the surface is running at an estimate, so
+  // even a hidden view must take the first measured size.
   private var hasAppliedMeasuredSize = false
   let presentation = TerminalPresentation()
   private var frameObservation: NSKeyValueObservation?
@@ -1106,9 +1106,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
       cellWidth: Int(currentSize.cell_width_px),
       cellHeight: Int(currentSize.cell_height_px)
     )
+    // An exact creation size measures as unchanged; that settles it just as well.
+    if decision != .rejectDegenerate { hasAppliedMeasuredSize = true }
     guard decision == .apply else { return }
     lastAppliedBackingSize = backingSize
-    hasAppliedMeasuredSize = true
     preparePresentation()
     ghostty_surface_set_size(
       surface,
