@@ -84,17 +84,15 @@ public nonisolated enum AgentPresenceOSC {
   /// rewrites the environment, and a stripped PATH is a supported shape).
   public static let netcatPath = "/usr/bin/nc"
 
-  /// Absolute for the same reason as `netcatPath`. Used to gate the socket arm
-  /// on the app's ack: `nc -w` exits 0 when it gives up on an idle connection,
-  /// so without this a wedged listener would report success and the signal would
-  /// be dropped instead of falling back to the tty.
-  public static let grepPath = "/usr/bin/grep"
-
-  /// What the app writes back once a signal is accepted.
+  /// What the app writes back once a signal is accepted. The socket arm is gated
+  /// on it: `nc -w` exits 0 when it gives up on an idle connection, so without
+  /// this a wedged listener would report success and the signal would be dropped
+  /// instead of falling back to the tty.
   public static let ackPattern = #""ok":true"#
 
-  /// Seconds `nc` waits on the socket. The app acks and half-closes immediately,
-  /// so this only bounds a wedged app; the hook's own deadline is 2s.
+  /// Seconds `nc` waits on the socket. The app acks as soon as it holds the whole
+  /// envelope and then closes, so this only bounds a wedged app; the hook's own
+  /// deadline is 2s.
   public static let socketTimeoutSeconds = 1
 
   static let eventField = "event"
@@ -285,18 +283,19 @@ public nonisolated enum AgentPresenceOSC {
   /// unreachable socket still lands the signal instead of silently dropping it.
   /// The arm succeeds only on the app's ack: `nc -w` exits 0 when it times out
   /// on an idle connection, so matching the ack is the only way a wedged
-  /// listener reaches the tty rather than swallowing the signal. That matches
-  /// what the extension emitters do, which is why all four can claim the same
-  /// contract. Everything on the wire is JSON-safe by construction: the metadata
-  /// is `key=value` pairs whose values are event names, digits, or standard base64.
+  /// listener reaches the tty rather than swallowing the signal. The match is a
+  /// shell `case`, not `grep`: a remote host owes us no particular path for one.
+  /// The extension emitters are looser, accepting any clean close as delivery.
+  /// Everything on the wire is JSON-safe by construction: the metadata is
+  /// `key=value` pairs whose values are event names, digits, or standard base64.
   private static func sendShell(agent: SkillAgent, action: String) -> String {
     let envelope =
       #"{"\#(signalField)":"\#(agent.rawValue)","\#(metadataField)":"%s","\#(surfaceIDField)":"%s"}"#
     let osc = #"\033]3008;\#(action)=\#(agent.rawValue);%s\033\\"#
     return #"{ [ -n "$__sock" ] "#
-      + #"&& printf '\#(envelope)' "$__md" "${\#(surfaceEnvVar):-}" "#
-      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "$__sock" "#
-      + #"| \#(grepPath) -q '\#(ackPattern)'; } "#
+      + #"&& case "$(printf '\#(envelope)' "$__md" "${\#(surfaceEnvVar):-}" "#
+      + #"| \#(netcatPath) -U -w\#(socketTimeoutSeconds) "$__sock")" "#
+      + #"in *'\#(ackPattern)'*) :;; *) false;; esac; } "#
       + #"|| { \#(ttyResolveSnippet); printf '\#(osc)' "$__md" > "$__tty"; }"#
   }
 

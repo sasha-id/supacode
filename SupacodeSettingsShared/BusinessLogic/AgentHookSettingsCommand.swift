@@ -108,9 +108,10 @@ nonisolated enum AgentHookSettingsCommand {
   /// Env vars Grok must forward into hook subprocesses. Grok spawns hooks without
   /// inheriting the terminal's `SUPACODE_*` env; `${VAR}` expansion copies from
   /// the parent Grok process at spawn time. Presence strictly needs
-  /// `SUPACODE_SURFACE_ID` (emit guard and socket attribution) and
-  /// `SUPACODE_SOCKET_PATH` (transport choice and local pid suffix); the remaining
-  /// vars match the terminal env for parity with other agents / future hooks.
+  /// `SUPACODE_SURFACE_ID` (emit guard and socket attribution) and the two socket
+  /// paths (transport choice and local pid suffix; the signals one is preferred);
+  /// the remaining vars match the terminal env for parity with other agents /
+  /// future hooks.
   static let grokHookEnvPassthrough: [String: String] = [
     "SUPACODE_SURFACE_ID": "${SUPACODE_SURFACE_ID}",
     "SUPACODE_SOCKET_PATH": "${SUPACODE_SOCKET_PATH}",

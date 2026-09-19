@@ -456,8 +456,9 @@ struct AgentHookCommandTests {
       + #"__md="event=busy"; [ -n "$__sock" ] && [ -n "$__ppid" ] "#
       + #"&& __md="$__md;pid=$__ppid"; "#
       + #"{ [ -n "$__sock" ] "#
-      + #"&& printf '{"signal":"claude","metadata":"%s","surface_id":"%s"}' "$__md" "${SUPACODE_SURFACE_ID:-}" "#
-      + #"| /usr/bin/nc -U -w1 "$__sock" | /usr/bin/grep -q '"ok":true'; } "#
+      + #"&& case "$(printf '{"signal":"claude","metadata":"%s","surface_id":"%s"}' "$__md" "#
+      + #""${SUPACODE_SURFACE_ID:-}" "#
+      + #"| /usr/bin/nc -U -w1 "$__sock")" in *'"ok":true'*) :;; *) false;; esac; } "#
       + #"|| { [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
       + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
@@ -476,7 +477,7 @@ struct AgentHookCommandTests {
     #expect(command.contains(#"[ -n "${SUPACODE_SURFACE_ID:-}" ]"#))
     #expect(!command.contains("token="))
     #expect(command.contains(#""signal":"claude""#))
-    #expect(command.contains(#"/usr/bin/nc -U -w1 "$__sock" | /usr/bin/grep -q '"ok":true'"#))
+    #expect(command.contains(#"/usr/bin/nc -U -w1 "$__sock")" in *'"ok":true'*) :;; *) false;; esac"#))
     #expect(command.contains("]3008;start=claude;"))
     #expect(command.contains(#"> "$__tty""#))
     #expect(command.contains("ps -o tty= -p \"$__ppid\""))
@@ -1142,8 +1143,9 @@ struct AgentHookCommandTests {
   /// parent agent's tty (resolved lazily, once) when the socket is unreachable.
   private static func send(_ action: String, _ agent: String) -> String {
     #"{ [ -n "$__sock" ] "#
-      + #"&& printf '{"signal":"\#(agent)","metadata":"%s","surface_id":"%s"}' "$__md" "${SUPACODE_SURFACE_ID:-}" "#
-      + #"| /usr/bin/nc -U -w1 "$__sock" | /usr/bin/grep -q '"ok":true'; } "#
+      + #"&& case "$(printf '{"signal":"\#(agent)","metadata":"%s","surface_id":"%s"}' "$__md" "#
+      + #""${SUPACODE_SURFACE_ID:-}" "#
+      + #"| /usr/bin/nc -U -w1 "$__sock")" in *'"ok":true'*) :;; *) false;; esac; } "#
       + #"|| { [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
       + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#

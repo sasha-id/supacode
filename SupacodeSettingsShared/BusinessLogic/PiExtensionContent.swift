@@ -64,7 +64,7 @@ nonisolated enum PiExtensionContent {
      * falling back to the terminal from inside the agent corrupts the TUI.
      */
     function signalSocket(): string | undefined {
-      return process.env["\(AgentPresenceOSC.signalSocketEnvVar)"] ?? process.env["\(AgentPresenceOSC.socketEnvVar)"];
+      return process.env["\(AgentPresenceOSC.signalSocketEnvVar)"] || process.env["\(AgentPresenceOSC.socketEnvVar)"];
     }
 
     /**
