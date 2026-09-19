@@ -1385,6 +1385,33 @@ struct RemoteRepositoryResolutionTests {
     }
   }
 
+  /// The selection the resolution restores has to reach the terminal side.
+  /// `.selectedWorktreeChanged` is the only bridge between the two halves, so
+  /// without it the chrome follows the restored worktree while the terminals
+  /// reducer keeps gating pane content, retention and hibernation on whatever
+  /// was selected before — a split that nothing later re-derives.
+  @Test(.dependencies) func restoringTheFocusedWorktreeOnResolutionAnnouncesTheSelection() async {
+    let cfg = config()
+    let repoID = RepositoriesFeature.remoteRepositoryID(for: cfg)
+    let restored = resolvedRepository(repoID: repoID).worktrees[0]
+    var state = placeholderState(repoID: repoID, config: cfg)
+    state.$sidebar.withLock { $0.focusedWorktreeID = restored.id }
+    state.shouldRestoreLastFocusedWorktree = true
+
+    await withStore(state) { store in
+      await store.send(
+        .remoteRepositoryResolved(
+          repositoryID: repoID,
+          repository: resolvedRepository(repoID: repoID),
+          failureMessage: nil
+        )
+      )
+      await store.receive(\.delegate.selectedWorktreeChanged) { _ in }
+      await store.finish()
+      #expect(store.state.selectedWorktreeID == restored.id)
+    }
+  }
+
   @Test(.dependencies) func resolvedRemoteReplacesPlaceholderAndClearsResolving() async {
     let cfg = config()
     let repoID = RepositoriesFeature.remoteRepositoryID(for: cfg)

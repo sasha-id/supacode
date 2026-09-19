@@ -3760,6 +3760,16 @@ struct RepositoriesFeature {
         }
         let didChange = existing != repository
         state.repositories[id: repositoryID] = repository
+        // `applyRepositories` and `dropStaleFailedRepositorySelection` both move
+        // the selection — a resolved remote can restore the last focused
+        // worktree, select the first row, or clear an invalid one. The terminal
+        // side only ever learns about a selection through
+        // `.selectedWorktreeChanged`, so skipping it here leaves the two halves
+        // permanently apart: the chrome follows the new worktree while the
+        // terminals reducer keeps gating pane content, recency retention and
+        // hibernation on the old one.
+        let previousSelection = state.selectedWorktreeID
+        let previousSelectedWorktree = state.worktree(for: previousSelection)
         // Reconcile the updated repo's worktrees into the sidebar (seeds buckets
         // / items) exactly as a bulk load would.
         _ = applyRepositories(
@@ -3771,10 +3781,23 @@ struct RepositoriesFeature {
         )
         // Clear a selected "can't reach" row once the remote resolves.
         state.dropStaleFailedRepositorySelection()
+        let selectedWorktree = state.worktree(for: state.selectedWorktreeID)
+        var resolvedEffects: [Effect<Action>] = []
         // A placeholder to resolved transition changes the worktree roster, so
         // tell downstream consumers (terminal prune, settings summaries); without
         // this a restored remote surface stays pruned until the next full reload.
-        return didChange ? .send(.delegate(.repositoriesChanged(state.repositories))) : .none
+        if didChange {
+          resolvedEffects.append(.send(.delegate(.repositoriesChanged(state.repositories))))
+        }
+        if state.hasSelectionChanged(
+          previousSelectionID: previousSelection,
+          previousSelectedWorktree: previousSelectedWorktree,
+          selectedWorktreeID: state.selectedWorktreeID,
+          selectedWorktree: selectedWorktree
+        ) {
+          resolvedEffects.append(.send(.delegate(.selectedWorktreeChanged(selectedWorktree))))
+        }
+        return .merge(resolvedEffects)
 
       case .openRepositories(let urls):
         analyticsClient.capture("repository_added", ["count": urls.count])
