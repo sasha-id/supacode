@@ -108,6 +108,10 @@ final class GhosttySurfaceView: NSView, Identifiable {
   private var lastAppliedBackingSize: CGSize = .zero
   // A size that arrived while this view was hidden, deferred to the reveal.
   private var needsSizeSyncOnReveal = false
+  // Whether a size measured from a real window has ever been applied. Until it
+  // has, the surface is still running at creation geometry, which is only an
+  // estimate, so even a hidden view must take the first measured size.
+  private var hasAppliedMeasuredSize = false
   let presentation = TerminalPresentation()
   private var frameObservation: NSKeyValueObservation?
   private var lastPerformKeyEvent: TimeInterval?
@@ -1085,9 +1089,12 @@ final class GhosttySurfaceView: NSView, Identifiable {
     guard window != nil else { return }
     // A deselected worktree keeps its tree mounted and AppKit lays hidden
     // subtrees out anyway, so a window resize would otherwise reflow every
-    // off-screen grid per drag frame. Deferring costs nothing even for the first
-    // size: the PTY was born at the creation geometry, not at a placeholder.
-    if isHiddenOrHasHiddenAncestor {
+    // off-screen grid per drag frame. The first measured size still applies:
+    // creation geometry comes from a sibling renderer, and a spawn into a
+    // worktree whose tabs are all hibernated finds none and falls back to the
+    // whole window, so an uncorrected hidden surface would run — and freeze —
+    // at a window-sized grid until it is revealed.
+    if isHiddenOrHasHiddenAncestor, hasAppliedMeasuredSize {
       needsSizeSyncOnReveal = true
       return
     }
@@ -1101,6 +1108,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
     )
     guard decision == .apply else { return }
     lastAppliedBackingSize = backingSize
+    hasAppliedMeasuredSize = true
     preparePresentation()
     ghostty_surface_set_size(
       surface,
