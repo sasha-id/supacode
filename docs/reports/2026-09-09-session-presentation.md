@@ -195,9 +195,8 @@ footprint. Any resulting budget is a soft renderer-retention budget, not a hard
 process-memory limit.
 
 The profiling test is `GhosttySurfaceViewTests.profileColdConstruction`, enabled
-only by `SUPACODE_PROFILE_TERMINAL=1`. Release test builds also define
-`SUPACODE_TESTING` to expose an existing test-support accessor without enabling
-DEBUG logging. Neither flag is required by normal production builds.
+only by `SUPACODE_PROFILE_TERMINAL=1`. The flag is not required by normal
+production builds.
 
 ## Resource-aware retention
 

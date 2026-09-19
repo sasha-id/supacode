@@ -281,7 +281,7 @@ final class WorktreeTerminalManager {
     emit(.agentHookEventReceived(event))
   }
 
-  #if DEBUG || SUPACODE_TESTING
+  #if DEBUG
     /// Count of idle-hook debounce tasks still scheduled (test-only). A clock-awoken
     /// resume removes its key only after it emits, so a non-zero count means a
     /// pending idle event has not yet landed in the stream.

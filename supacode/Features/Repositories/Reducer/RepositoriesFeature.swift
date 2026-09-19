@@ -6056,13 +6056,6 @@ extension RepositoriesFeature.State {
     return ordered
   }
 
-  func isWorktreePinned(_ worktree: Worktree) -> Bool {
-    guard let owningRepositoryID = repositoryID(containing: worktree.id) else {
-      return false
-    }
-    return sidebar.sections[owningRepositoryID]?.buckets[.pinned]?.items[worktree.id] != nil
-  }
-
   var confirmWorktreeAlert: RepositoriesFeature.Alert? {
     guard let alert else { return nil }
     for button in alert.buttons {
