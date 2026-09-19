@@ -25,6 +25,9 @@ protocol TabChrome: AnyObject {
   var reportedTitle: String? { get }
   /// A bounded-rate presentation of the report; persistence uses the raw title.
   var presentedTitle: String? { get }
+  /// Whether a strip is showing this tab, and as its selection. Chrome that
+  /// throttles its presentation uses it to pause while hidden.
+  func setPresentation(active: Bool, selected: Bool)
 }
 
 extension TabChrome {
@@ -33,6 +36,8 @@ extension TabChrome {
   var presentedTitle: String? { reportedTitle }
   var presentedIsWorking: Bool { isWorking }
   var presentedProgress: TerminalTabProgressDisplay? { progress }
+  // Chrome with no presentation of its own has nothing to pause.
+  func setPresentation(active: Bool, selected: Bool) {}
 }
 
 /// Resolves what a tab shows, and what the layout should store for it, from the
@@ -98,7 +103,8 @@ final class TerminalTabChrome: TabChrome {
   /// fields. Revealing a strip catches up immediately and restarts activity.
   func setPresentation(active: Bool, selected: Bool) {
     let shouldFlush = active && (!presentationActive || (selected && !titleSelected))
-    presentationActive = active
+    // Observed: an unconditional write invalidates the tab on every strip pass.
+    if presentationActive != active { presentationActive = active }
     titleSelected = selected
     if !active {
       titlePublicationTask?.cancel()
