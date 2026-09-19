@@ -2280,6 +2280,7 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
   private let documentView: NSView
   private let surfaceView: GhosttySurfaceView
   private let presentationCover = TerminalPresentationCover()
+  private let progressBar = TerminalSurfaceProgressBar()
   private var observers: [NSObjectProtocol] = []
   private var isLiveScrolling = false
   private var lastSentRow: Int?
@@ -2301,12 +2302,14 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
     super.init(frame: .zero)
     addSubview(scrollView)
     addSubview(presentationCover)
+    addSubview(progressBar)
     surfaceView.presentation.onChange = { [weak self, weak surfaceView] in
       guard let self, let surfaceView else { return }
       self.presentationCover.update(surfaceView.presentation, contentID: surfaceView.id)
     }
     surfaceView.scrollWrapper = self
     refreshAppearance()
+    beginProgressTracking()
 
     scrollView.contentView.postsBoundsChangedNotifications = true
     observers.append(
@@ -2390,6 +2393,13 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
     super.layout()
     scrollView.frame = bounds
     presentationCover.frame = bounds
+    // An overlay on the top edge, so the surface neither reflows nor resizes
+    // its PTY around it.
+    progressBar.frame = NSRect(
+      x: 0,
+      y: bounds.height - TerminalSurfaceProgressBar.height,
+      width: bounds.width,
+      height: TerminalSurfaceProgressBar.height)
     surfaceView.frame.size = scrollView.bounds.size
     documentView.frame.size.width = scrollView.bounds.width
     synchronizeScrollView()
@@ -2404,6 +2414,28 @@ final class GhosttySurfaceScrollView: NSView, WindowTintMaskRegion {
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     WindowTintMaskRegistry.regionDidMoveToWindow(self)
+  }
+
+  /// Re-arming observation over the surface's progress and the motion
+  /// preference: both are read inside the tracked closure, so flipping either
+  /// re-arms and repaints without a notification or a poll. One loop per
+  /// wrapper, started once from `init`.
+  private func beginProgressTracking() {
+    let (display, reducesMotion) = withObservationTracking {
+      // Re-uses the projection the tab stripe renders from, bucketing included,
+      // so a pane and its tab can never disagree about what the surface said.
+      (
+        TerminalTabProgressDisplay.make(
+          progressState: surfaceView.bridge.state.progressState,
+          progressValue: surfaceView.bridge.state.progressValue),
+        MotionPreference.reduceMotion
+      )
+    } onChange: { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.beginProgressTracking()
+      }
+    }
+    progressBar.update(display, reducesMotion: reducesMotion)
   }
 
   func updateSurfaceSize() {
