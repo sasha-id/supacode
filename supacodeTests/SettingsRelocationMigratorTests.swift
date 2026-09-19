@@ -203,10 +203,16 @@ struct SettingsRelocationMigratorTests {
       SettingsRelocationMigrator.retireLegacyFiles(fileSystem: fileSystem.system)
     }
 
-    // The golden snapshot survives, and the newer legacy file stays put rather
-    // than clobbering it.
+    // The golden snapshot survives untouched.
     #expect(fileSystem.data(at: settingsBackup) == golden)
-    #expect(fileSystem.data(at: SupacodePaths.legacySettingsURL) == newer)
+    // The newer file is still retired, into the next free slot. Leaving it in
+    // place would strand it: the taken name never frees up, so every later launch
+    // would skip it and `~/.supacode` would keep a legacy file forever.
+    #expect(fileSystem.data(at: SupacodePaths.legacySettingsURL) == nil)
+    #expect(
+      fileSystem.data(
+        at: SupacodePaths.backupDirectory
+          .appending(path: "settings.json.1", directoryHint: .notDirectory)) == newer)
   }
 
   @Test(.dependencies) func finishSeedingKeepsAValidUserDefaultsValueAndItsLegacyFile() throws {
@@ -588,6 +594,66 @@ struct SettingsRelocationMigratorTests {
     }
     #expect(second == .completed)
     #expect(fileSystem.data(at: SupacodePaths.configURL) == sentinel)
+  }
+
+  // MARK: - retireLegacyFiles.
+
+  @Test(.dependencies) func retireClearsSidebarAndLayoutsOnceTheirKeysHoldValidData() throws {
+    // A relocated tree whose sidebar / layouts files came back after the seed
+    // retired them: the seed can't fire again, so the retire step must clear them.
+    let defaults = UserDefaults.inMemory
+    defaults.set(try JSONEncoder().encode(SidebarState()), forKey: SidebarKey.storageKey)
+    defaults.set(
+      try JSONEncoder().encode(LayoutsFile(worktrees: [:])), forKey: LayoutsFile.userDefaultsKey)
+    let sidebarData = try JSONEncoder().encode(SidebarState())
+    let layoutsData = try JSONEncoder().encode(LayoutsFile(worktrees: [:]))
+    let fileSystem = FakeRelocationFS(files: [
+      SupacodePaths.relocationMarkerURL: Data(),
+      SupacodePaths.configURL: try JSONEncoder().encode(GlobalSettings.default),
+      SupacodePaths.routesURL: try JSONEncoder().encode(RoutesFile()),
+      SupacodePaths.reposURL: try JSONEncoder().encode([String: RepositorySettings]()),
+      SupacodePaths.legacySidebarURL: sidebarData,
+      SupacodePaths.legacyLayoutsURL: layoutsData,
+    ])
+
+    let outcome = withDependencies {
+      $0.settingsFileStorage = fileSystem.settingsStorage()
+      $0.defaultAppStorage = defaults
+    } operation: {
+      SettingsRelocationMigrator.run(fileSystem: fileSystem.system, legacyMigrators: {})
+    }
+
+    #expect(outcome == .completed)
+    #expect(fileSystem.data(at: SupacodePaths.legacySidebarURL) == nil)
+    #expect(fileSystem.data(at: SupacodePaths.legacyLayoutsURL) == nil)
+    // Retired, not discarded.
+    #expect(
+      fileSystem.data(
+        at: SupacodePaths.backupDirectory.appending(path: "sidebar.json", directoryHint: .notDirectory))
+        == sidebarData)
+    #expect(
+      fileSystem.data(
+        at: SupacodePaths.backupDirectory.appending(path: "layouts.json", directoryHint: .notDirectory))
+        == layoutsData)
+  }
+
+  @Test(.dependencies) func retireKeepsSidebarUntilTheRelocationMarkerExists() throws {
+    // The key holds valid data, so the seed skips it — but without the marker the
+    // relocation has not landed, and the legacy file is still the live copy.
+    let defaults = UserDefaults.inMemory
+    defaults.set(try JSONEncoder().encode(SidebarState()), forKey: SidebarKey.storageKey)
+    let sidebarData = try JSONEncoder().encode(SidebarState())
+    let fileSystem = FakeRelocationFS(files: [SupacodePaths.legacySidebarURL: sidebarData])
+
+    withDependencies {
+      $0.settingsFileStorage = fileSystem.settingsStorage()
+      $0.defaultAppStorage = defaults
+    } operation: {
+      _ = SettingsRelocationMigrator.run(fileSystem: fileSystem.system, legacyMigrators: {})
+    }
+
+    #expect(fileSystem.data(at: SupacodePaths.relocationMarkerURL) == nil)
+    #expect(fileSystem.data(at: SupacodePaths.legacySidebarURL) == sidebarData)
   }
 }
 

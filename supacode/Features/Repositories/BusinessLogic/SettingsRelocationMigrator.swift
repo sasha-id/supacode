@@ -196,16 +196,36 @@ enum SettingsRelocationMigrator {
     fileSystem.fileExists(url) && fileSystem.readData(url) == nil
   }
 
-  /// Retires the file-backed legacy files (settings, Ghostty) into `.backup` once
-  /// their new-store counterpart exists, and sweeps stray `.bak` / `.corrupt-*`
-  /// files. Sidebar / layouts are retired inside the seed instead, because their
-  /// UserDefaults key can't distinguish seeded data from what the app later wrote.
-  /// Safe to run every launch: settings.json needs all three new files, and both
-  /// counterparts are only ever produced by the seed (never the app's own writes).
+  /// Retires each legacy file into `.backup` once its new-store counterpart is
+  /// populated, and sweeps stray `.bak` / `.corrupt-*` files. Safe to run every
+  /// launch: settings.json needs all three new files, and sidebar / layouts need
+  /// the marker, so a key the seed has not yet had its chance at never reads as a
+  /// landed counterpart.
+  ///
+  /// The seed also retires sidebar / layouts, but only on the launch it runs. It
+  /// is not enough on its own: the legacy schema migrators still write through
+  /// `SupacodePaths.sidebarURL` / `.layoutsURL`, so a file retired there can come
+  /// back, and the seed is gated on the UserDefaults key being invalid — which it
+  /// no longer is — so it never fires again. Retiring here too means any later
+  /// re-creation is cleared on the next launch.
   static func retireLegacyFiles(fileSystem: RelocationFileSystem = .live) {
+    @Dependency(\.defaultAppStorage) var defaults
+    // Past the marker the app reads sidebar / layouts from UserDefaults, so a key
+    // holding a decodable value means the legacy file is a dead copy whoever wrote
+    // it. `.backup` keeps it either way.
+    let relocated = isRelocated(fileSystem: fileSystem)
     let retirable: [(url: URL, landed: Bool)] = [
       (SupacodePaths.legacySettingsURL, settingsStoreComplete()),
       (SupacodePaths.legacyGhosttyUserConfigURL, fileSystem.fileExists(SupacodePaths.ghosttyUserConfigURL)),
+      (
+        SupacodePaths.legacySidebarURL,
+        relocated && userDefaultsHoldsValid(SidebarState.self, forKey: SidebarKey.storageKey, defaults)
+      ),
+      (
+        SupacodePaths.legacyLayoutsURL,
+        relocated
+          && userDefaultsHoldsValid(LayoutsFile.self, forKey: LayoutsFile.userDefaultsKey, defaults)
+      ),
     ]
     for entry in retirable where entry.landed {
       moveToBackup(entry.url, fileSystem: fileSystem)
@@ -341,17 +361,40 @@ enum SettingsRelocationMigrator {
     }
   }
 
-  /// Moves `url` into `directory`, creating it first and never overwriting an
-  /// existing snapshot (the golden pre-relocation copy stays put).
+  /// Moves `url` into `directory`, creating it first. The golden pre-relocation
+  /// copy is never overwritten: when its name is already taken the file lands
+  /// under the next free `<name>.1`, `<name>.2`, … Returning instead would strand
+  /// every legacy file re-created after an earlier retire, and since the taken
+  /// name is permanent, the retire step would skip it on every launch after that.
   private static func move(_ url: URL, into directory: URL, fileSystem: RelocationFileSystem) {
-    let destination = directory.appending(path: url.lastPathComponent, directoryHint: .notDirectory)
-    guard !fileSystem.fileExists(destination) else { return }
+    guard let destination = freeBackupSlot(for: url, in: directory, fileSystem: fileSystem) else {
+      logger.warning("No free \(url.lastPathComponent) slot in .backup; leaving it in place.")
+      return
+    }
     do {
       try fileSystem.createDirectory(directory)
       try fileSystem.moveItem(url, destination)
     } catch {
       logger.warning("Failed to move \(url.lastPathComponent) into .backup: \(error)")
     }
+  }
+
+  /// First unused name for `url` in `directory`, preferring its own. The bound
+  /// stops a directory that somehow fills up from spinning.
+  private static func freeBackupSlot(
+    for url: URL,
+    in directory: URL,
+    fileSystem: RelocationFileSystem
+  ) -> URL? {
+    let name = url.lastPathComponent
+    for attempt in 0...99 {
+      let candidate = directory.appending(
+        path: attempt == 0 ? name : "\(name).\(attempt)",
+        directoryHint: .notDirectory
+      )
+      if !fileSystem.fileExists(candidate) { return candidate }
+    }
+    return nil
   }
 
   // MARK: - Helpers
