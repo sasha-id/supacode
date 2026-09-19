@@ -1312,7 +1312,6 @@ struct LayoutFeatureTests {
     await harness.store.send(.hibernateTab(id: harness.tabID)) {
       $0.layout.panes[id: paneID]?.tabs[id: harness.tabID]?.content =
         ContentSnapshot(id: harness.contentID, state: .terminal(marker))
-      $0.renderEpoch = 1
     }
     #expect(mock.hibernateCalls == 1)
     #expect(harness.runtime.content(for: harness.contentID) === mock)
@@ -1330,13 +1329,11 @@ struct LayoutFeatureTests {
     await harness.store.send(.hibernateTab(id: harness.tabID)) {
       $0.layout.panes[id: harness.paneID]?.tabs[id: harness.tabID]?.content =
         ContentSnapshot(id: harness.contentID, state: .terminal(marker))
-      $0.renderEpoch = 1
     }
     // The click's turn only marks the tab waking; the surface is built by the
     // effect that follows, so no Metal or zmx work lands inside reduce.
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
-      $0.renderEpoch = 2
     }
     #expect(mock.renderer == nil)
     // Still nothing a fraction into the deferral: the build has to clear the
@@ -1346,7 +1343,6 @@ struct LayoutFeatureTests {
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
       $0.wakingTabs = []
-      $0.renderEpoch = 3
     }
     let restored = try #require(ContentGeometry.restored(grid))
     #expect(mock.startGeometries == [.fallback, restored])
@@ -1356,12 +1352,9 @@ struct LayoutFeatureTests {
   @Test func secondWakeWhileProvisioningIsIgnored() async throws {
     let harness = await makeHarness()
     let mock = try #require(harness.mock)
-    await harness.store.send(.hibernateTab(id: harness.tabID)) {
-      $0.renderEpoch = 1
-    }
+    await harness.store.send(.hibernateTab(id: harness.tabID))
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
-      $0.renderEpoch = 2
     }
     // A second click while the first wake is in flight must not spawn a
     // duplicate session behind it.
@@ -1369,7 +1362,6 @@ struct LayoutFeatureTests {
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
       $0.wakingTabs = []
-      $0.renderEpoch = 3
     }
     #expect(mock.startGeometries.count == 2)
   }
@@ -1377,18 +1369,14 @@ struct LayoutFeatureTests {
   @Test func hibernatingAWakingTabCancelsTheProvisioning() async throws {
     let harness = await makeHarness()
     let mock = try #require(harness.mock)
-    await harness.store.send(.hibernateTab(id: harness.tabID)) {
-      $0.renderEpoch = 1
-    }
+    await harness.store.send(.hibernateTab(id: harness.tabID))
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
-      $0.renderEpoch = 2
     }
     // Hibernating before the wake lands cancels it; no `wakeCompleted` follows
     // and the tab stays dormant.
     await harness.store.send(.hibernateTab(id: harness.tabID)) {
       $0.wakingTabs = []
-      $0.renderEpoch = 4
     }
     await harness.settleWake()
     await harness.store.finish()
@@ -1407,18 +1395,15 @@ struct LayoutFeatureTests {
     await harness.store.send(.hibernateTab(id: harness.tabID)) {
       $0.layout.panes[id: harness.paneID]?.tabs[id: harness.tabID]?.content =
         ContentSnapshot(id: harness.contentID, state: .terminal(marker))
-      $0.renderEpoch = 1
     }
     // Simulate a relaunch: the runtime lost the entry, no tombstone.
     harness.runtime.remove(harness.contentID, tombstone: false)
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
-      $0.renderEpoch = 2
     }
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
       $0.wakingTabs = []
-      $0.renderEpoch = 3
     }
     let revived = try #require(harness.recorder.contents[harness.contentID])
     #expect(revived !== original)
@@ -1434,21 +1419,17 @@ struct LayoutFeatureTests {
   @Test func wakeThatProducesNoRendererMarksTheTabUnavailable() async throws {
     let harness = await makeHarness()
     let mock = try #require(harness.mock)
-    await harness.store.send(.hibernateTab(id: harness.tabID)) {
-      $0.renderEpoch = 1
-    }
+    await harness.store.send(.hibernateTab(id: harness.tabID))
     mock.failsToStart = true
     // A wake in flight is not a failure: the pane holds the background until
     // the attempt reports back.
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
-      $0.renderEpoch = 2
     }
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
       $0.wakingTabs = []
       $0.wakeFailedTabs = [harness.tabID]
-      $0.renderEpoch = 3
     }
     #expect(mock.renderer == nil)
   }
@@ -1456,30 +1437,24 @@ struct LayoutFeatureTests {
   @Test func retryingAFailedWakeClearsTheUnavailableVerdict() async throws {
     let harness = await makeHarness()
     let mock = try #require(harness.mock)
-    await harness.store.send(.hibernateTab(id: harness.tabID)) {
-      $0.renderEpoch = 1
-    }
+    await harness.store.send(.hibernateTab(id: harness.tabID))
     mock.failsToStart = true
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
-      $0.renderEpoch = 2
     }
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
       $0.wakingTabs = []
       $0.wakeFailedTabs = [harness.tabID]
-      $0.renderEpoch = 3
     }
     mock.failsToStart = false
     await harness.store.send(.wakeTab(id: harness.tabID)) {
       $0.wakingTabs = [harness.tabID]
       $0.wakeFailedTabs = []
-      $0.renderEpoch = 4
     }
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: harness.tabID))) {
       $0.wakingTabs = []
-      $0.renderEpoch = 5
     }
     #expect(mock.renderer != nil)
   }
@@ -1503,16 +1478,13 @@ struct LayoutFeatureTests {
     await harness.store.send(.hibernateTab(id: tabID)) {
       $0.layout.panes[id: paneID]?.tabs[id: tabID]?.content =
         ContentSnapshot(id: contentID, state: .terminal(marker))
-      $0.renderEpoch = 1
     }
     await harness.store.send(.wakeTab(id: tabID)) {
       $0.wakingTabs = [tabID]
-      $0.renderEpoch = 2
     }
     await harness.settleWake()
     await harness.store.receive(.runtime(.wakeCompleted(tab: tabID))) {
       $0.wakingTabs = []
-      $0.renderEpoch = 3
     }
     // With no grid to reproduce, the wake measures what a spawn would: no mock
     // renderer is ever in a window, so resolution lands on the same window/screen
@@ -1713,9 +1685,7 @@ struct LayoutFeatureTests {
     let harness = await makeHarness()
     // A hibernated terminal cannot report busyness; its zmx session may still
     // host work, so busy mode confirms.
-    await harness.store.send(.hibernateTab(id: harness.tabID)) {
-      $0.renderEpoch = 1
-    }
+    await harness.store.send(.hibernateTab(id: harness.tabID))
     await harness.store.send(.contentRequestedClose(content: harness.contentID, scope: .tab)) {
       $0.alertPaneID = harness.paneID
       $0.alert = self.closeConfirmAlert(tabs: [harness.tabID])

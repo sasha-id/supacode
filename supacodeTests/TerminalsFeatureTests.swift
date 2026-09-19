@@ -253,9 +253,7 @@ struct TerminalsFeatureTests {
     await harness.store.receive(\.hibernationGraceElapsed) {
       $0.hibernationArmedTabs = []
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.hiddenContent.renderer == nil)
     #expect(harness.selectedContent.renderer != nil)
   }
@@ -281,9 +279,7 @@ struct TerminalsFeatureTests {
     await harness.store.receive(\.hibernationGraceElapsed) {
       $0.hibernationArmedTabs = []
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.hiddenContent.renderer != nil)
     #expect(harness.selectedContent.renderer == nil)
   }
@@ -327,9 +323,7 @@ struct TerminalsFeatureTests {
       $0.hibernationArmedTabs = []
       $0.hibernationDeferralLogged = []
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.hiddenContent.renderer == nil)
   }
 
@@ -347,13 +341,11 @@ struct TerminalsFeatureTests {
     // The wake only marks the tab; the surface arrives on a later turn.
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
     #expect(harness.selectedContent.renderer == nil)
     await harness.clock.advance(by: LayoutFeature.wakeDeferral)
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
       $0.wakeRequestedTabs = []
     }
     #expect(harness.selectedContent.renderer != nil)
@@ -378,7 +370,6 @@ struct TerminalsFeatureTests {
     }
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
     // Scrub past the recency window before the wake's deferral elapses; every
     // hop but the last keeps the worktree retained, the last drops its cover.
@@ -398,7 +389,6 @@ struct TerminalsFeatureTests {
     }
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
     }
     // The deferral elapsing spawns nothing: the effect died with the cancel.
     await harness.clock.advance(by: LayoutFeature.wakeDeferral)
@@ -423,7 +413,6 @@ struct TerminalsFeatureTests {
     }
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
     // Deselect while the wake still defers; recency keeps the tab covered.
     await harness.store.send(.selectedWorktreeChanged(Worktree.ID("/tmp/other"))) {
@@ -442,11 +431,8 @@ struct TerminalsFeatureTests {
     }
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 3
-    }
+    await harness.store.receive(\.layouts)
     await harness.clock.advance(by: LayoutFeature.wakeDeferral)
     #expect(harness.selectedContent.renderer == nil)
     #expect(harness.hiddenContent.renderer == nil)
@@ -475,9 +461,7 @@ struct TerminalsFeatureTests {
     await harness.store.receive(\.hibernationGraceElapsed) {
       $0.hibernationArmedTabs = []
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.selectedContent.renderer != nil)
     #expect(harness.hiddenContent.renderer == nil)
   }
@@ -526,12 +510,10 @@ struct TerminalsFeatureTests {
     }
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = [harness.selectedTab]
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
     }
     await harness.clock.advance(by: LayoutFeature.wakeDeferral)
     await harness.store.receive(\.layouts) {
       $0.layouts[id: harness.worktreeID]?.wakingTabs = []
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
       $0.wakeRequestedTabs = []
     }
     #expect(harness.selectedContent.renderer != nil)
@@ -749,7 +731,7 @@ struct TerminalsFeatureTests {
     if !detach { await harness.store.receive(\.layouts) }
     await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
     await harness.store.receive(\.hibernationGraceElapsed) { $0.hibernationArmedTabs = [] }
-    await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[2]]?.renderEpoch = 1 }
+    await harness.store.receive(\.layouts)
     #expect(harness.contents[2].renderer == nil)
     await harness.store.finish()
   }
@@ -774,13 +756,8 @@ struct TerminalsFeatureTests {
     await harness.store.send(.memoryPressureWarning) { $0.hibernationArmedTabs = [] }
     // A renderer-only completion must not re-arm its still-live sibling
     // while that sibling's pressure action is queued.
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
-    }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 2
-      $0.hibernationArmedTabs = []
-    }
+    await harness.store.receive(\.layouts)
+    await harness.store.receive(\.layouts)
     await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
     #expect(harness.selectedContent.renderer == nil)
     #expect(harness.hiddenContent.renderer == nil)
@@ -806,11 +783,11 @@ struct TerminalsFeatureTests {
       $0.recentWorktreeIDs = [harness.worktreeIDs[2]]
       $0.hibernationArmedTabs = [harness.tabs[0]]
     }
-    await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[1]]?.renderEpoch = 1 }
+    await harness.store.receive(\.layouts)
     harness.contents[0].claimsHibernation = true
     await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
     await harness.store.receive(\.hibernationGraceElapsed) { $0.hibernationArmedTabs = [] }
-    await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[0]]?.renderEpoch = 1 }
+    await harness.store.receive(\.layouts)
     #expect(harness.contents[0].renderer == nil)
     await harness.store.finish()
   }
@@ -843,7 +820,7 @@ struct TerminalsFeatureTests {
     } else {
       await harness.clock.advance(by: TerminalsFeature.hibernationGraceWindow)
       await harness.store.receive(\.hibernationGraceElapsed) { $0.hibernationArmedTabs = [] }
-      await harness.store.receive(\.layouts) { $0.layouts[id: harness.worktreeIDs[0]]?.renderEpoch = 1 }
+      await harness.store.receive(\.layouts)
       #expect(harness.contents[0].renderer == nil)
     }
     await harness.store.finish()
@@ -947,9 +924,7 @@ struct TerminalsFeatureTests {
     await harness.store.receive(\.hibernationGraceElapsed) {
       $0.hibernationArmedTabs = []
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeIDs[0]]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.contents[0].renderer == nil)
     #expect(harness.contents.dropFirst().allSatisfy { $0.renderer != nil })
   }
@@ -968,9 +943,7 @@ struct TerminalsFeatureTests {
     await harness.store.receive(\.memoryPressureWarning) {
       $0.hibernationArmedTabs = []
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeID]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.hiddenContent.renderer == nil)
     #expect(harness.selectedContent.renderer != nil)
     harness.pressure.finish()
@@ -998,9 +971,7 @@ struct TerminalsFeatureTests {
     await harness.store.receive(\.memoryPressureWarning) {
       $0.recentWorktreeIDs = [harness.worktreeIDs[1]]
     }
-    await harness.store.receive(\.layouts) {
-      $0.layouts[id: harness.worktreeIDs[0]]?.renderEpoch = 1
-    }
+    await harness.store.receive(\.layouts)
     #expect(harness.contents[0].renderer == nil)
     #expect(harness.contents[1].renderer != nil)
     harness.pressure.finish()

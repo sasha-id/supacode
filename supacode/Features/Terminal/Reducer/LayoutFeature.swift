@@ -115,9 +115,6 @@ struct LayoutFeature {
     /// Base for minted tab titles ("<prefix> N"); the worktree's name once the
     /// integration layer attaches it.
     var titlePrefix = ""
-    /// Bumped whenever a content's renderer identity changes without a layout
-    /// change (hibernate, wake), so hosts remount. Never persisted.
-    var renderEpoch: UInt64 = 0
     /// The tab whose strip shows the inline rename field; owned here so the
     /// menu command reaches it and it survives structural rebuilds.
     var editingTabID: TabID?
@@ -759,7 +756,6 @@ extension LayoutFeature {
     // Land the frozen grid recorded at hibernation in persisted state.
     pane.tabs[id: tabID]?.content = content.snapshot()
     state.layout.panes[id: pane.id] = pane
-    state.renderEpoch &+= 1
     return cancelWake
   }
 
@@ -788,7 +784,6 @@ extension LayoutFeature {
     // A retry clears the previous verdict; the pane holds the background again
     // until this attempt reports back.
     state.wakeFailedTabs.remove(tabID)
-    state.renderEpoch &+= 1
     return .run { @MainActor [contentRuntime, layoutContentFactory, clock] send in
       // A clock sleep rather than a bare await: it puts the build past the
       // runloop iteration that commits the interaction's frame, it is the
@@ -823,7 +818,6 @@ extension LayoutFeature {
   /// flight, so ordinary closes and hibernations stay epoch-neutral.
   private func cancelPendingWake(_ state: inout State, tabID: TabID) -> Effect<Action> {
     guard state.wakingTabs.remove(tabID) != nil else { return .none }
-    state.renderEpoch &+= 1
     return .cancel(id: WakeID.tab(tabID))
   }
 
@@ -1130,7 +1124,6 @@ extension LayoutFeature {
     case .wakeCompleted(let tabID):
       guard state.wakingTabs.remove(tabID) != nil else { break }
       // The placeholder gives way to the live surface here, not at wake time.
-      state.renderEpoch &+= 1
       let contentID = state.layout.pane(containingTab: tabID)?.tabs[id: tabID]?.content.id
       let content = contentID.flatMap { contentRuntime.content(for: $0) }
       // A wake that produced no renderer is the one state worth naming to the
