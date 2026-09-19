@@ -565,7 +565,7 @@ final class GhosttySurfaceView: NSView, Identifiable {
     guard !inLiveResize || presentation.isCovered else { return }
     let size = convertToBacking(bounds.size)
     presentation.prepare(
-      size: CGSize(width: floor(size.width), height: floor(size.height)), immediateProgress: layer.contents == nil)
+      size: CGSize(width: floor(size.width), height: floor(size.height)), cold: layer.contents == nil)
     guard presentation.isCovered else { return }
     if frameObservation == nil {
       frameObservation = layer.observe(\.contents) { [weak self] _, _ in

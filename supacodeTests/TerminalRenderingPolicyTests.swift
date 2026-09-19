@@ -9,7 +9,7 @@ struct TerminalRenderingPolicyTests {
   @Test func presentationWaitsForDestinationGeometry() async {
     let clock = TestClock()
     let presentation = TerminalPresentation(clock: clock)
-    presentation.prepare(size: CGSize(width: 800, height: 600))
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
     #expect(presentation.isCovered)
     presentation.frameAvailable(size: CGSize(width: 400, height: 300))
     #expect(presentation.isCovered)
@@ -22,17 +22,46 @@ struct TerminalRenderingPolicyTests {
   @Test func residentPresentationDoesNotFlashALoadingCover() {
     let presentation = TerminalPresentation()
     let size = CGSize(width: 800, height: 600)
-    presentation.prepare(size: size)
+    presentation.prepare(size: size, cold: true)
     presentation.frameAvailable(size: size)
     presentation.park()
-    presentation.prepare(size: size)
+    presentation.prepare(size: size, cold: false)
     #expect(!presentation.isCovered)
+  }
+
+  @Test func aWarmSurfaceIsNeverCoveredWhileGeometryMoves() async {
+    // Regression: a divider drag relayouts on every mouse event, so the expected
+    // size kept moving out from under `frameAvailable` and the cover held for the
+    // whole gesture, blanking a pane that already had a perfectly good frame.
+    let clock = TestClock()
+    let presentation = TerminalPresentation(clock: clock)
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
+    presentation.frameAvailable(size: CGSize(width: 800, height: 600))
+    #expect(!presentation.isCovered)
+    for width in stride(from: 810.0, through: 900.0, by: 10.0) {
+      presentation.prepare(size: CGSize(width: width, height: 600), cold: false)
+      #expect(!presentation.isCovered)
+    }
+    // No deadline was ever armed, so nothing can fire behind the drag.
+    await clock.advance(by: .seconds(3))
+    #expect(!presentation.isCovered)
+    #expect(!presentation.showsProgress)
+  }
+
+  @Test func aSurfaceThatLostItsFrameIsCoveredAgain() {
+    // Losing layer contents (a wake, a restore) is the one case that still covers.
+    let presentation = TerminalPresentation()
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
+    presentation.frameAvailable(size: CGSize(width: 800, height: 600))
+    presentation.park()
+    presentation.prepare(size: CGSize(width: 1000, height: 600), cold: true)
+    #expect(presentation.isCovered)
   }
 
   @Test func loadingIndicatorIsDelayedAndCoverHasABoundedLifetime() async {
     let clock = TestClock()
     let presentation = TerminalPresentation(clock: clock)
-    presentation.prepare(size: CGSize(width: 800, height: 600))
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
     #expect(!presentation.showsProgress)
     await clock.advance(by: .milliseconds(150))
     #expect(presentation.showsProgress)
@@ -44,7 +73,7 @@ struct TerminalRenderingPolicyTests {
   @Test func parkingCancelsDelayedPresentationWork() async {
     let clock = TestClock()
     let presentation = TerminalPresentation(clock: clock)
-    presentation.prepare(size: CGSize(width: 800, height: 600))
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
     presentation.park()
     await clock.advance(by: .seconds(3))
     #expect(!presentation.showsProgress)
@@ -54,24 +83,24 @@ struct TerminalRenderingPolicyTests {
   @Test func changingGeometryDoesNotExtendTheCoverDeadline() async {
     let clock = TestClock()
     let presentation = TerminalPresentation(clock: clock)
-    presentation.prepare(size: CGSize(width: 800, height: 600))
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
     await clock.advance(by: .seconds(1))
-    presentation.prepare(size: CGSize(width: 1000, height: 600))
+    presentation.prepare(size: CGSize(width: 1000, height: 600), cold: true)
     presentation.frameAvailable(size: CGSize(width: 800, height: 600))
     #expect(presentation.isCovered)
     await clock.advance(by: .seconds(1))
     #expect(!presentation.isCovered)
-    presentation.prepare(size: CGSize(width: 1000, height: 600))
+    presentation.prepare(size: CGSize(width: 1000, height: 600), cold: true)
     #expect(!presentation.isCovered)
   }
 
   @Test func parkedTimeoutCannotReleaseANewPresentation() async {
     let clock = TestClock()
     let presentation = TerminalPresentation(clock: clock)
-    presentation.prepare(size: CGSize(width: 800, height: 600))
+    presentation.prepare(size: CGSize(width: 800, height: 600), cold: true)
     await clock.advance(by: .seconds(1))
     presentation.park()
-    presentation.prepare(size: CGSize(width: 1000, height: 600))
+    presentation.prepare(size: CGSize(width: 1000, height: 600), cold: true)
     await clock.advance(by: .seconds(1))
     #expect(presentation.isCovered)
     presentation.frameAvailable(size: CGSize(width: 1000, height: 600))

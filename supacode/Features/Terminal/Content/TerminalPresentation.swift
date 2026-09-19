@@ -2,7 +2,8 @@ import AppKit
 import OSLog
 import SupacodeSettingsShared
 
-/// Covers construction and stale geometry, not the application's ongoing output.
+/// Covers a surface that has no frame to show, not the application's ongoing
+/// output and not a warm surface whose geometry moved.
 /// Each surface owns one instance, so a retired surface cannot reveal its replacement.
 @MainActor
 final class TerminalPresentation {
@@ -10,7 +11,6 @@ final class TerminalPresentation {
   private(set) var showsProgress = false
   var onChange: (() -> Void)?
   private let clock: any Clock<Duration>
-  private var readySize: CGSize?
   private var expectedSize: CGSize?
   private var timedOutSize: CGSize?
   private var generation: UInt64 = 0
@@ -23,15 +23,21 @@ final class TerminalPresentation {
 
   deinit { timeout?.cancel() }
 
-  func prepare(size: CGSize, immediateProgress: Bool = false) {
+  /// `cold` means the layer holds nothing to present: construction, a wake, or a
+  /// restore. A warm surface is never covered. Geometry moves on every event of a
+  /// divider drag or a sidebar animation, so `expectedSize` would keep moving out
+  /// from under `frameAvailable` and the cover would hold for the whole gesture;
+  /// letting the last frame stretch for a refresh reads far better than blanking
+  /// a terminal that already has content.
+  func prepare(size: CGSize, cold: Bool) {
     guard size.width > 0, size.height > 0 else { return }
     expectedSize = size
-    guard readySize != size, timedOutSize != size else { return }
+    guard cold, timedOutSize != size else { return }
     // Geometry can move repeatedly while covered; it must not restart the deadline.
     guard !isCovered else { return }
     isCovered = true
     interval = TerminalPerformance.begin("First frame availability")
-    showsProgress = immediateProgress
+    showsProgress = false
     generation &+= 1
     let token = generation
     onChange?()
@@ -52,7 +58,6 @@ final class TerminalPresentation {
 
   func frameAvailable(size: CGSize) {
     guard size == expectedSize else { return }
-    readySize = size
     timedOutSize = nil
     if isCovered { finish() }
   }
