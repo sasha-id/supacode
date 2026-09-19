@@ -455,14 +455,14 @@ struct AgentHookCommandTests {
       + #"__sock="${SUPACODE_SIGNAL_SOCKET_PATH:-${SUPACODE_SOCKET_PATH:-}}"; __tty=""; "#
       + #"__md="event=busy"; [ -n "$__sock" ] && [ -n "$__ppid" ] "#
       + #"&& __md="$__md;pid=$__ppid"; "#
-      + #"{ [ -n "$__sock" ] "#
-      + #"&& case "$(printf '{"signal":"claude","metadata":"%s","surface_id":"%s"}' "$__md" "#
+      + #"if [ -n "$__sock" ]; then "#
+      + #"printf '{"signal":"claude","metadata":"%s","surface_id":"%s"}' "$__md" "#
       + #""${SUPACODE_SURFACE_ID:-}" "#
-      + #"| /usr/bin/nc -U -w1 "$__sock")" in *'"ok":true'*) :;; *) false;; esac; } "#
-      + #"|| { [ -n "$__tty" ] || { "#
+      + #"| /usr/bin/nc -U -w1 "$__sock" >/dev/null 2>&1; "#
+      + #"else [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
       + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
-      + #"printf '\033]3008;start=claude;%s\033\\' "$__md" > "$__tty"; }; "#
+      + #"printf '\033]3008;start=claude;%s\033\\' "$__md" > "$__tty"; fi; "#
       + #"} >/dev/null 2>&1 || true # supacode-managed-hook"#
     #expect(composite == expected)
   }
@@ -473,30 +473,59 @@ struct AgentHookCommandTests {
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.busy], forwardStdinAsNotification: false, agent: .claude)
     // Emission is gated only by the surface id (no-op outside Supacode) and
-    // carries no token. The socket leg leads; the OSC leg is its fallback.
+    // carries no token. Both transports are present, selected by whether a
+    // socket is configured.
     #expect(command.contains(#"[ -n "${SUPACODE_SURFACE_ID:-}" ]"#))
     #expect(!command.contains("token="))
     #expect(command.contains(#""signal":"claude""#))
-    #expect(command.contains(#"/usr/bin/nc -U -w1 "$__sock")" in *'"ok":true'*) :;; *) false;; esac"#))
+    #expect(command.contains(#"| /usr/bin/nc -U -w1 "$__sock" >/dev/null 2>&1"#))
     #expect(command.contains("]3008;start=claude;"))
     #expect(command.contains(#"> "$__tty""#))
     #expect(command.contains("ps -o tty= -p \"$__ppid\""))
   }
 
-  @Test func presenceOSCLegIsTheFallbackArmOfTheSocketLeg() throws {
-    // The ordering is the whole fix: writing to the agent's tty must happen only
-    // when the socket leg has already failed, never alongside it. `ps` sits in
-    // the same arm, so a local session never pays that fork either — and hooks
-    // fire on every tool call.
+  @Test func presenceOSCLegIsTheElseArmOfTheSocketLeg() throws {
+    // The exclusivity is the whole fix: writing to the agent's tty happens only
+    // when no socket is configured, never because a configured one failed. A
+    // configured-but-unreachable socket belongs to a managed surface whose tty
+    // the agent is actively rendering into, so an OSC there corrupts the TUI.
+    // `ps` sits in the same arm, so a socket-bearing session never pays that
+    // fork either — and hooks fire on every tool call.
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.busy], forwardStdinAsNotification: false, agent: .claude)
+    let branch = try #require(command.range(of: #"if [ -n "$__sock" ]; then "#)).lowerBound
     let socket = try #require(command.range(of: "/usr/bin/nc -U")).lowerBound
-    let fallback = try #require(command.range(of: #"|| { [ -n "$__tty" ] ||"#)).lowerBound
+    let elseArm = try #require(command.range(of: #"; else [ -n "$__tty" ] ||"#)).lowerBound
     let resolve = try #require(command.range(of: "ps -o tty=")).lowerBound
     let osc = try #require(command.range(of: "]3008;start=claude;")).lowerBound
-    #expect(socket < fallback)
-    #expect(fallback < resolve)
+    #expect(branch < socket)
+    #expect(socket < elseArm)
+    #expect(elseArm < resolve)
     #expect(resolve < osc)
+    // No `||` chain between the two: the socket write's exit status is discarded,
+    // so a failed send can never reach the tty arm.
+    #expect(!command.contains(#"|| { [ -n "$__tty" ]"#))
+  }
+
+  @Test func aConfiguredSocketNeverWritesToTheAgentTTY() throws {
+    // Byte-level statement of the invariant the corruption incident violated:
+    // every tty write in a managed hook sits inside an `else` arm whose `if`
+    // tested for an empty `$__sock`.
+    for command in [
+      AgentHookSettingsCommand.compositeCommand(
+        events: [.busy, .idle], forwardStdinAsNotification: true, agent: .claude),
+      AgentHookSettingsCommand.claudeStopCommand(agent: .claude),
+    ] {
+      let writes = command.ranges(of: #"> "$__tty""#)
+      #expect(!writes.isEmpty)
+      for write in writes {
+        // Walk back to the branch this write sits in; it must be the `else`.
+        let head = command[command.startIndex..<write.lowerBound]
+        let branch = try #require(head.range(of: #"if [ -n "$__sock" ]; then "#, options: .backwards))
+        let elseArm = try #require(head.range(of: #"; else "#, options: .backwards))
+        #expect(branch.lowerBound < elseArm.lowerBound)
+      }
+    }
   }
 
   @Test func sessionStartComposesPresenceForOSCAgents() {
@@ -555,28 +584,20 @@ struct AgentHookCommandTests {
 
   // MARK: - Runtime behaviour (real shell).
 
-  @Test func presenceCarriesLocalPidButNotRemote() async throws {
-    // The pid suffix is the local/remote discriminator: present when
-    // SUPACODE_SOCKET_PATH is set (local host), absent over SSH. A regression
-    // that always or never emitted it would silently break the liveness sweep.
-    // Both legs are read off the tty: the local one takes the fallback because
-    // the socket path points nowhere, which is exactly how the pid reaches OSC.
-    let base: [String: String] = ["SUPACODE_SURFACE_ID": UUID().uuidString]
+  @Test func presenceOverTheTTYCarriesNoPid() async throws {
+    // The pid suffix is the local/remote discriminator: emitted only on the
+    // socket transport, since only a local socket makes the pid meaningful to
+    // the liveness sweep. A surface with no socket reaches the app over OSC,
+    // where the pid would be unattributable, so it must be absent.
+    // (The positive half — a pid on the socket wire — is
+    // `presenceRidesTheSocketAndLeavesTheAgentTTYAlone`.)
     let command = AgentHookSettingsCommand.compositeCommand(
       events: [.busy], forwardStdinAsNotification: false, agent: .claude)
-
-    // Local (socket path present): the presence signal carries a positive pid.
-    let local = try await runHookCommandCapturingTTY(
-      command, env: base.merging(["SUPACODE_SOCKET_PATH": "/tmp/sock-\(UUID().uuidString)"]) { $1 })
-    let localSignal = try #require(Self.parsePresence(fromTTY: local))
-    #expect(localSignal.eventRawValue == "busy")
-    #expect(localSignal.pid == ProcessInfo.processInfo.processIdentifier)
-
-    // Remote (socket absent): the presence OSC lands but carries no pid.
-    let remote = try await runHookCommandCapturingTTY(command, env: base)
-    let remoteSignal = try #require(Self.parsePresence(fromTTY: remote))
-    #expect(remoteSignal.eventRawValue == "busy")
-    #expect(remoteSignal.pid == nil)
+    let tty = try await runHookCommandCapturingTTY(
+      command, env: ["SUPACODE_SURFACE_ID": UUID().uuidString])
+    let signal = try #require(Self.parsePresence(fromTTY: tty))
+    #expect(signal.eventRawValue == "busy")
+    #expect(signal.pid == nil)
   }
 
   // MARK: - Socket transport (real shell, real socket).
@@ -658,18 +679,19 @@ struct AgentHookCommandTests {
     #expect(forks == "x\n")
   }
 
-  @Test func presenceFallsBackToOSCWhenTheSocketIsUnreachable() async throws {
+  @Test func anUnreachableSocketDropsTheSignalInsteadOfWritingToTheTTY() async throws {
     // An app restart under a surviving zmx session leaves a stale socket path in
-    // the shell's environment. Presence must still land, so the OSC leg is keyed
-    // on the send FAILING, not merely on the variable being unset.
+    // the shell's environment. That session is still a managed surface whose tty
+    // the agent is rendering into, so the signal is dropped rather than painted:
+    // keying the OSC on the send failing is what corrupted live agent TUIs the
+    // moment the app's listener went away.
     let stale = "/tmp/supacode-tests/gone-\(UUID().uuidString)"
     let tty = try await runHookCommandCapturingTTY(
       AgentHookSettingsCommand.compositeCommand(
         events: [.busy], forwardStdinAsNotification: false, agent: .claude),
       env: ["SUPACODE_SURFACE_ID": UUID().uuidString, "SUPACODE_SOCKET_PATH": stale]
     )
-    let signal = try #require(Self.parsePresence(fromTTY: tty))
-    #expect(signal.eventRawValue == "busy")
+    #expect(tty.isEmpty)
   }
 
   @MainActor
@@ -691,9 +713,10 @@ struct AgentHookCommandTests {
     #expect(presence.pid == ProcessInfo.processInfo.processIdentifier)
   }
 
-  @Test func presenceFallsBackToOSCWhenTheListenerNeverAcks() async throws {
-    // `nc -w1` exits 0 on an idle timeout, so a listener that takes the bytes and
-    // never answers would read as a delivery. Only the app's ack may count.
+  @Test func aWedgedListenerDropsTheSignalInsteadOfWritingToTheTTY() async throws {
+    // A bound-but-never-accepting listener is the worst case for the old
+    // ack-gated fallback: `nc -w1` blocks to its deadline and then the hook
+    // painted the agent's tty. The socket is configured, so nothing may.
     let directory = "/tmp/supacode-tests/\(UUID().uuidString)"
     try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(atPath: directory) }
@@ -706,8 +729,7 @@ struct AgentHookCommandTests {
         events: [.busy], forwardStdinAsNotification: false, agent: .claude),
       env: ["SUPACODE_SURFACE_ID": UUID().uuidString, "SUPACODE_SIGNAL_SOCKET_PATH": path]
     )
-    let signal = try #require(Self.parsePresence(fromTTY: tty))
-    #expect(signal.eventRawValue == "busy")
+    #expect(tty.isEmpty)
   }
 
   @Test func notifyExtractsBodyFromStdinThroughAwk() async throws {
@@ -1031,47 +1053,45 @@ struct AgentHookCommandTests {
   // MARK: - OSC presence round-trip.
 
   @Test func presenceOSCRoundTripsThroughParser() async throws {
-    // The shell-produced OSC must parse back into a well-formed, pid-bearing
-    // signal. A guard against a template change that subtly breaks the wire.
-    let surfaceID = UUID()
+    // The shell-produced OSC must parse back into a well-formed signal. A guard
+    // against a template change that subtly breaks the wire. No socket here, so
+    // the tty is the transport — and the pid is deliberately absent on it (see
+    // `presenceOverTheTTYCarriesNoPid`).
     let captured = try await runHookCommandCapturingTTY(
       AgentHookSettingsCommand.compositeCommand(
         events: [.sessionStart], forwardStdinAsNotification: false, agent: .claude),
-      env: [
-        "SUPACODE_SURFACE_ID": surfaceID.uuidString,
-        "SUPACODE_SOCKET_PATH": "/tmp/supacode-rt-\(UUID().uuidString)",
-      ]
+      env: ["SUPACODE_SURFACE_ID": UUID().uuidString]
     )
     let signal = try #require(Self.parsePresence(fromTTY: captured))
     #expect(signal.agent == "claude")
     #expect(signal.eventRawValue == "session_start")
-    // `Process` spawns the hook shell straight from the test runner, so `$__ppid`
-    // must decode to this pid. A weaker "is positive" check would pass for an emit
-    // that sent the shell's own `$$`, which is the regression this pins.
-    #expect(signal.pid == ProcessInfo.processInfo.processIdentifier)
   }
 
+  @MainActor
   @Test func presenceStillCarriesPidWhenPSIsUnavailable() async throws {
     // The parent pid comes from `${PPID:-}`, so an unreachable `ps` no longer costs
     // the pid field. Resolving it through `ps -o ppid= -p $$` did: Grok rewrites the
     // command before spawning it and collapses `$$` to a bare `$`, which left every
     // Grok presence hook running but emitting nothing (#704 follow-up).
+    // Read off the socket, the only transport that carries a pid at all; `nc` is
+    // named absolutely, so an empty PATH cannot reach it either.
     let emptyPath = URL(fileURLWithPath: NSTemporaryDirectory())
       .appendingPathComponent("supacode-nops-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: emptyPath, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: emptyPath) }
 
-    let captured = try await runHookCommandCapturingTTY(
+    let run = try await runHookCommandAgainstSocket(
       AgentHookSettingsCommand.compositeCommand(
         events: [.busy], forwardStdinAsNotification: false, agent: .claude),
-      env: [
-        "SUPACODE_SURFACE_ID": UUID().uuidString,
-        "SUPACODE_SOCKET_PATH": "/tmp/supacode-nops-\(UUID().uuidString)",
-        "PATH": emptyPath.path,
-      ]
+      surfaceID: UUID(),
+      socketEnv: { ["SUPACODE_SOCKET_PATH": $0, "PATH": emptyPath.path] }
     )
-    let signal = try #require(Self.parsePresence(fromTTY: captured))
+    let captured = try #require(run.signals.first)
+    let signal = try #require(AgentPresenceOSC.parse(id: captured.id, metadata: captured.metadata))
     #expect(signal.eventRawValue == "busy")
+    // `Process` spawns the hook shell straight from the test runner, so `$__ppid`
+    // must decode to this pid. A weaker "is positive" check would pass for an emit
+    // that sent the shell's own `$$`, which is the regression this pins.
     #expect(signal.pid == ProcessInfo.processInfo.processIdentifier)
   }
 
@@ -1139,17 +1159,18 @@ struct AgentHookCommandTests {
     + #"__sock="${SUPACODE_SIGNAL_SOCKET_PATH:-${SUPACODE_SOCKET_PATH:-}}"; __tty=""; "#
   private static let suppressTail = #"} >/dev/null 2>&1 || true # supacode-managed-hook"#
 
-  /// Transport branch shared by presence and notify: socket first, OSC on the
-  /// parent agent's tty (resolved lazily, once) when the socket is unreachable.
+  /// Transport branch shared by presence and notify: the socket when the surface
+  /// has one, OSC on the parent agent's tty (resolved lazily, once) only when it
+  /// has none. The two arms are exclusive — an unreachable socket emits nothing.
   private static func send(_ action: String, _ agent: String) -> String {
-    #"{ [ -n "$__sock" ] "#
-      + #"&& case "$(printf '{"signal":"\#(agent)","metadata":"%s","surface_id":"%s"}' "$__md" "#
+    #"if [ -n "$__sock" ]; then "#
+      + #"printf '{"signal":"\#(agent)","metadata":"%s","surface_id":"%s"}' "$__md" "#
       + #""${SUPACODE_SURFACE_ID:-}" "#
-      + #"| /usr/bin/nc -U -w1 "$__sock")" in *'"ok":true'*) :;; *) false;; esac; } "#
-      + #"|| { [ -n "$__tty" ] || { "#
+      + #"| /usr/bin/nc -U -w1 "$__sock" >/dev/null 2>&1; "#
+      + #"else [ -n "$__tty" ] || { "#
       + #"set -f; set -- $(ps -o tty= -p "$__ppid" 2>/dev/null); __tty=${1:-}; set +f; "#
       + #"case "$__tty" in *[0-9]*) __tty="/dev/${__tty#/dev/}";; *) __tty="/dev/tty";; esac; }; "#
-      + #"printf '\033]3008;\#(action)=\#(agent);%s\033\\' "$__md" > "$__tty"; }"#
+      + #"printf '\033]3008;\#(action)=\#(agent);%s\033\\' "$__md" > "$__tty"; fi"#
   }
 
   private static func presence(_ action: String, _ agent: String, _ event: String) -> String {

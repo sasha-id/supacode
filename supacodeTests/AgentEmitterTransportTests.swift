@@ -185,8 +185,9 @@ struct AgentEmitterTransportTests {
   }
 
   @Test func theHermesPluginSurvivesAnUnreachableSocket() async throws {
-    // The plugin runs inside the agent turn, so a dead socket must degrade to
-    // the terminal leg rather than raise out of the hook.
+    // The plugin runs inside the agent turn, so a dead socket must drop the
+    // signal quietly — neither raising out of the hook nor falling through to
+    // the terminal, which would paint an OSC into the agent's own render.
     let directory = try Self.makeTempDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     try HermesPluginContent.module().write(
