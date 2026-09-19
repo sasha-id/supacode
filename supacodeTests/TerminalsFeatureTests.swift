@@ -852,7 +852,8 @@ struct TerminalsFeatureTests {
   @Test(.dependencies) func localCostChangeReconcilesOtherEvictedWorktrees() async {
     @Shared(.settingsFile) var settingsFile
     $settingsFile.withLock { $0.global.terminalHibernationEnabled = true }
-    let harness = makeRecencyHarness(count: 3)
+    // Five, so two fall outside the retention floor once the budget is gone.
+    let harness = makeRecencyHarness(count: 5)
     for (index, id) in harness.worktreeIDs.enumerated() {
       await harness.store.send(.selectedWorktreeChanged(id)) {
         $0.selectedWorktreeID = id
@@ -860,9 +861,9 @@ struct TerminalsFeatureTests {
         $0.hibernationArmedTabs = Set(harness.tabs.dropFirst(index + 1))
       }
     }
-    harness.contents[2].estimatedRetentionBytes = ContentRetentionPolicy.testValue.budgetBytes
-    await harness.store.send(.layouts(.element(id: harness.worktreeIDs[2], action: .selectTab(id: harness.tabs[2])))) {
-      $0.recentWorktreeIDs = [harness.worktreeIDs[2]]
+    harness.contents[4].estimatedRetentionBytes = ContentRetentionPolicy.testValue.budgetBytes
+    await harness.store.send(.layouts(.element(id: harness.worktreeIDs[4], action: .selectTab(id: harness.tabs[4])))) {
+      $0.recentWorktreeIDs = [harness.worktreeIDs[4], harness.worktreeIDs[3], harness.worktreeIDs[2]]
       $0.hibernationArmedTabs = Set(harness.tabs.prefix(2))
     }
     $settingsFile.withLock { $0.global.terminalHibernationEnabled = false }
