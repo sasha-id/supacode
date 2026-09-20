@@ -678,19 +678,22 @@ final class GhosttyRuntime {
     keybind = super+shift+f=unbind
     """
 
-  /// Reports Supacode in `TERM_PROGRAM` so programs detect the real host
-  /// terminal (issue #440); loaded after the user config so it wins. The version
-  /// is always emitted because Ghostty's `env` map can override a key but not
-  /// clear its seeded version, so a blank value falls back to a placeholder.
-  internal static func terminalProgramOverrides(version: String?) -> String {
+  /// Publishes the app's own version without touching `TERM_PROGRAM`.
+  ///
+  /// Ghostty seeds every surface with `TERM_PROGRAM=ghostty` and
+  /// `TERM_PROGRAM_VERSION` set to the embedded libghostty version, and that
+  /// pair is what programs gate terminal capabilities on — Claude Code only
+  /// emits its OSC 9;4 progress reports when it reads `ghostty` 1.2.0 or
+  /// newer, and renaming it silently turned the progress bar off. Supacode is
+  /// libghostty and supports every sequence the name promises, so the seeded
+  /// pair stands and identification (issue #440) rides on `SUPACODE_VERSION`
+  /// alongside the per-surface `SUPACODE_*` variables.
+  internal static func terminalIdentityOverrides(version: String?) -> String {
     // Trim like Ghostty's `env` parser, which strips whitespace then drops a
-    // now-empty value, leaving its seeded version.
+    // now-empty value.
     let trimmed = version?.trimmingCharacters(in: .whitespacesAndNewlines)
     let resolved = trimmed.flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
-    return """
-      env = TERM_PROGRAM=supacode
-      env = TERM_PROGRAM_VERSION=\(resolved)
-      """
+    return "env = SUPACODE_VERSION=\(resolved)"
   }
 
   private static var appVersion: String? {
@@ -711,7 +714,7 @@ final class GhosttyRuntime {
     tempURL.path.withCString { ghostty_config_load_file(config, $0) }
   }
 
-  /// Writes the app-owned overrides (close predicate, TERM_PROGRAM, keybind
+  /// Writes the app-owned overrides (close predicate, app version, keybind
   /// unbinds) as the final config tier so nothing can override them.
   private static func loadAppOwnedOverrides(
     into config: ghostty_config_t,
@@ -719,7 +722,7 @@ final class GhosttyRuntime {
   ) {
     let contents = [
       appOwnedOverridesString,
-      terminalProgramOverrides(version: appVersion),
+      terminalIdentityOverrides(version: appVersion),
       AppShortcuts.ghosttyKeybindConfigLines(from: shortcutOverrides).joined(separator: "\n"),
     ]
     .filter { !$0.isEmpty }

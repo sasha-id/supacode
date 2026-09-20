@@ -176,30 +176,40 @@ struct GhosttyRuntimeBundledOverridesTests {
     #expect(lines.contains("background-blur = true"))
   }
 
-  /// `TERM_PROGRAM` reports Supacode with its version (issue #440).
-  @Test func terminalProgramOverridesIdentifySupacode() {
-    let overrides = GhosttyRuntime.terminalProgramOverrides(version: "1.2.3")
-    #expect(overrides.contains("env = TERM_PROGRAM=supacode"))
-    #expect(overrides.contains("env = TERM_PROGRAM_VERSION=1.2.3"))
+  /// `SUPACODE_VERSION` identifies the host app (issue #440).
+  @Test func terminalIdentityOverridesPublishTheAppVersion() {
+    let overrides = GhosttyRuntime.terminalIdentityOverrides(version: "1.2.3")
+    #expect(overrides.contains("env = SUPACODE_VERSION=1.2.3"))
   }
 
-  /// A missing or blank version still emits a placeholder, never Ghostty's.
-  @Test func terminalProgramOverridesFallBackWhenVersionUnavailable() {
+  /// Ghostty's seeded `TERM_PROGRAM` pair is what programs gate terminal
+  /// capabilities on — Claude Code's OSC 9;4 progress reports among them — so
+  /// nothing here may rename it.
+  @Test func terminalIdentityOverridesLeaveTermProgramSeeded() {
+    for version: String? in ["1.2.3", nil, ""] {
+      let overrides = GhosttyRuntime.terminalIdentityOverrides(version: version)
+      #expect(!overrides.contains("TERM_PROGRAM"))
+    }
+    #expect(!GhosttyRuntime.appOwnedOverridesString.contains("TERM_PROGRAM"))
+    #expect(!GhosttyRuntime.bundledOverridesString.contains("TERM_PROGRAM"))
+  }
+
+  /// A missing or blank version still emits a placeholder.
+  @Test func terminalIdentityOverridesFallBackWhenVersionUnavailable() {
     for version: String? in [nil, "", "   "] {
-      let overrides = GhosttyRuntime.terminalProgramOverrides(version: version)
-      #expect(overrides.contains("env = TERM_PROGRAM=supacode"))
-      #expect(overrides.contains("env = TERM_PROGRAM_VERSION=unknown"))
+      let overrides = GhosttyRuntime.terminalIdentityOverrides(version: version)
+      #expect(overrides.contains("env = SUPACODE_VERSION=unknown"))
     }
   }
 
   /// Surrounding whitespace is trimmed from the emitted version.
-  @Test func terminalProgramOverridesTrimVersionWhitespace() {
-    let overrides = GhosttyRuntime.terminalProgramOverrides(version: " 1.2.3 ")
-    #expect(overrides.contains("env = TERM_PROGRAM_VERSION=1.2.3"))
+  @Test func terminalIdentityOverridesTrimVersionWhitespace() {
+    let overrides = GhosttyRuntime.terminalIdentityOverrides(version: " 1.2.3 ")
+    #expect(overrides.contains("env = SUPACODE_VERSION=1.2.3"))
   }
 
-  @Test func terminalProgramOverridesAreKeyValueDirectives() {
-    let lines = GhosttyRuntime.terminalProgramOverrides(version: "9.9.9")
+  @Test func terminalIdentityOverridesAreKeyValueDirectives() {
+    let lines = GhosttyRuntime.terminalIdentityOverrides(version: "9.9.9")
       .split(whereSeparator: \.isNewline)
       .map { $0.trimmingCharacters(in: .whitespaces) }
       .filter { !$0.isEmpty }
