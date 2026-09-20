@@ -76,36 +76,26 @@ final class GhosttySurfaceBridge {
   var onContextSignal: ((UInt8, String, String) -> Void)?
 
   // Coalesce OSC-9 progress: a flush task applies the latest value at the
-  // throttle cadence while it moves, and a slow stale-watch clears a bar whose
-  // reports stopped without a REMOVE.
+  // throttle cadence while it moves.
   private let clock: any Clock<Duration>
   private let progressThrottleInterval: Duration
-  private let progressIdleInterval: Duration
-  private let progressStaleTimeout: Duration
   private var pendingProgress: ProgressUpdate?
   private var appliedProgress: ProgressUpdate?
-  private var progressReportCount = 0
   private var progressFlushTask: Task<Void, Never>?
-  private var progressStaleTask: Task<Void, Never>?
 
   /// Test seam: mirrors the leading-edge gate in `scheduleProgressFlush`.
   var isProgressFlushIdleForTesting: Bool { progressFlushTask == nil }
 
   init(
     clock: any Clock<Duration> = ContinuousClock(),
-    progressThrottleInterval: Duration = .milliseconds(50),
-    progressIdleInterval: Duration = .seconds(1),
-    progressStaleTimeout: Duration = .seconds(15)
+    progressThrottleInterval: Duration = .milliseconds(50)
   ) {
     self.clock = clock
     self.progressThrottleInterval = progressThrottleInterval
-    self.progressIdleInterval = progressIdleInterval
-    self.progressStaleTimeout = progressStaleTimeout
   }
 
   deinit {
     progressFlushTask?.cancel()
-    progressStaleTask?.cancel()
   }
 
   private struct ProgressUpdate: Equatable {
@@ -343,6 +333,9 @@ final class GhosttySurfaceBridge {
       let exitCode = info.exit_code == -1 ? nil : Int(info.exit_code)
       state.commandExitCode = exitCode
       state.commandDuration = info.duration
+      // A command that ended without a REMOVE leaves its bar behind; the
+      // finish is the signal that the work it described is over.
+      flushProgressRemoval()
       onCommandFinished?(exitCode)
       return true
 
@@ -350,6 +343,7 @@ final class GhosttySurfaceBridge {
       let info = action.action.child_exited
       state.childExitCode = info.exit_code
       state.childExitTimeMs = info.timetime_ms
+      flushProgressRemoval()
       onChildExited?(info.exit_code)
       return true
 
@@ -366,16 +360,15 @@ final class GhosttySurfaceBridge {
     }
   }
 
-  /// Coalescing entry point for OSC-9 progress. REMOVE clears immediately; a
-  /// value identical to what's already shown only refreshes the stale window.
+  /// Coalescing entry point for OSC-9 progress. A bar is held until the emitter
+  /// takes it down with REMOVE, or the command or child it belongs to ends —
+  /// never on a timeout, because emitters are free to report once and hold
+  /// (Claude Code reports edge-triggered, one report per turn).
   func ingestProgressReport(state: ghostty_action_progress_report_state_e, value: Int?) {
     guard state != GHOSTTY_PROGRESS_STATE_REMOVE else {
       flushProgressRemoval()
       return
     }
-    // The counter is the stale watch's liveness signal; bump it on every report.
-    progressReportCount &+= 1
-    startProgressStaleWatchIfNeeded()
     let update = ProgressUpdate(state: state, value: value)
     guard update != appliedProgress else { return }
     pendingProgress = update
@@ -400,33 +393,6 @@ final class GhosttySurfaceBridge {
     }
   }
 
-  /// Slow watch that clears a bar whose reports stopped without a REMOVE (e.g.
-  /// the process died). Wakes at the idle cadence, not the throttle cadence, so
-  /// a held bar doesn't pin a high-frequency wakeup on the main thread.
-  private func startProgressStaleWatchIfNeeded() {
-    guard progressStaleTask == nil else { return }
-    let startCount = progressReportCount
-    progressStaleTask = Task { @MainActor [weak self] in
-      guard let self else { return }
-      var lastSeenCount = startCount
-      var idleElapsed: Duration = .zero
-      while !Task.isCancelled {
-        try? await self.clock.sleep(for: self.progressIdleInterval)
-        guard !Task.isCancelled else { return }
-        if self.progressReportCount != lastSeenCount {
-          lastSeenCount = self.progressReportCount
-          idleElapsed = .zero
-          continue
-        }
-        idleElapsed += self.progressIdleInterval
-        if idleElapsed >= self.progressStaleTimeout {
-          self.flushProgressRemoval()
-          return
-        }
-      }
-    }
-  }
-
   private func applyPendingProgress() {
     guard let pending = pendingProgress else { return }
     pendingProgress = nil
@@ -438,13 +404,14 @@ final class GhosttySurfaceBridge {
   }
 
   private func flushProgressRemoval() {
+    // Nothing to take down: a command finishing on a surface that never
+    // reported progress must not wake the downstream running-state recompute.
+    guard pendingProgress != nil || appliedProgress != nil else { return }
     // REMOVE wins over any unapplied trailing value: applying it first would
     // emit a spurious determinate paint that coalesces away before render,
     // since the bar is clearing anyway.
     progressFlushTask?.cancel()
     progressFlushTask = nil
-    progressStaleTask?.cancel()
-    progressStaleTask = nil
     pendingProgress = nil
     appliedProgress = nil
     state.progressState = nil

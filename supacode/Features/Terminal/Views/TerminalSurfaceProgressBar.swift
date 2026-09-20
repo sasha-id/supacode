@@ -53,8 +53,9 @@ final class TerminalSurfaceProgressBar: NSView {
 
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-  /// Nil hides the bar; the bridge's stale watch is what produces that nil once
-  /// a surface stops reporting, so there is no timeout of our own here.
+  /// Nil hides the bar. That nil only ever comes from the emitter's own REMOVE
+  /// or from the command ending, never from a timeout: emitters are free to
+  /// report once and hold for the whole run.
   func update(_ display: TerminalTabProgressDisplay?, reducesMotion: Bool) {
     guard self.display != display || self.reducesMotion != reducesMotion else { return }
     // A bar that is only now appearing has nothing to ease from.

@@ -7,14 +7,13 @@ import Testing
 @testable import SupacodeSettingsShared
 @testable import supacode
 
-// Serialized: the coalescing tests drive a TestClock with two concurrent
-// sleepers (flush + stale watch); parallel execution can race `advance` before
-// a task suspends and flake.
+// Serialized: the coalescing tests drive a TestClock from the throttle task;
+// parallel execution can race `advance` before a task suspends and flake.
 @MainActor
 @Suite(.serialized)
 struct GhosttySurfaceBridgeTests {
-  /// Yields enough for freshly spawned throttle / stale-watch tasks to
-  /// register their sleeps with the TestClock before advancing past them.
+  /// Yields enough for a freshly spawned throttle task to register its sleep
+  /// with the TestClock before advancing past it.
   private func settleThenAdvance(_ clock: TestClock<Duration>, by duration: Duration) async {
     await Task.megaYield()
     await clock.advance(by: duration)
@@ -226,12 +225,7 @@ struct GhosttySurfaceBridgeTests {
 
   @Test func coalescesBurstOfProgressReports() async {
     let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      progressIdleInterval: .milliseconds(50),
-      progressStaleTimeout: .seconds(15)
-    )
+    let bridge = GhosttySurfaceBridge(clock: clock, progressThrottleInterval: .milliseconds(50))
     var callbackCount = 0
     bridge.onProgressReport = { _ in callbackCount += 1 }
 
@@ -250,68 +244,75 @@ struct GhosttySurfaceBridgeTests {
     #expect(callbackCount == 2)
   }
 
-  @Test func staleProgressClearsAfterTimeout() async {
+  /// The regression that hid every bar: Claude Code reports OSC-9 once per turn
+  /// and holds, so a bar that expires on its own silence is a bar nobody sees.
+  /// Only the emitter's REMOVE, or the command ending, may take it down.
+  @Test func aHeldReportSurvivesArbitrarySilence() async {
     let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      progressIdleInterval: .milliseconds(50),
-      progressStaleTimeout: .milliseconds(200)
-    )
+    let bridge = GhosttySurfaceBridge(clock: clock, progressThrottleInterval: .milliseconds(50))
     var lastState: ghostty_action_progress_report_state_e?
     bridge.onProgressReport = { lastState = $0 }
 
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
     #expect(bridge.state.progressState == GHOSTTY_PROGRESS_STATE_INDETERMINATE)
 
-    // No further reports: the driver synthesizes a REMOVE once the window lapses.
-    await settleThenAdvance(clock, by: .milliseconds(200)) { bridge.state.progressState == nil }
-    #expect(bridge.state.progressState == nil)
-    #expect(lastState == GHOSTTY_PROGRESS_STATE_REMOVE)
-  }
-
-  @Test func continuedReportsKeepProgressAlivePastStaleWindow() async {
-    let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      progressIdleInterval: .milliseconds(50),
-      progressStaleTimeout: .milliseconds(100)
-    )
-    var lastState: ghostty_action_progress_report_state_e?
-    bridge.onProgressReport = { lastState = $0 }
-
-    bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
-    // A long indeterminate run re-fires identical reports; the stale timer must
-    // keep resetting even though the value never changes.
-    for _ in 0..<6 {
-      bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
-      await settleThenAdvance(clock, by: .milliseconds(50))
+    // Minutes of silence, well past any plausible timeout.
+    for _ in 0..<10 {
+      await settleThenAdvance(clock, by: .seconds(60))
     }
     #expect(bridge.state.progressState == GHOSTTY_PROGRESS_STATE_INDETERMINATE)
     #expect(lastState == GHOSTTY_PROGRESS_STATE_INDETERMINATE)
   }
 
-  @Test func progressDriverRestartsAfterStaleRemoval() async {
+  @Test func commandFinishedClearsAHeldBar() {
+    let bridge = GhosttySurfaceBridge(clock: TestClock())
+    var lastState: ghostty_action_progress_report_state_e?
+    bridge.onProgressReport = { lastState = $0 }
+
+    bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
+    #expect(bridge.state.progressState == GHOSTTY_PROGRESS_STATE_INDETERMINATE)
+
+    _ = bridge.handleAction(target: ghostty_target_s(), action: commandFinishedAction(exitCode: 0))
+    #expect(bridge.state.progressState == nil)
+    #expect(bridge.state.progressValue == nil)
+    #expect(lastState == GHOSTTY_PROGRESS_STATE_REMOVE)
+  }
+
+  @Test func childExitedClearsAHeldBar() {
+    let bridge = GhosttySurfaceBridge(clock: TestClock())
+    var lastState: ghostty_action_progress_report_state_e?
+    bridge.onProgressReport = { lastState = $0 }
+
+    bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_SET, value: 42)
+    #expect(bridge.state.progressValue == 42)
+
+    _ = bridge.handleAction(target: ghostty_target_s(), action: childExitedAction(exitCode: 1))
+    #expect(bridge.state.progressState == nil)
+    #expect(lastState == GHOSTTY_PROGRESS_STATE_REMOVE)
+  }
+
+  /// Shell integration fires COMMAND_FINISHED on every prompt; a surface that
+  /// never reported progress must not wake the downstream running-state work.
+  @Test func commandFinishedWithoutProgressStaysSilent() {
+    let bridge = GhosttySurfaceBridge(clock: TestClock())
+    var callbackCount = 0
+    bridge.onProgressReport = { _ in callbackCount += 1 }
+
+    _ = bridge.handleAction(target: ghostty_target_s(), action: commandFinishedAction(exitCode: 0))
+    _ = bridge.handleAction(target: ghostty_target_s(), action: childExitedAction(exitCode: 0))
+    #expect(callbackCount == 0)
+  }
+
+  @Test func progressDriverRestartsAfterRemoval() async {
     let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      // Coarse idle with a wide window: teardown needs only 15 wakes, so the
-      // loop below converges even when a starved tick lands a single wake, and
-      // the re-arm ticks after it can't accrue a second stale REMOVE.
-      progressIdleInterval: .seconds(1),
-      progressStaleTimeout: .seconds(15)
-    )
+    let bridge = GhosttySurfaceBridge(clock: clock, progressThrottleInterval: .milliseconds(50))
     bridge.onProgressReport = { _ in }
 
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
-    // No further reports: the stale window synthesizes a REMOVE and tears down
-    // the driver.
-    await settleThenAdvance(clock, by: .seconds(1)) { bridge.state.progressState == nil }
+    bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_REMOVE, value: nil)
     #expect(bridge.state.progressState == nil)
 
-    // A report after the stale REMOVE must re-arm the driver, not freeze.
+    // A report after the REMOVE must re-arm the driver, not freeze.
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_SET, value: 30)
     #expect(bridge.state.progressValue == 30)
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_SET, value: 60)
@@ -321,22 +322,15 @@ struct GhosttySurfaceBridgeTests {
 
   @Test func determinateValuePaintsPromptlyAfterIdlePeriod() async {
     let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      progressIdleInterval: .milliseconds(50),
-      progressStaleTimeout: .seconds(15)
-    )
+    let bridge = GhosttySurfaceBridge(clock: clock, progressThrottleInterval: .milliseconds(50))
     bridge.onProgressReport = { _ in }
 
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_SET, value: 10)
     #expect(bridge.state.progressValue == 10)
 
     // Sit idle past the throttle window, then a fresh value must paint on its
-    // leading edge instead of waiting for a slow idle tick. Drain the in-flight
-    // flush first so the leading-edge gate is actually open; the short ticks
-    // keep the loop's whole budget below the stale window, so a stale REMOVE
-    // can never open the gate on a flush that failed to drain.
+    // leading edge instead of waiting for a tick. Drain the in-flight flush
+    // first so the leading-edge gate is actually open.
     await settleThenAdvance(clock, by: .milliseconds(50)) { bridge.isProgressFlushIdleForTesting }
     #expect(bridge.state.progressValue == 10)
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_SET, value: 80)
@@ -345,20 +339,15 @@ struct GhosttySurfaceBridgeTests {
 
   @Test func identicalReportsNeverReapply() async {
     let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      progressIdleInterval: .milliseconds(50),
-      progressStaleTimeout: .seconds(15)
-    )
+    let bridge = GhosttySurfaceBridge(clock: clock, progressThrottleInterval: .milliseconds(50))
     var callbackCount = 0
     bridge.onProgressReport = { _ in callbackCount += 1 }
 
     bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
     #expect(callbackCount == 1)
 
-    // A flood of identical reports keeps the bar alive but never re-applies, so
-    // the downstream callback fires exactly once across the whole stream.
+    // A flood of identical reports never re-applies, so the downstream callback
+    // fires exactly once across the whole stream.
     for _ in 0..<10 {
       bridge.ingestProgressReport(state: GHOSTTY_PROGRESS_STATE_INDETERMINATE, value: nil)
       await settleThenAdvance(clock, by: .milliseconds(50))
@@ -369,10 +358,7 @@ struct GhosttySurfaceBridgeTests {
 
   @Test func removeWinsOverUnappliedTrailingValue() {
     let bridge = GhosttySurfaceBridge(
-      clock: TestClock(),
-      progressThrottleInterval: .milliseconds(50),
-      progressStaleTimeout: .seconds(15)
-    )
+      clock: TestClock(), progressThrottleInterval: .milliseconds(50))
     var states: [ghostty_action_progress_report_state_e] = []
     bridge.onProgressReport = { states.append($0) }
 
@@ -390,12 +376,7 @@ struct GhosttySurfaceBridgeTests {
 
   @Test func removeRacingRescheduleKeepsFlushHealthy() async {
     let clock = TestClock()
-    let bridge = GhosttySurfaceBridge(
-      clock: clock,
-      progressThrottleInterval: .milliseconds(50),
-      progressIdleInterval: .milliseconds(50),
-      progressStaleTimeout: .seconds(15)
-    )
+    let bridge = GhosttySurfaceBridge(clock: clock, progressThrottleInterval: .milliseconds(50))
     var applied: [Int?] = []
     bridge.onProgressReport = { state in
       if state != GHOSTTY_PROGRESS_STATE_REMOVE { applied.append(bridge.state.progressValue) }
@@ -432,6 +413,20 @@ struct GhosttySurfaceBridgeTests {
     #expect(bridge.state.progressState == nil)
     #expect(bridge.state.progressValue == nil)
     #expect(lastState == GHOSTTY_PROGRESS_STATE_REMOVE)
+  }
+
+  private func commandFinishedAction(exitCode: Int16) -> ghostty_action_s {
+    var action = ghostty_action_s(tag: GHOSTTY_ACTION_COMMAND_FINISHED, action: .init())
+    action.action.command_finished = ghostty_action_command_finished_s(
+      exit_code: exitCode, duration: 0)
+    return action
+  }
+
+  private func childExitedAction(exitCode: UInt32) -> ghostty_action_s {
+    var action = ghostty_action_s(tag: GHOSTTY_ACTION_SHOW_CHILD_EXITED, action: .init())
+    action.action.child_exited = ghostty_surface_message_childexited_s(
+      exit_code: exitCode, timetime_ms: 0)
+    return action
   }
 
   private func withOpenURLAction<T>(
